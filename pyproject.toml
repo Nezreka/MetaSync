@@ -1,0 +1,14 @@
+[project]
+name = "metasync"
+version = "0.0.1"
+description = "A peer-to-peer music metadata network built alongside SoulSync"
+requires-python = ">=3.10"
+dependencies = [
+    "cryptography>=41",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+include = ["metasync*"]

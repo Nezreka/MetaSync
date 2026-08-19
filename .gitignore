@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Node identity and local state — never commit
+*.key
+node.key
+metasync.db
+metasync.db-wal
+metasync.db-shm
+.env
+data/
+*.pack
