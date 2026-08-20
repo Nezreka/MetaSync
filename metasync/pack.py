@@ -78,17 +78,6 @@ def write_pack(store: ClaimStore, path: Path | str, origin: Optional[str] = ORIG
     path.parent.mkdir(parents=True, exist_ok=True)
     stats = PackStats()
 
-    where, params = [], []
-    if origin:
-        where.append("origin = ?")
-        params.append(origin)
-    if entity:
-        where.append("entity = ?")
-        params.append(entity)
-    clause = f"WHERE {' AND '.join(where)}" if where else ""
-
-    rows = store._conn.execute(
-        f"SELECT payload, node, sig, entity FROM claims {clause} ORDER BY entity, key", params)
 
     # Written to a temp file first: a half-written pack that looks complete is
     # worse than no pack, since the reader cannot tell.
@@ -99,13 +88,12 @@ def write_pack(store: ClaimStore, path: Path | str, origin: Optional[str] = ORIG
             "format": FORMAT,
             "created_on": datetime.now(timezone.utc).date().isoformat(),
         }) + "\n")
-        for row in rows:
-            handle.write(json.dumps({
-                "claim": json.loads(row["payload"]), "node": row["node"], "sig": row["sig"],
-            }, sort_keys=True) + "\n")
+        for signed in store.iter_claims(entity=entity, origin=origin):
+            handle.write(json.dumps(signed.to_wire(), sort_keys=True) + "\n")
             stats.claims += 1
-            stats.entities[row["entity"]] = stats.entities.get(row["entity"], 0) + 1
-            observers.add(row["node"])
+            kind = signed.payload["entity"]
+            stats.entities[kind] = stats.entities.get(kind, 0) + 1
+            observers.add(signed.node)
 
     stats.observers = len(observers)
     temp.replace(path)

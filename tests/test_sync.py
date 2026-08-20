@@ -122,7 +122,13 @@ class SyncTests(unittest.TestCase):
     def test_nothing_local_leaks_into_the_store(self):
         sync_all(self.config, entities=["track"])
         with ClaimStore(self.config.store_path) as store:
-            blob = "".join(row[0] for row in store._conn.execute("SELECT payload FROM claims"))
+            blob = "".join(
+                str(row[0]) + str(row[1]) for row in
+                store._conn.execute("SELECT norm, key FROM entities"))
+            blob += "".join(str(row[0]) for row in
+                            store._conn.execute("SELECT facts FROM claims"))
+            blob += "".join(str(row[0]) for row in
+                            store._conn.execute("SELECT value FROM claim_ids"))
         for secret in ("file_path", "/music/", "secret words", "pk-Dogs"):
             self.assertNotIn(secret, blob)
 

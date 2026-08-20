@@ -1,5 +1,6 @@
 """The claim store, and the corroboration model it implements."""
 
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -106,7 +107,8 @@ class StoreTests(unittest.TestCase):
         claim = claim_for()
         self.store.put(claim.sign(self.alice))
         self.store._conn.execute(
-            "UPDATE claims SET payload = replace(payload, '6VbjrBn8FgFHaFI6NxCSK5', 'tampered0000000000000')")
+            "UPDATE claim_ids SET value = 'tampered0000000000000' "
+            "WHERE value = '6VbjrBn8FgFHaFI6NxCSK5'")
         self.store._conn.commit()
         _, failures = self.store.verify_all()
         self.assertEqual(len(failures), 1)
@@ -213,25 +215,38 @@ class ProvenanceTests(unittest.TestCase):
         self.assertEqual(stats["observers"], 1)
         self.assertEqual(stats["dataset_sources"], 1)
 
-    def test_an_old_store_gains_the_column_without_losing_claims(self):
-        """Real stores predate this field; the migration must not drop them."""
+    def test_a_payload_era_store_is_converted_without_losing_signatures(self):
+        """Real stores kept a full payload per claim. Converting must preserve
+        every signature — the rebuilt bytes have to match the originals."""
+        import json as _json
         path = Path(self._tmp.name) / "old.db"
-        legacy = ClaimStore(path)
-        legacy.put(claim_for().sign(NodeIdentity.generate()))
-        legacy._conn.execute("ALTER TABLE claims RENAME TO claims_tmp")
-        legacy._conn.execute(
+        signed = claim_for().sign(NodeIdentity.generate())
+
+        legacy = sqlite3.connect(str(path))
+        legacy.executescript(
             "CREATE TABLE claims (node TEXT NOT NULL, entity TEXT NOT NULL, key TEXT NOT NULL,"
             " song_key TEXT, payload TEXT NOT NULL, sig TEXT NOT NULL,"
             " observed_on TEXT NOT NULL, origin TEXT NOT NULL, stored_at TEXT NOT NULL,"
-            " PRIMARY KEY (node, entity, key))")
-        legacy._conn.execute(
-            "INSERT INTO claims SELECT node, entity, key, song_key, payload, sig,"
-            " observed_on, origin, stored_at FROM claims_tmp")
-        legacy._conn.execute("DROP TABLE claims_tmp")
-        legacy._conn.commit()
+            " src TEXT NOT NULL DEFAULT 'observed', PRIMARY KEY (node, entity, key));"
+            "CREATE TABLE claim_ids (entity TEXT, key TEXT, provider TEXT, value TEXT,"
+            " node TEXT, src TEXT DEFAULT 'observed',"
+            " PRIMARY KEY (entity, key, provider, value, node));")
+        legacy.execute(
+            "INSERT INTO claims VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (signed.node, "track", signed.payload["key"], signed.payload.get("song_key"),
+             _json.dumps(signed.payload, sort_keys=True), signed.sig,
+             signed.payload["observed_on"], "local", "2026-08-19T00:00:00+00:00", "observed"))
+        for provider, values in signed.payload["ids"].items():
+            for value in values:
+                legacy.execute("INSERT INTO claim_ids VALUES (?,?,?,?,?,?)",
+                               ("track", signed.payload["key"], provider, value,
+                                signed.node, "observed"))
+        legacy.commit()
         legacy.close()
 
-        reopened = ClaimStore(path)
-        self.assertEqual(reopened.stats()["total"], 1)
-        self.assertEqual(reopened.stats()["observers"], 1)
-        reopened.close()
+        converted = ClaimStore(path)
+        self.assertEqual(converted.stats()["total"], 1)
+        self.assertNotIn("payload", converted._table_columns("claims"))
+        checked, failures = converted.verify_all()
+        self.assertEqual((checked, failures), (1, []))
+        converted.close()

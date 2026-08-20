@@ -91,9 +91,9 @@ def wanted_isrcs(store: ClaimStore, only_missing: bool = True) -> Tuple[Dict[str
     # correctly rather than being asserted.
     norms: Dict[str, dict] = {}
     for row in store._conn.execute(
-            "SELECT key, payload FROM claims WHERE entity = 'track'"):
-        if row["key"] in keys and row["key"] not in norms:
-            norms[row["key"]] = json.loads(row["payload"]).get("norm", {})
+            "SELECT key, norm FROM entities WHERE entity = 'track'"):
+        if row["key"] in keys:
+            norms[row["key"]] = json.loads(row["norm"])
     return by_isrc, norms
 
 
