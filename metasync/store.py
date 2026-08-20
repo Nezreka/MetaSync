@@ -164,20 +164,31 @@ class ClaimStore:
         and remasters, so several ids can be correct under one key at once.
         Ordered by observer count, so the most corroborated reading is first.
         """
+        # `mine` first, always. Node identities are free to generate, so an
+        # attacker with a handful of keypairs can out-count a sparse honest
+        # majority — the simulation puts it at roughly one fake identity per
+        # three honest nodes. No amount of peer agreement should be able to
+        # override what this machine observed in its own library, so local
+        # observation is a separate, higher rank rather than one more vote.
         rows = self._conn.execute(
-            "SELECT provider, value, "
-            "  COUNT(DISTINCT CASE WHEN src = ? THEN node END) AS observers, "
-            "  COUNT(DISTINCT CASE WHEN src = ? THEN node END) AS datasets "
-            "FROM claim_ids WHERE entity = ? AND key = ? "
-            "GROUP BY provider, value HAVING (observers + datasets) >= ? "
-            "ORDER BY provider, observers DESC, datasets DESC, value",
-            (SRC_OBSERVED, SRC_DATASET, entity, key, min_observers),
+            "SELECT ci.provider AS provider, ci.value AS value, "
+            "  MAX(CASE WHEN c.origin = ? THEN 1 ELSE 0 END) AS mine, "
+            "  COUNT(DISTINCT CASE WHEN ci.src = ? THEN ci.node END) AS observers, "
+            "  COUNT(DISTINCT CASE WHEN ci.src = ? THEN ci.node END) AS datasets "
+            "FROM claim_ids ci "
+            "JOIN claims c ON c.node = ci.node AND c.entity = ci.entity AND c.key = ci.key "
+            "WHERE ci.entity = ? AND ci.key = ? "
+            "GROUP BY ci.provider, ci.value HAVING (observers + datasets) >= ? "
+            "ORDER BY ci.provider, mine DESC, observers DESC, datasets DESC, ci.value",
+            (ORIGIN_LOCAL, SRC_OBSERVED, SRC_DATASET, entity, key, min_observers),
         ).fetchall()
         out: Dict[str, List[Dict[str, Any]]] = {}
         for row in rows:
             entry = {"value": row["value"], "observers": row["observers"]}
             if row["datasets"]:
                 entry["datasets"] = row["datasets"]
+            if row["mine"]:
+                entry["mine"] = True
             out.setdefault(row["provider"], []).append(entry)
         return out
 
