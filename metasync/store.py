@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
-from .claim import Claim, SignedClaim
+from .claim import SRC_DATASET, SRC_OBSERVED, Claim, SignedClaim
 
 ORIGIN_LOCAL = "local"
 ORIGIN_PEER = "peer"
@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS claims (
     observed_on TEXT NOT NULL,
     origin      TEXT NOT NULL,
     stored_at   TEXT NOT NULL,
+    src         TEXT NOT NULL DEFAULT 'observed',
     PRIMARY KEY (node, entity, key)
 );
 CREATE INDEX IF NOT EXISTS idx_claims_entity_key ON claims(entity, key);
@@ -43,6 +44,7 @@ CREATE TABLE IF NOT EXISTS claim_ids (
     provider TEXT NOT NULL,
     value    TEXT NOT NULL,
     node     TEXT NOT NULL,
+    src      TEXT NOT NULL DEFAULT 'observed',
     PRIMARY KEY (entity, key, provider, value, node)
 );
 CREATE INDEX IF NOT EXISTS idx_claim_ids_lookup ON claim_ids(entity, key);
@@ -69,7 +71,18 @@ class ClaimStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Add columns a store created by an earlier version lacks. CREATE TABLE
+        IF NOT EXISTS never reshapes an existing table, so new columns arrive
+        here — the same probe-then-ALTER pattern SoulSync uses."""
+        for table in ("claims", "claim_ids"):
+            columns = {row[1] for row in self._conn.execute(f"PRAGMA table_info({table})")}
+            if "src" not in columns:
+                self._conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN src TEXT NOT NULL DEFAULT 'observed'")
 
     def close(self) -> None:
         self._conn.close()
@@ -92,6 +105,7 @@ class ClaimStore:
         payload = dict(signed.payload)
         entity, key = payload["entity"], payload["key"]
         observed_on = payload["observed_on"]
+        src = payload.get("src", SRC_OBSERVED)
 
         existing = self._conn.execute(
             "SELECT observed_on FROM claims WHERE node = ? AND entity = ? AND key = ?",
@@ -103,11 +117,11 @@ class ClaimStore:
         with self._conn:
             self._conn.execute(
                 "INSERT OR REPLACE INTO claims "
-                "(node, entity, key, song_key, payload, sig, observed_on, origin, stored_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "(node, entity, key, song_key, payload, sig, observed_on, origin, stored_at, src) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (signed.node, entity, key, payload.get("song_key"),
                  json.dumps(payload, sort_keys=True), signed.sig,
-                 observed_on, origin, _now()),
+                 observed_on, origin, _now(), src),
             )
             # Rebuild this observer's ids for this key — an id the node has
             # since retracted must not linger.
@@ -116,9 +130,9 @@ class ClaimStore:
                 (entity, key, signed.node),
             )
             self._conn.executemany(
-                "INSERT OR IGNORE INTO claim_ids (entity, key, provider, value, node) "
-                "VALUES (?, ?, ?, ?, ?)",
-                [(entity, key, provider, value, signed.node)
+                "INSERT OR IGNORE INTO claim_ids (entity, key, provider, value, node, src) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                [(entity, key, provider, value, signed.node, src)
                  for provider, values in (payload.get("ids") or {}).items()
                  for value in values],
             )
@@ -138,24 +152,33 @@ class ClaimStore:
                 for r in rows]
 
     def resolve(self, entity: str, key: str, min_observers: int = 1) -> Dict[str, List[Dict[str, Any]]]:
-        """The id map for one key, each id with its distinct-observer count.
+        """The id map for one key, each id with its support.
+
+        ``observers`` counts nodes whose own library held the entity;
+        ``datasets`` counts public corpora that assert it. They are reported
+        separately and never summed into one score: a dataset is one source
+        however many nodes redistribute it, so letting it accumulate like
+        independent observation would let one dump outvote every real person.
 
         A provider maps to a *list*: SoulSync's normalization collapses editions
         and remasters, so several ids can be correct under one key at once.
         Ordered by observer count, so the most corroborated reading is first.
         """
         rows = self._conn.execute(
-            "SELECT provider, value, COUNT(DISTINCT node) AS observers "
+            "SELECT provider, value, "
+            "  COUNT(DISTINCT CASE WHEN src = ? THEN node END) AS observers, "
+            "  COUNT(DISTINCT CASE WHEN src = ? THEN node END) AS datasets "
             "FROM claim_ids WHERE entity = ? AND key = ? "
-            "GROUP BY provider, value HAVING observers >= ? "
-            "ORDER BY provider, observers DESC, value",
-            (entity, key, min_observers),
+            "GROUP BY provider, value HAVING (observers + datasets) >= ? "
+            "ORDER BY provider, observers DESC, datasets DESC, value",
+            (SRC_OBSERVED, SRC_DATASET, entity, key, min_observers),
         ).fetchall()
         out: Dict[str, List[Dict[str, Any]]] = {}
         for row in rows:
-            out.setdefault(row["provider"], []).append(
-                {"value": row["value"], "observers": row["observers"]}
-            )
+            entry = {"value": row["value"], "observers": row["observers"]}
+            if row["datasets"]:
+                entry["datasets"] = row["datasets"]
+            out.setdefault(row["provider"], []).append(entry)
         return out
 
     def find_by_id(self, provider: str, value: str) -> List[Tuple[str, str]]:
@@ -188,7 +211,11 @@ class ClaimStore:
             "claims": dict(sorted(counts.items())),
             "total": sum(counts.values()),
             "observers": self._conn.execute(
-                "SELECT COUNT(DISTINCT node) AS n FROM claims").fetchone()["n"],
+                "SELECT COUNT(DISTINCT node) AS n FROM claims WHERE src = ?",
+                (SRC_OBSERVED,)).fetchone()["n"],
+            "dataset_sources": self._conn.execute(
+                "SELECT COUNT(DISTINCT node) AS n FROM claims WHERE src = ?",
+                (SRC_DATASET,)).fetchone()["n"],
             "distinct_keys": self._conn.execute(
                 "SELECT COUNT(*) AS n FROM (SELECT DISTINCT entity, key FROM claims)"
             ).fetchone()["n"],

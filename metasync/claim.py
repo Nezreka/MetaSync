@@ -29,11 +29,23 @@ from .identity import NodeIdentity, public_key_from_id
 
 WIRE_VERSION = 1
 
+# Where a claim came from, which is not the same question as whether it is
+# correct. An OBSERVED claim is possession-backed: a node's own library held the
+# entity and its own enrichment resolved the ids. A DATASET claim is derived
+# from a public corpus (a MusicBrainz dump, say) — often more accurate than any
+# single library, but it is one source no matter how many nodes redistribute it,
+# so it must never be counted as independent corroboration. One public dump
+# would otherwise outvote every real person on the network.
+SRC_OBSERVED = "observed"
+SRC_DATASET = "dataset"
+SOURCES = (SRC_OBSERVED, SRC_DATASET)
+
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _KEY_RE = re.compile(r"^soul_[0-9a-f]{16}$")
 
 _TOP_LEVEL_KEYS = frozenset({
-    "v", "entity", "key", "song_key", "key_path", "norm", "ids", "facts", "observed_on",
+    "v", "entity", "key", "song_key", "key_path", "norm", "ids", "facts",
+    "observed_on", "src",
 })
 
 
@@ -51,6 +63,7 @@ class Claim:
     facts: Mapping[str, Any] = field(default_factory=dict)
     observed_on: str = ""
     key_path: Optional[str] = None   # artist only — see soulid.ARTIST_PATHS
+    src: str = SRC_OBSERVED
 
     @property
     def key(self) -> str:
@@ -91,6 +104,10 @@ class Claim:
             "norm": {k: v for k, v in sorted(self.norm.items()) if v},
             "observed_on": self.observed_on,
         }
+        if self.src != SRC_OBSERVED:
+            # Omitted when observed, so the common case stays the shortest
+            # encoding and claims signed before this field existed still verify.
+            payload["src"] = self.src
         if self.entity == "track":
             payload["song_key"] = self.song_key
         if self.key_path:
@@ -114,6 +131,7 @@ class Claim:
             facts=dict(payload.get("facts", {})),
             observed_on=payload.get("observed_on", ""),
             key_path=payload.get("key_path"),
+            src=payload.get("src", SRC_OBSERVED),
         )
 
     def sign(self, identity: NodeIdentity) -> "SignedClaim":
@@ -184,6 +202,12 @@ def validate(payload: Mapping[str, Any]) -> None:
     observed = payload.get("observed_on", "")
     if not isinstance(observed, str) or not _DATE_RE.match(observed):
         raise InvalidClaim("observed_on must be a YYYY-MM-DD string")
+
+    src = payload.get("src", SRC_OBSERVED)
+    if src not in SOURCES:
+        raise InvalidClaim(f"unknown src {src!r}")
+    if src == SRC_OBSERVED and "src" in payload:
+        raise InvalidClaim("src must be omitted for observed claims, not written explicitly")
 
     _validate_norm(entity, payload.get("norm"))
     _validate_key_path(entity, payload.get("key_path"))

@@ -68,6 +68,36 @@ def cmd_lookup(args, config: Config) -> int:
     return 0 if hits else 1
 
 
+def cmd_seed(args, config: Config) -> int:
+    from .seed import build
+    key_path = config.data_dir / "seed-musicbrainz.key"
+    identity = NodeIdentity.load_or_create(key_path)
+
+    def progress(phase, stats):
+        scanned = stats.isrc_rows_scanned if phase == "isrc" else stats.recording_rows_scanned
+        print(f"  {phase}: {scanned:,} rows scanned, {stats.isrc_matched:,} isrcs matched",
+              end="\r", file=sys.stderr, flush=True)
+
+    with ClaimStore(config.store_path) as store:
+        stats = build(store, args.isrc, args.recording, identity,
+                      only_missing=not args.all, progress=None if args.quiet else progress)
+        result = {"seed_node": identity.node_id, **stats.as_dict(), "store": store.stats()}
+    print(" " * 70, end="\r", file=sys.stderr)
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def cmd_gaps(args, config: Config) -> int:
+    from .gaps import measure
+    from .soulsync import SoulSyncClient
+    client = SoulSyncClient(config.soulsync_url, config.require_api_key())
+    with ClaimStore(config.store_path) as store:
+        report = measure(client, store, args.entity, limit=config.page_size,
+                         min_observers=args.min_observers, max_rows=args.max_rows)
+    print(json.dumps(report.as_dict(), indent=2))
+    return 0
+
+
 def cmd_pack(args, config: Config) -> int:
     from .pack import write_pack
     origin = None if args.relay else ORIGIN_LOCAL
@@ -129,6 +159,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_lookup.add_argument("provider")
     p_lookup.add_argument("value")
     p_lookup.set_defaults(func=cmd_lookup)
+
+    p_seed = sub.add_parser("seed", help="build dataset claims from a MusicBrainz dump")
+    p_seed.add_argument("--isrc", required=True, help="path to mbdump/isrc")
+    p_seed.add_argument("--recording", required=True, help="path to mbdump/recording")
+    p_seed.add_argument("--all", action="store_true",
+                        help="seed every track, not only those missing a MusicBrainz id")
+    p_seed.add_argument("--quiet", action="store_true")
+    p_seed.set_defaults(func=cmd_seed)
+
+    p_gaps = sub.add_parser("gaps", help="how many library rows MetaSync could fill in")
+    p_gaps.add_argument("entity", choices=ENTITIES)
+    p_gaps.add_argument("--min-observers", type=int, default=1)
+    p_gaps.add_argument("--max-rows", type=int, help="stop after this many rows")
+    p_gaps.set_defaults(func=cmd_gaps)
 
     p_pack = sub.add_parser("pack", help="write this node's claims to a shareable file")
     p_pack.add_argument("--out", default="metasync.pack", help="output path (default: metasync.pack)")

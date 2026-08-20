@@ -160,3 +160,78 @@ class StatsDistinctionTests(unittest.TestCase):
         self.store.put(claim_for("bbb").sign(NodeIdentity.generate()))
         second = self.store.stats()
         self.assertEqual(second["ids"], first["ids"] + 1)
+
+
+class ProvenanceTests(unittest.TestCase):
+    """A public dataset is one source however many nodes redistribute it.
+    Counting it as independent observation would let one dump outvote every
+    real person on the network."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.store = ClaimStore(Path(self._tmp.name) / "s.db")
+
+    def tearDown(self):
+        self.store.close()
+        self._tmp.cleanup()
+
+    def _dataset_claim(self, spotify_id="aaa"):
+        from metasync.claim import SRC_DATASET
+        return Claim(
+            entity="track",
+            norm={"artist": "pinkfloyd", "album": "animals", "title": "dogs"},
+            ids={"spotify": (spotify_id,)},
+            observed_on="2026-08-19",
+            src=SRC_DATASET,
+        )
+
+    def test_dataset_and_observed_support_are_reported_separately(self):
+        self.store.put(claim_for("aaa").sign(NodeIdentity.generate()))
+        self.store.put(self._dataset_claim("aaa").sign(NodeIdentity.generate()))
+        entry = self.store.resolve("track", claim_for().key)["spotify"][0]
+        self.assertEqual(entry["observers"], 1)
+        self.assertEqual(entry["datasets"], 1)
+
+    def test_many_dataset_copies_do_not_look_like_many_observers(self):
+        for _ in range(5):
+            self.store.put(self._dataset_claim().sign(NodeIdentity.generate()))
+        entry = self.store.resolve("track", claim_for().key)["spotify"][0]
+        self.assertEqual(entry["observers"], 0)
+        self.assertEqual(entry["datasets"], 5)
+
+    def test_observed_entries_outrank_dataset_ones(self):
+        self.store.put(claim_for("observed-id").sign(NodeIdentity.generate()))
+        for _ in range(3):
+            self.store.put(self._dataset_claim("dataset-id").sign(NodeIdentity.generate()))
+        values = [e["value"] for e in self.store.resolve("track", claim_for().key)["spotify"]]
+        self.assertEqual(values[0], "observed-id")
+
+    def test_stats_separate_the_two_kinds_of_source(self):
+        self.store.put(claim_for().sign(NodeIdentity.generate()))
+        self.store.put(self._dataset_claim("zzz").sign(NodeIdentity.generate()))
+        stats = self.store.stats()
+        self.assertEqual(stats["observers"], 1)
+        self.assertEqual(stats["dataset_sources"], 1)
+
+    def test_an_old_store_gains_the_column_without_losing_claims(self):
+        """Real stores predate this field; the migration must not drop them."""
+        path = Path(self._tmp.name) / "old.db"
+        legacy = ClaimStore(path)
+        legacy.put(claim_for().sign(NodeIdentity.generate()))
+        legacy._conn.execute("ALTER TABLE claims RENAME TO claims_tmp")
+        legacy._conn.execute(
+            "CREATE TABLE claims (node TEXT NOT NULL, entity TEXT NOT NULL, key TEXT NOT NULL,"
+            " song_key TEXT, payload TEXT NOT NULL, sig TEXT NOT NULL,"
+            " observed_on TEXT NOT NULL, origin TEXT NOT NULL, stored_at TEXT NOT NULL,"
+            " PRIMARY KEY (node, entity, key))")
+        legacy._conn.execute(
+            "INSERT INTO claims SELECT node, entity, key, song_key, payload, sig,"
+            " observed_on, origin, stored_at FROM claims_tmp")
+        legacy._conn.execute("DROP TABLE claims_tmp")
+        legacy._conn.commit()
+        legacy.close()
+
+        reopened = ClaimStore(path)
+        self.assertEqual(reopened.stats()["total"], 1)
+        self.assertEqual(reopened.stats()["observers"], 1)
+        reopened.close()
