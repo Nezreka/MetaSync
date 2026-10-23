@@ -11,10 +11,14 @@ wishlist adds, hunt demand, library keeps, recent arrivals. SoulSync
 also records **acquisition** — every track it downloads — and acquisition
 carries two facts the current signals can't express:
 
-- **Heat with proof.** A download is desire that cost effort. Albums
-  people actually grabbed this week (through search, playlists,
-  watchlist grabs — not just library imports) are a stronger trending
-  input than a wishlist add alone.
+- **Heat with proof — the slice the library can't see.** A download
+  that lands in the library is already counted: it fires `recent_add`
+  the week it arrives and `import_keep` after. What no current signal
+  sees is acquisition aimed at albums **already owned** — re-grabs,
+  quality upgrades, gap-fills from playlist syncs — and grabs that
+  complete but never land in the library snapshot at all. When a
+  remaster drops and fifty installs re-grab an album they have owned
+  for years, that is real heat, and today it is invisible.
 - **Churn.** Downloaded, then deleted. The negative image of
   `import_keep`, and a chart-quality lever nobody else in this space
   uses: an album many installs grabbed and many threw away should not
@@ -31,7 +35,7 @@ per node per week, same as everything else in SIN:
 
 | Signal | Rule (computed on the node) |
 |---|---|
-| `download_grab` | At least one track of this album finished downloading this week (status completed), however it was requested. |
+| `download_grab` | At least one track of this album finished downloading this week (status completed) **and the album was not newly added to the library this week** — re-grabs, upgrades, gap-fills, and grabs that never landed. New arrivals are `recent_add`'s job; the two never fire for the same album-week on one node. |
 | `download_churn` | This album was downloaded 14+ days ago, was in the library afterwards, and has now been absent from **two consecutive complete** library reads. Reported once per node per album (see §5). |
 
 Plus one rule extension, no new type:
@@ -118,13 +122,16 @@ New read in the weekly report flow, after the library read:
    already bridged by the main pass. Download-only releases (grabbed
    and already gone, or never imported) resolve **first** in the
    fresh-lookup budget — they are few and high-value.
-3. `download_grab`: any row with `completed_downloads ≥ 1` where
-   `last_downloaded_at` falls in the report week and the completion
-   was this week. (SoulSync's per-album `last_downloaded_at` plus a
-   `completed_this_week` count would be cleaner; if the endpoint can
-   cheaply add `completed_downloads_this_week` computed server-side
-   against a `?week=` parameter, prefer that — decide at build time,
-   the node-side window check is the fallback.)
+3. `download_grab`: any row with a download completed this week
+   whose group did **not** produce a `recent_add` this run — the
+   exclusion is computed locally from the same run's library read
+   (album in the library with `created_at` in the report week), so
+   grab and recent_add stay disjoint by construction. (SoulSync's
+   per-album `last_downloaded_at` plus a `completed_this_week` count
+   would be cleaner; if the endpoint can cheaply add
+   `completed_downloads_this_week` computed server-side against a
+   `?week=` parameter, prefer that — decide at build time, the
+   node-side window check is the fallback.)
 4. `download_churn` (only when the §7 toggle is on):
    - Candidate: completed download with `last_downloaded_at` ≥ 14
      days before the report week, **and** the group was present in a
@@ -162,7 +169,9 @@ signals. Dry-run behavior is unchanged: computed, shown, not sent.
   download_grab)` per album. One node wanting an album and then
   grabbing it is one node's heat, not two — the max() keeps a single
   node's desire from double-counting while still letting grabs from
-  non-wishlisters count in full.
+  non-wishlisters count in full. (Grab is already disjoint from
+  `recent_add` by construction — §5 — so new-arrival heat is never
+  counted twice either.)
 - **Loved & Kept** ranks by `import_keep − download_churn` and
   excludes albums whose churn meets or beats their keeps. Churn is a
   **ranking input only in v1 — never a displayed number.** Reason
