@@ -106,6 +106,25 @@ describe("validation", () => {
     assert.equal(withExtra.ok, false);
   });
 
+  test("accepts recent_add signals and a large-library-sized report", () => {
+    const recent = validateReport({
+      week: WEEK,
+      token: TOKEN_1,
+      signals: [{ type: "recent_add", mbid: MBID_A }],
+    });
+    assert.equal(recent.ok, true);
+    // A 71k-album library produces tens of thousands of import_keep signals;
+    // the cap must sit far above that (see MAX_SIGNALS_PER_REPORT).
+    const large = Array.from({ length: 50_000 }, (_, i) => ({
+      type: "import_keep",
+      mbid: `aaaaaaaa-aaaa-4aaa-8aaa-${String(i).padStart(12, "0")}`,
+    }));
+    assert.equal(
+      validateReport({ week: WEEK, token: TOKEN_1, signals: large }).ok,
+      true,
+    );
+  });
+
   test("rejects empty and oversized signal arrays", () => {
     assert.equal(
       validateReport({ week: WEEK, token: TOKEN_1, signals: [] }).ok,

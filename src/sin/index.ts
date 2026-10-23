@@ -686,7 +686,7 @@ async function touchAuth(auth: KeyAuth, db: SinDb): Promise<void> {
 }
 
 app.get("/health", (c) =>
-  c.json({ ok: true, service: "sin", version: "0.1.0" }),
+  c.json({ ok: true, service: "sin", version: "0.1.0", build: "chunked-insert-1" }),
 );
 
 app.get("/v1/auth/public-key", (c) => {
@@ -932,18 +932,25 @@ app.post("/v1/report", async (c) => {
   const report = validation.value;
   // Binary per node per item per week: the unique index + onConflictDoNothing
   // make a re-sent report a no-op, exactly as the privacy model promises.
-  const inserted = await db
-    .insert(rawReports)
-    .values(
-      report.signals.map((s) => ({
-        week: report.week,
-        tokenHash: report.token,
-        signal: s.type,
-        mbid: s.mbid,
-      })),
-    )
-    .onConflictDoNothing()
-    .returning({ id: rawReports.id });
+  // Inserts run in chunks: one statement for a whole large-library report
+  // (tens of thousands of rows) exceeds Postgres' per-query parameter limit.
+  const rows = report.signals.map((s) => ({
+    week: report.week,
+    tokenHash: report.token,
+    signal: s.type,
+    mbid: s.mbid,
+  }));
+  let insertedCount = 0;
+  const INSERT_CHUNK = 1_000;
+  for (let i = 0; i < rows.length; i += INSERT_CHUNK) {
+    const inserted = await db
+      .insert(rawReports)
+      .values(rows.slice(i, i + INSERT_CHUNK))
+      .onConflictDoNothing()
+      .returning({ id: rawReports.id });
+    insertedCount += inserted.length;
+  }
+  const inserted = { length: insertedCount };
 
   // Portal keys only: refresh last_used_at (throttled, fire-and-forget).
   // The rows above were built ONLY from the validated body — week,

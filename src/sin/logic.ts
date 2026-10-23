@@ -7,7 +7,7 @@
  * Privacy invariants baked in here (see README / SIDECAR-ARCHITECTURE-SKETCH.md §2):
  * - Signals are keyed ONLY by MusicBrainz IDs. SoulID is NOT used by SIN —
  *   SoulID belongs exclusively to the metadata MetaSync service.
- * - Exactly four signal types exist. Anything else is rejected.
+ * - Exactly five signal types exist. Anything else is rejected.
  * - Contributions are binary: one node can contribute at most 1 per
  *   (week, signal, MBID), enforced by dedupe on the rotating weekly token.
  * - Nothing is published below the k-anonymity threshold.
@@ -26,19 +26,23 @@ export const BREAKOUT_GROWTH_FACTOR = 2;
 /** Raw reports are deleted this long after receipt (24 hours). */
 export const RAW_REPORT_RETENTION_MS = 24 * 60 * 60 * 1000;
 
-/** Hard cap on a single POST /v1/report body, in bytes. A weekly report is a
- *  few KB; this leaves generous headroom while rejecting abuse/bloat. */
-export const MAX_REPORT_BODY_BYTES = 64 * 1024;
+/** Hard cap on a single POST /v1/report body, in bytes. A report from a
+ *  large library carries one signal per distinct release group owned, which
+ *  at real scale (a 71k-album library) is tens of thousands of signals and
+ *  low single-digit MB; this cap leaves headroom while rejecting abuse. */
+export const MAX_REPORT_BODY_BYTES = 16 * 1024 * 1024;
 
-/** Hard cap on the number of signals in a single report. */
-export const MAX_SIGNALS_PER_REPORT = 1_000;
+/** Hard cap on the number of signals in a single report. Sized for the
+ *  largest real libraries, not the average one. */
+export const MAX_SIGNALS_PER_REPORT = 100_000;
 
-/** The only four signal types SIN accepts. */
+/** The only five signal types SIN accepts. */
 export const SIGNAL_TYPES = [
   "watchlist_add",
   "wishlist_add",
   "import_keep",
   "hunt_demand",
+  "recent_add",
 ] as const;
 
 export type SignalType = (typeof SIGNAL_TYPES)[number];
@@ -49,6 +53,7 @@ export const SIGNAL_MBID_KIND: Record<SignalType, "artist" | "release-group"> = 
   wishlist_add: "release-group",
   import_keep: "release-group",
   hunt_demand: "release-group",
+  recent_add: "release-group",
 };
 
 export interface SignalInput {
