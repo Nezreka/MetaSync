@@ -1,0 +1,133 @@
+{% extends "base.html" %}
+{% block title %}MetaSync · Dashboard{% endblock %}
+{% block content %}
+<p class="eyebrow">SoulSync network node</p>
+<h1>Dashboard</h1>
+
+{% for p in status.pools if p.binding_status == "pending_approval" %}
+<section class="card alert-card">
+  <p class="eyebrow">Action needed in the portal</p>
+  <h2>Waiting for approval in the portal</h2>
+  <p><strong>{{ p.name }}</strong> has this node’s pool key, but no access token will be issued until the binding is approved in the portal. No report is sent while this is pending.</p>
+  <p>Compare this node fingerprint in the portal: <code class="fingerprint">{{ p.pending_node_fingerprint or status.node_fingerprint }}</code></p>
+</section>
+{% endfor %}
+
+<div class="grid">
+  <section class="card">
+    <p class="eyebrow">Local node</p>
+    <h2>This node</h2>
+    <dl>
+      <dt>Fingerprint</dt><dd><code>{{ status.node_fingerprint }}</code></dd>
+      <dt>Node ID</dt><dd><code class="break">{{ status.node_id }}</code></dd>
+      <dt>Current week</dt><dd>{{ status.current_week }}</dd>
+      <dt>Dry run</dt><dd>{{ "ON — nothing is sent or synced" if status.dry_run else "OFF — live" }}</dd>
+      <dt>Last refresh</dt><dd>{{ status.last_refresh_at or "never" }}</dd>
+    </dl>
+    <form method="post" action="{{ url_for('action_dry_run') }}" class="inline">
+      <label><input type="checkbox" name="dry_run" {% if status.dry_run %}checked{% endif %}> Dry run</label>
+      <button type="submit">Save</button>
+    </form>
+    <div class="row">
+      <form method="post" action="{{ url_for('action_report') }}"><button class="primary" type="submit">Run weekly report now</button></form>
+      <form method="post" action="{{ url_for('action_refresh') }}"><button type="submit">Refresh playlists now</button></form>
+    </div>
+  </section>
+
+  <section class="card">
+    <p class="eyebrow">Network status</p>
+    <h2>Connections</h2>
+    <dl>
+      <dt>SoulSync</dt><dd>{{ "connected (URL saved)" if status.soulsync_connected else "not connected — step A in SoulSync settings" }}</dd>
+      <dt>Last report</dt>
+      <dd>{% for pid, r in status.last_report.items() %}{{ pid }}: {{ r.week }} ({{ r.signal_count }} signals)<br>{% else %}never{% endfor %}</dd>
+    </dl>
+    <h3>Pools</h3>
+    {% if status.pools %}
+    <table>
+      <tr><th>Name</th><th>Binding</th><th>Token</th><th>Enabled</th></tr>
+      {% for p in status.pools %}
+      <tr>
+        <td>{{ p.name }}<br><code class="break">{{ p.url }}</code></td>
+        <td><span class="status-pill {{ p.binding_status }}">{{ p.binding_status.replace('_', ' ') }}</span></td>
+        <td>{{ p.token_expires_at or "—" }}</td>
+        <td>{{ "yes" if p.enabled else "no" }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% else %}<p>No pools joined yet. Joining a pool is separate from connecting SoulSync.</p>{% endif %}
+  </section>
+</div>
+
+<section class="card" id="soulsync-connection">
+  <p class="eyebrow">SoulSync → MetaSync</p>
+  <h2>SoulSync connection</h2>
+  <p class="muted">SoulSync uses MetaSync’s own local API key when it hands over a pool key or checks this node’s status. Only a hash of the key is stored here.</p>
+
+  {% if local_key_once %}
+  <div class="secret-box">
+    <span class="secret-label">Copy this local API key now — it is shown only once</span>
+    <code id="local-api-key-once">{{ local_key_once }}</code>
+    <button type="button" onclick="navigator.clipboard.writeText(document.getElementById('local-api-key-once').textContent)">Copy key</button>
+  </div>
+  {% elif status.local_api_key.configured %}
+  <dl>
+    <dt>Local key</dt><dd><code>{{ status.local_api_key.prefix }}…</code> <span class="muted">(created {{ status.local_api_key.created_at }})</span></dd>
+  </dl>
+  {% else %}
+  <p>No local API key has been issued yet. Generate one for the manual setup, or use the one-click pairing below and SoulSync will receive it during the claim step.</p>
+  {% endif %}
+
+  <div class="row">
+    <form method="post" action="{{ url_for('local_key_regenerate') }}">
+      <button type="submit">{{ "Regenerate local key" if status.local_api_key.configured else "Generate local key" }}</button>
+    </form>
+    {% if status.local_api_key.configured %}
+    <form method="post" action="{{ url_for('local_key_revoke') }}">
+      <button class="danger" type="submit">Revoke local key</button>
+    </form>
+    {% endif %}
+  </div>
+  <p class="muted">Regenerating kills the old key immediately. Manual setup: paste the new key into SoulSync’s MetaSync settings. One-click setup: approve the request below and SoulSync receives the key automatically.</p>
+
+  {% if status.pending_pairing %}
+  <div class="pairing-box">
+    <p class="eyebrow">One-click pairing request</p>
+    <h3>Compare this code with the code shown in SoulSync</h3>
+    <div class="pairing-code">{{ status.pending_pairing.pairing_code }}</div>
+    <p class="muted">Status: {{ status.pending_pairing.status }} · expires {{ status.pending_pairing.expires_at }}</p>
+    {% if status.pending_pairing.status == "pending" %}
+    <form method="post" action="{{ url_for('pair_confirm') }}" class="row">
+      <input type="hidden" name="session_id" value="{{ status.pending_pairing.session_id }}">
+      <button class="primary" type="submit" name="decision" value="approve">Approve pairing</button>
+      <button class="danger" type="submit" name="decision" value="reject">Reject</button>
+    </form>
+    {% else %}
+    <p><strong>Approved.</strong> SoulSync can now claim the connection using the same code.</p>
+    {% endif %}
+  </div>
+  {% endif %}
+</section>
+
+<section class="card">
+  <p class="eyebrow">Provided by this node</p>
+  <h2>Playlists this node manages in SoulSync</h2>
+  {% if status.managed_playlists %}
+  <table>
+    <tr><th>Pool</th><th>Playlist</th><th>Tracks</th><th>Last sync</th><th>Error</th></tr>
+    {% for pid, keys in status.managed_playlists.items() %}
+      {% for key, pl in keys.items() %}
+      <tr><td>{{ pid }}</td><td>{{ pl.name }} (<code>{{ pl.playlist_id }}</code>)</td><td>{{ pl.track_count }}</td><td>{{ pl.last_sync_at or "never" }}</td><td>{{ pl.last_error or "" }}</td></tr>
+      {% endfor %}
+    {% endfor %}
+  </table>
+  {% else %}<p>None yet. They appear after the first playlist refresh.</p>{% endif %}
+</section>
+{% if status.last_errors %}
+<section class="card">
+  <p class="eyebrow">Diagnostics</p>
+  <h2>Recent errors</h2>
+  <ul>{% for e in status.last_errors %}<li><code>{{ e.leg }}</code> — {{ e.message }} <span class="muted">{{ e.at }}</span></li>{% endfor %}</ul>
+</section>
+{% endif %}
+{% endblock %}

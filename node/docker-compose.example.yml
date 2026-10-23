@@ -1,0 +1,30 @@
+# MetaSync next to SoulSync. Running MetaSync is the opt-in; connecting it
+# to SoulSync does NOT join any network — join a pool from the MetaSync UI.
+services:
+  soulsync:
+    image: soulsync:latest # your existing SoulSync service
+    # ... your existing SoulSync configuration ...
+    ports:
+      - "8000:8000"
+
+  metasync:
+    build: .
+    image: metasync-node:latest
+    environment:
+      METASYNC_STATE_DIR: /data
+      METASYNC_PORT: "8790"
+      # Optional first-boot bootstrap (the UI can do all of this instead):
+      SOULSYNC_URL: http://soulsync:8000
+      # SOULSYNC_API_KEY: sk_...        # or set it in the UI (Settings -> API keys in SoulSync)
+      # SIN_URL: https://<sin-backend>  # seeds the SIN pool as a normal node
+      # SIN_INGEST_KEY: <pool key>
+      # METASYNC_DRY_RUN: "true"        # default: the first report is preview-only
+    volumes:
+      - metasync_data:/data   # node key, settings, caches — MetaSync's alone
+    ports:
+      - "8790:8790"           # MetaSync's own UI (SoulSync stays on 8000)
+    depends_on:
+      - soulsync
+
+volumes:
+  metasync_data:

@@ -1,0 +1,11 @@
+.neon
+.agents/
+node_modules/
+.env
+.env.local
+.env.*.local
+!.env.example
+dist/
+__pycache__/
+*.py[cod]
+portal/.next/

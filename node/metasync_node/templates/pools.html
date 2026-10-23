@@ -1,0 +1,82 @@
+{% extends "base.html" %}
+{% block title %}MetaSync · Pools{% endblock %}
+{% block content %}
+<p class="eyebrow">Step B · Optional</p>
+<h1>Pools</h1>
+<p class="muted">A pool is a network this node exchanges data with; SIN is one pool. Normally the pool key is entered in <strong>SoulSync</strong>, handed to MetaSync over the protected local connection, and exchanged here for a short-lived access token. This page is therefore mainly connection status. The manual key form remains available below as a labelled fallback.</p>
+<p class="muted">A normal node can only push its weekly report and pull index/playlist data. The <strong>admin</strong> role is only for Boulder's official MetaSync, which publishes the shared playlist data — user nodes never publish.</p>
+
+{% if pools %}
+<div class="pool-list">
+  {% for p in pools %}
+  <section class="card pool-card">
+    <div class="pool-heading">
+      <div>
+        <p class="eyebrow">{{ p.role }} pool</p>
+        <h2>{{ p.name }}</h2>
+        <code class="break">{{ p.url }}</code>
+      </div>
+      <span class="status-pill {{ p.binding_status }}">{{ p.binding_status.replace('_', ' ') }}</span>
+    </div>
+
+    {% if p.binding_status == "pending_approval" %}
+    <div class="notice">
+      <strong>Waiting for approval in the portal.</strong>
+      Compare this node fingerprint there: <code>{{ p.pending_node_fingerprint or "see Dashboard" }}</code>
+    </div>
+    {% endif %}
+    {% if p.status_note %}<p class="muted">{{ p.status_note }}</p>{% endif %}
+
+    <dl class="pool-details">
+      <dt>Key prefix</dt><dd><code>{{ p.key_prefix or "no key stored" }}</code></dd>
+      <dt>Auth mode</dt><dd>{{ p.auth_mode or "not exchanged yet" }}</dd>
+      <dt>Binding</dt><dd>{{ p.binding_status.replace('_', ' ') }}</dd>
+      <dt>Token expiry</dt><dd>{{ p.token_expires_at or "no token" }}</dd>
+      <dt>Last exchange</dt><dd>{{ p.last_exchange_at or "never" }}{% if p.last_exchange_error %}<br><span class="error-text">{{ p.last_exchange_error }}</span>{% endif %}</dd>
+      <dt>Last report</dt><dd>{% if p.last_report %}{{ p.last_report.week }} · {{ p.last_report.signal_count }} signals · {{ p.last_report.at }}{% else %}never{% endif %}</dd>
+      <dt>Enabled</dt><dd>{{ "yes" if p.enabled else "no" }}</dd>
+    </dl>
+
+    <div class="row pool-actions">
+      <form method="post" action="{{ url_for('pool_toggle', pool_id=p.id) }}"><button type="submit">{{ "Disable" if p.enabled else "Enable" }}</button></form>
+      <form method="post" action="{{ url_for('pool_delete', pool_id=p.id) }}"><button class="danger" type="submit">Remove</button></form>
+    </div>
+
+    <details class="fallback-box">
+      <summary>Manual fallback — replace this pool key directly</summary>
+      <p class="muted">Use this only when the normal SoulSync handoff is unavailable. Saving a key resets the token state and immediately attempts the exchange.</p>
+      <form method="post" class="form">
+        <input type="hidden" name="pool_id" value="{{ p.id }}">
+        <label>Pool name <input type="text" name="name" value="{{ p.name }}"></label>
+        <label>Pool URL <input type="url" name="url" value="{{ p.url }}"></label>
+        <label>Pool API key <input type="password" name="api_key" placeholder="Leave blank to keep the current key"></label>
+        <label>Role
+          <select name="role">
+            <option value="node" {% if p.role != "admin" %}selected{% endif %}>node — push report, pull data (normal)</option>
+            <option value="admin" {% if p.role == "admin" %}selected{% endif %}>admin — official MetaSync only (publishes playlist data)</option>
+          </select>
+        </label>
+        <button type="submit">Save fallback key &amp; exchange</button>
+      </form>
+    </details>
+  </section>
+  {% endfor %}
+</div>
+{% endif %}
+
+<form method="post" class="card form">
+  <p class="eyebrow">Manual fallback</p>
+  <h2>Add a pool directly</h2>
+  <p class="muted">This is the development/manual path. The preferred path is to enter the pool key in SoulSync and let SoulSync hand it to MetaSync.</p>
+  <label>Pool name <input type="text" name="name" placeholder="SIN" required></label>
+  <label>Pool URL <input type="url" name="url" placeholder="https://..." required></label>
+  <label>Pool API key <input type="password" name="api_key" placeholder="pool key"></label>
+  <label>Role
+    <select name="role">
+      <option value="node" selected>node — push report, pull data (normal)</option>
+      <option value="admin">admin — official MetaSync only (publishes playlist data)</option>
+    </select>
+  </label>
+  <button type="submit">Add pool manually</button>
+</form>
+{% endblock %}

@@ -1,0 +1,145 @@
+@import "tailwindcss";
+
+/* NOTE: do NOT add a global `* { margin: 0; padding: 0 }` reset here.
+   Unlayered CSS beats Tailwind v4's @layer utilities in the cascade.
+   Tailwind's own preflight already resets correctly inside its layers.
+   (Lesson copied from roll-call's globals.css.) */
+
+/* ── SoulSync music-dashboard theme ────────────────────────────────────
+   Boulder's rule: the portal follows the SoulSync dashboard theme
+   pretty strictly. Tokens below are adopted from SoulSync dev
+   (Nezreka/SoulSync @ bd840487, fetched via the GitHub API):
+     - webui/static/tokens.css      — --accent-rgb 29,185,84 (#1db954),
+       --accent-light-rgb 30,215,96 (#1ed760), --bg-primary #0b0b0f,
+       --font-sans / --font-mono stacks, radius + status tokens
+     - webui/static/style.css       — body background gradient
+       (135deg, #080808 → #0c0c0c → #101010)
+     - webui/static/dashboard-premier.css — glass cards: 1px solid
+       white-a08/09, linear-gradient(180deg, white .045 → .01) over a
+       dark panel, radius 20px, shadow 0 16px 40px black-a40; kicker
+       labels 11px / 700 / .16em uppercase
+   SoulSync's accent is user-configurable there; the portal pins the
+   default green, since a keys page has no per-user theme setting. */
+
+@theme {
+  --font-sans: 'SF Pro Display', 'SF Pro Text', -apple-system,
+    BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Helvetica Neue', Arial,
+    sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --color-ss-accent: #1db954;
+  --color-ss-accent-light: #1ed760;
+  --color-ss-danger: #ef4444;
+  --color-ss-danger-light: #f87171;
+  --color-ss-warning: #fbbf24;
+  --color-ss-success: #4ade80;
+  --color-ss-gold: #f5b942;
+  --color-ss-info: #38bdf8;
+}
+
+body {
+  /* SoulSync dashboard body: near-black 135deg gradient (style.css). */
+  background: linear-gradient(
+    135deg,
+    rgba(8, 8, 8, 1) 0%,
+    rgba(12, 12, 12, 1) 50%,
+    rgba(16, 16, 16, 1) 100%
+  );
+  background-attachment: fixed;
+  color: #ffffff;
+  font-family: var(--font-sans);
+}
+
+/* SoulSync glass card (dashboard-premier.css .listen-hero/.weekly-digest):
+   hairline white border, faint top-light gradient over a dark green-black
+   panel, 20px radius, deep soft shadow. */
+.card-glass {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 20px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0.01)),
+    linear-gradient(180deg, #0e1512, #090c0a);
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.4);
+}
+
+/* SoulSync sidebar glass (style.css .sidebar): dark gradient panel,
+   soft translucent border, floating shadow with an inset top glow. */
+.sidebar-glass {
+  background: linear-gradient(
+    135deg,
+    rgba(18, 18, 18, 1) 0%,
+    rgba(12, 12, 12, 1) 100%
+  );
+  border-right: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow:
+    0 8px 30px rgba(0, 0, 0, 0.34),
+    inset 0 1px 0 rgba(255, 255, 255, 0.1);
+}
+
+/* Primary action: SoulSync's accent gradient (accent → accent-light,
+   tokens.css / form range indicator), radius-control 10px, dark text
+   on the bright green (the dashboard's accent-on-dark convention). */
+.btn-primary {
+  background: linear-gradient(180deg, #1ed760, #1db954);
+  color: #04160b;
+  border-radius: 10px;
+  transition:
+    filter 0.18s ease,
+    opacity 0.18s ease;
+}
+.btn-primary:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+.btn-primary:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+/* Secondary/ghost action: surface-2 fill, hairline border (tokens.css
+   --surface-2 / --line), radius-control. */
+.btn-ghost {
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.05);
+  color: #ffffff;
+  border-radius: 10px;
+  transition:
+    background 0.18s ease,
+    border-color 0.18s ease,
+    opacity 0.18s ease;
+}
+.btn-ghost:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.09);
+  border-color: rgba(255, 255, 255, 0.2);
+}
+.btn-ghost:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+/* Destructive action: danger token at low alpha (dashboard convention). */
+.btn-danger {
+  border: 1px solid rgba(239, 68, 68, 0.25);
+  background: rgba(239, 68, 68, 0.1);
+  color: #fca5a5;
+  border-radius: 10px;
+  transition:
+    background 0.18s ease,
+    opacity 0.18s ease;
+}
+.btn-danger:hover:not(:disabled) {
+  background: rgba(239, 68, 68, 0.2);
+}
+.btn-danger:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+/* SoulSync dashboard kicker: 11px, 700, .16em tracking, uppercase,
+   in the accent (dashboard-premier.css .wd-kicker shape). */
+.kicker {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: #1ed760;
+}
