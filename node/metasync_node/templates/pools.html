@@ -6,6 +6,10 @@
   <h1>Pools</h1>
   <p class="page-sub">A pool is a network this node exchanges data with; SIN is one pool. Normally the pool key is entered in <strong>SoulSync</strong>, handed to MetaSync over the protected local connection, and exchanged here for a short-lived access token. This page is therefore mainly connection status. The manual key form stays at the bottom, collapsed, as a labelled fallback.</p>
   <p class="page-sub">A normal node can only push its weekly report and pull index/playlist data. The <strong>admin</strong> role is only for Boulder's official MetaSync, which publishes the shared playlist data — user nodes never publish.</p>
+  <div class="row">
+    <a class="btn-link" href="https://metasync.ssync.net" target="_blank" rel="noopener">Get a pool key</a>
+    <span class="muted">Opens the SIN front desk at metasync.ssync.net — sign in there to create or manage your pool key, then hand it to MetaSync from SoulSync's settings.</span>
+  </div>
 </div>
 
 {% if pools %}

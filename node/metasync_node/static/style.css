@@ -506,6 +506,25 @@ button.primary:hover { background: rgb(var(--accent-light-rgb)); border-color: r
 button.danger { border-color: rgba(var(--danger-rgb), 0.35); color: #ffb3b3; background: rgba(var(--danger-rgb), 0.05); }
 button.danger:hover { background: rgba(var(--danger-rgb), 0.13); border-color: rgba(var(--danger-rgb), 0.55); color: #ffd7d7; }
 button.btn-block { width: 100%; }
+a.btn-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 40px;
+  padding: 0 18px;
+  border: 1px solid rgba(var(--accent-rgb), 0.45);
+  border-radius: var(--radius-pill);
+  background: rgba(var(--accent-rgb), 0.10);
+  color: var(--accent-light);
+  font-size: 13px;
+  font-weight: 650;
+  letter-spacing: 0.01em;
+  text-decoration: none;
+  white-space: nowrap;
+  transition: background var(--dur-quick) ease, border-color var(--dur-quick) ease;
+}
+a.btn-link:hover { background: rgba(var(--accent-rgb), 0.18); border-color: rgba(var(--accent-rgb), 0.65); color: #fff; }
 button:focus-visible, a:focus-visible, summary:focus-visible {
   outline: 2px solid rgba(var(--accent-rgb), 0.7);
   outline-offset: 2px;
