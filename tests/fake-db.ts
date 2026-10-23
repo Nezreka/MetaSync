@@ -287,6 +287,10 @@ export class FakeSinDb {
     };
   }
 
+  selectDistinct(selection?: Record<string, unknown>) {
+    return this.select(selection);
+  }
+
   insert(table: unknown) {
     return {
       values: (vals: unknown) => new InsertQuery(this, table, vals),
@@ -344,6 +348,11 @@ export class FakeSinDb {
             const gone = this.rawRows.filter((r) => week === undefined || r.week === week);
             this.rawRows = this.rawRows.filter((r) => !gone.includes(r));
             return gone.map((r) => ({ ...r }));
+          }
+          if (table === aggregateCountsTable) {
+            const cutoff = param as string;
+            this.countRows = this.countRows.filter((r) => !(r.week < cutoff));
+            return [];
           }
           if (table === reportTokensTable) {
             const cutoff = param as string;

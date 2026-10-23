@@ -1283,6 +1283,9 @@ export interface ChartItem {
   mbid: string;
   kind: "release-group" | "artist";
   score: number;
+  /** "public" = a cold-start fill from ListenBrainz's public weekly
+   *  statistics (fillFromPublic); absent = counted by the SIN network. */
+  source?: "public";
 }
 
 export interface ChartSpec {
@@ -1520,3 +1523,68 @@ export function buildEditions(
   }
   return editions;
 }
+
+/* ------------------------------------------------------------------ */
+/* Cold start: public fill for the flagship charts                    */
+/*                                                                     */
+/* Nothing charts until k installs agree, so a young network publishes  */
+/* empty playlists. Trending and Just Landed have an honest public      */
+/* equivalent — what ListenBrainz's whole user base played last week,   */
+/* and the recent releases among it — so while the network cannot fill  */
+/* them, public items take the EMPTY slots only: network items always   */
+/* rank first, and the public share falls to zero on its own as the     */
+/* network grows. The playlist name says when public data is in it.     */
+/* Editions are built from network items only.                          */
+/* ------------------------------------------------------------------ */
+
+/** The charts that get a public fill, their base names, and what the
+ *  public source is for each. */
+export const PUBLIC_FILL_CHARTS = {
+  trending: "Trending in SoulSync",
+  "just-landed": "Just Landed",
+} as const;
+
+export type PublicFillKey = keyof typeof PUBLIC_FILL_CHARTS;
+
+/**
+ * Top up a network chart with public candidates (ranked, release-group
+ * MBIDs) to `limit` items, skipping anything the network already has.
+ * `spec` may be undefined (nothing charted on the network yet).
+ */
+export function fillFromPublic(
+  key: PublicFillKey,
+  spec: ChartSpec | undefined,
+  candidates: string[],
+  limit: number = CHART_ALBUM_LIMIT,
+): ChartSpec | undefined {
+  const items: ChartItem[] = [...(spec?.items ?? [])];
+  const have = new Set(items.map((i) => i.mbid));
+  // Public items score below every network item, in their public order.
+  for (const mbid of candidates) {
+    if (items.length >= limit) break;
+    const id = mbid.toLowerCase();
+    if (have.has(id)) continue;
+    have.add(id);
+    items.push({ mbid: id, kind: "release-group", score: 0, source: "public" });
+  }
+  if (items.length === 0) return undefined;
+  return { key, name: spec?.name ?? PUBLIC_FILL_CHARTS[key], items };
+}
+
+/**
+ * The name a published chart carries, from what actually made it in:
+ * pure network → the base name; part public → "· SoulSync + ListenBrainz";
+ * all public → "· from ListenBrainz". Nobody should mistake ListenBrainz's
+ * listening for SoulSync's.
+ */
+export function chartDisplayName(key: PublicFillKey, networkItems: number, publicItems: number): string {
+  const base = PUBLIC_FILL_CHARTS[key];
+  if (publicItems === 0) return base;
+  const short = base.replace(/ in SoulSync$/, "");
+  return networkItems === 0 ? `${short} · from ListenBrainz` : `${short} · SoulSync + ListenBrainz`;
+}
+
+/** Private running counts are kept this long: once a week can no longer
+ *  receive reports (REPORT_TOKEN_RETENTION_WEEKS), everything at or above
+ *  k is already in `aggregates`, and the below-k remainder has no use. */
+export const COUNT_RETENTION_WEEKS = REPORT_TOKEN_RETENTION_WEEKS;

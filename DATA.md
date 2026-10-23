@@ -170,6 +170,13 @@ Once per album, cached in its `mb_resolutions` bundle (`topTrackIds`). No
 node ever talks to ListenBrainz for this, and nothing in the request came
 from a SIN user: SIN collects no track-level data at all.
 
+**ListenBrainz public charts, from the composer only**
+(`src/sin/public-charts.ts`): `GET /1/stats/sitewide/release-groups?range=week&count=1000`
+(what ListenBrainz's whole user base played most last week) and
+`GET /1/explore/fresh-releases/?days=30` (what was released recently).
+Plain public reads with no parameters from SIN's data. They feed the
+cold-start fill (§9).
+
 ## 5. Identity, tokens, and the wire protocol
 
 **Node identity** (`node/metasync_node/identity.py`): on first run
@@ -318,7 +325,7 @@ Schema: `src/sin/schema.ts`, migrations `db/migrations/0001`–`0008`.
 | Table | Columns (complete) | Purpose / retention |
 |---|---|---|
 | `report_tokens` | `week`, `token_hash` (PK) | One row per accepted report: the weekly dedupe token, so a second report for the same week counts nothing. **Holds no signals and is never joined to the counts.** Pruned after 3 weeks (the report window is 2). |
-| `aggregate_counts` | `week`, `signal`, `mbid`, `node_count` (PK = week+signal+mbid) | Private running distinct-node counts, **including below-k ones**. A report adds +1 per distinct signal the moment it arrives, in the same transaction as its token claim. No route reads this table. |
+| `aggregate_counts` | `week`, `signal`, `mbid`, `node_count` (PK = week+signal+mbid) | Private running distinct-node counts, **including below-k ones**. A report adds +1 per distinct signal the moment it arrives, in the same transaction as its token claim. No route reads this table. **Deleted 3 weeks after its week**: once a week can no longer receive reports, the aggregation pass publishes everything at or above k, then drops the week's remaining (below-k) counts. |
 | `raw_reports` | `id`, `week`, `token_hash`, `signal`, `mbid`, `received_at` | **No longer written** (migration 0008). The next aggregation pass drains any rows left by the old ingest path into `aggregate_counts` and deletes them. Drop the table once it is empty. |
 | `aggregates` | `week`, `signal`, `mbid`, `node_count`, `computed_at` (PK = week+signal+mbid) | Distinct-node counts **after** the k filter — below-k rows are never written. The only table the public index reads. Kept indefinitely (it is the published history). |
 | `index_publications` | `id`, `week`, `trigger`, `aggregate_count`, `raw_deleted`, `published_at` | Audit log of aggregation runs. No user data. |
@@ -377,6 +384,25 @@ inputs are `aggregates` only — composition never reads raw reports.
   Wanted only, built from resolved bundles; an edition needs ≥ 8
   chart items sharing the tag (`CHART_MIN_EDITION_ITEMS`). Playlists
   cap at 400 tracks (`CHART_MAX_TRACKS`); flagship album charts at 25.
+
+**Cold-start fill** (`fillFromPublic`, `chartDisplayName`): until the
+network can fill them, **Trending** and **Just Landed** take
+ListenBrainz's public weekly top albums (Just Landed: the ones released
+in the last 30 days) in the slots the network leaves empty, up to 25.
+Network items always rank first, so the public share falls to zero on
+its own as the network grows. The playlist **name says so**: "Trending
+· from ListenBrainz" (all public), "Trending · SoulSync + ListenBrainz"
+(mixed), plain "Trending in SoulSync" (network only). Genre/decade
+editions are built from network items only. A public album MusicBrainz
+cannot turn into a tracklist is skipped, not waited for. Network items
+still must all resolve before a chart publishes.
+
+**History and decay**: `aggregates` keeps every published week, since
+they are public counts already above k. Each chart describes its own
+week only. Trending scores against the prior 3 weeks, so a steady
+seller ranks below a riser, and Rising and Breakouts compare with the
+previous week. Nothing older than that influences any chart. Private
+below-k counts are dropped after 3 weeks (§8).
 
 **Tracks per album**: each charted album contributes at most **5
 tracks**, its most popular by distinct ListenBrainz listeners (then total
