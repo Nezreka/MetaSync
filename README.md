@@ -172,7 +172,8 @@ python3 -m unittest discover -s tests -v   # node tests, all on localhost mocks
 Design docs: [DESIGN-NODE.md](DESIGN-NODE.md) (the node),
 [PORTAL-DESIGN.md](PORTAL-DESIGN.md) (portal, keys, and the key
 exchange), [PORTAL-EXPLAINED.md](PORTAL-EXPLAINED.md) (the plain-English
-version).
+version), [DATA.md](DATA.md) (the data map: exactly what data exists,
+where it flows, and how it is used).
 
 ---
 
