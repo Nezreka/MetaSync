@@ -1,16 +1,9 @@
-"""Canonical playlists + local materialization.
+"""Canonical playlists.
 
-A CANONICAL playlist is the pool-level definition published by the
-official node: {key, name, tracks} where tracks are already in SoulSync's
-Spotify-shaped sync format. User nodes pull these verbatim and
-materialize LOCAL copies in their own SoulSync.
-
-Local playlist identity is STABLE and minted by the node:
-    metasync_<pool_id>_<key>     e.g. metasync_sin_trending
-Every refresh syncs the SAME id with sync_mode "replace" (explicit —
-SoulSync's omitted-mode default resolves to "reconcile"; see
-soulsync.py). A refresh updates the playlist the user already has; it
-never creates a new playlist per week.
+A CANONICAL playlist is the pool-level definition: {key, name, tracks}
+where tracks are Spotify-shaped. User nodes pull these verbatim and offer
+them to SoulSync on GET /local/charts; SoulSync shows them as playlists a
+person can open. The node never writes a playlist into SoulSync.
 
 ADMIN definition building (official node only): the three global
 playlists are built from the pool index —
@@ -26,9 +19,6 @@ its playlist is a sampler, not the artist's catalogue.
 """
 from __future__ import annotations
 
-import hashlib
-import json
-import re
 from typing import Any
 
 from .musicbrainz import MusicBrainzResolver
@@ -40,17 +30,6 @@ PLAYLIST_NAMES = {
     "most-wanted": "SIN · Most Wanted",
     "breakouts": "SIN · Breakout Artists",
 }
-
-
-def local_playlist_id(pool_id: str, key: str) -> str:
-    safe_pool = re.sub(r"[^a-z0-9]+", "_", pool_id.lower()).strip("_") or "pool"
-    return f"metasync_{safe_pool}_{key}"
-
-
-def content_hash(tracks: list[dict[str, Any]]) -> str:
-    digest = hashlib.sha256()
-    digest.update(json.dumps([[t.get("id"), t.get("name")] for t in tracks]).encode())
-    return digest.hexdigest()
 
 
 def _resolve_item_tracks(item: dict[str, Any], kind: str, resolver: MusicBrainzResolver, tracks_per_item: int) -> list[dict[str, Any]] | None:

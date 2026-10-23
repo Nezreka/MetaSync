@@ -297,10 +297,9 @@ class TestDryRun(ServiceCase):
         self.assertEqual(self.store.state["previews"]["sin"]["week"], "2026-W43")
         self.assertEqual(self.store.state.get("last_report"), {})
 
-    def test_dry_run_refresh_syncs_nothing(self):
-        outcome = self.service.run_refresh(NOW)
+    def test_dry_run_refresh_writes_nothing_to_soulsync(self):
+        self.service.run_refresh(NOW)
         self.assertEqual(self.soulsync.syncs, [])
-        self.assertTrue(all(not p["synced"] or p["skipped_unchanged"] for p in outcome["pools"]["sin"]["playlists"]))
 
 
 class TestFailureIsolation(ServiceCase):
@@ -334,41 +333,35 @@ class TestPermissionModel(ServiceCase):
 
 
 class TestUserRefresh(ServiceCase):
-    def test_canonical_playlists_materialize_with_stable_ids_and_dev_payload_shape(self):
+    def test_refresh_keeps_the_charts_and_writes_nothing_into_soulsync(self):
         outcome = self.service.run_refresh(NOW)
         entry = outcome["pools"]["sin"]
         self.assertEqual(entry["status"], "ok")
-        by_id = {s["playlist_id"]: s["body"] for s in self.soulsync.syncs}
-        self.assertIn("metasync_sin_trending", by_id)
-        self.assertIn("metasync_sin_most-wanted", by_id)
-        body = by_id["metasync_sin_trending"]
-        self.assertEqual(body["playlist_name"], "SIN · Trending in SoulSync")
-        self.assertEqual(body["sync_mode"], "replace")  # explicit; SoulSync's default would be reconcile
-        track = body["tracks"][0]
+        # The node never pushes a playlist (that path also wishlisted every
+        # missing track for SoulSync's wishlist automation to download).
+        self.assertEqual(self.soulsync.syncs, [])
+        self.assertEqual([p["key"] for p in entry["playlists"]], ["trending", "most-wanted", "breakouts"])
+
+    def test_charts_are_offered_on_local_charts_for_soulsync_to_pull(self):
+        self.service.run_refresh(NOW)
+        charts = self.service.local_charts()
+        self.assertEqual(charts["week"], "2026-W43")
+        by_key = {p["key"]: p for p in charts["playlists"]}
+        # SIN keeps its keys; the empty breakouts chart is not offered
+        self.assertEqual(sorted(by_key), ["most-wanted", "trending"])
+        self.assertEqual(by_key["trending"]["name"], "SIN · Trending in SoulSync")
+        track = by_key["trending"]["tracks"][0]
         self.assertIsInstance(track["id"], str)
         self.assertIsInstance(track["artists"][0]["name"], str)
-        self.assertIn("images", track["album"])
-        self.assertIsInstance(track["duration_ms"], int)
-        # breakouts canonical playlist is empty -> never synced (would wipe).
-        self.assertNotIn("metasync_sin_breakouts", by_id)
 
-    def test_unchanged_skips_and_changed_replaces_same_id(self):
-        self.service.run_refresh(NOW)
-        count = len(self.soulsync.syncs)
-        second = self.service.run_refresh(NOW)
-        self.assertEqual(len(self.soulsync.syncs), count)
-        self.assertTrue(all(p["skipped_unchanged"] for p in second["pools"]["sin"]["playlists"] if p["track_count"]))
-
-        changed = json.loads(json.dumps(CANONICAL_PLAYLISTS))
-        changed["playlists"][0]["tracks"] = [dict(changed["playlists"][0]["tracks"][0], id="rec-9", name="New Song")]
-        self.pool.close()
-        self.pool = MockPool(playlists=changed)
-        self.addCleanup(self.pool.close)
-        self.store.settings["pools"][0]["url"] = self.pool.url
-        self.service.run_refresh(NOW)
-        trending = [s for s in self.soulsync.syncs if s["playlist_id"] == "metasync_sin_trending"]
-        self.assertEqual(len(trending), 2)
-        self.assertEqual(trending[1]["body"]["tracks"][0]["name"], "New Song")
+    def test_another_pools_charts_cannot_collide_with_sins(self):
+        self.store.state["playlists_cache"] = {
+            "sin": {"week": "2026-W43", "playlists": [{"key": "trending", "name": "T", "tracks": [{"id": "a"}]}]},
+            "lab": {"week": "2026-W43", "playlists": [{"key": "trending", "name": "T", "tracks": [{"id": "b"}]}]},
+        }
+        self.store.settings["pools"].append({"id": "lab", "name": "Lab", "url": "http://127.0.0.1:9", "api_key": "k", "enabled": True})
+        keys = [(p["key"], p["name"]) for p in self.service.local_charts()["playlists"]]
+        self.assertEqual(keys, [("trending", "T"), ("lab-trending", "Lab · T")])
 
 
 class TestUserRefreshWithoutPoolPlaylists(ServiceCase):
@@ -385,7 +378,7 @@ class TestUserRefreshWithoutPoolPlaylists(ServiceCase):
 class TestAdminFlow(ServiceCase):
     pool_role = "admin"
 
-    def test_admin_builds_definitions_publishes_and_materializes(self):
+    def test_admin_builds_definitions_and_publishes(self):
         outcome = self.service.run_refresh(NOW)
         entry = outcome["pools"]["sin"]
         self.assertEqual(entry["status"], "published")
@@ -398,25 +391,14 @@ class TestAdminFlow(ServiceCase):
         self.assertEqual(trending_tracks[0]["artists"][0]["name"], "Fixture Artist")
         breakout_tracks = by_key["breakouts"]["tracks"]
         self.assertEqual([t["name"] for t in breakout_tracks], ["Song One", "Song Two"])  # newest Album RG sampled
-        # ...and the official node materializes the same definitions locally.
-        self.assertIn("metasync_sin_trending", {s["playlist_id"] for s in self.soulsync.syncs})
+        # ...and offers the same definitions to its own SoulSync, never pushing them.
+        self.assertEqual(self.soulsync.syncs, [])
+        self.assertIn("trending", {p["key"] for p in self.service.local_charts()["playlists"]})
 
     def test_admin_can_trigger_aggregate(self):
         client = PoolClient(self.pool_dict())
         client.post_aggregate()
         self.assertEqual(self.pool.aggregate_calls, 1)
-
-
-class TestSyncConflictIsolation(ServiceCase):
-    fail_sync = True
-
-    def test_409_does_not_fail_other_work_or_the_node(self):
-        outcome = self.service.run_refresh(NOW)
-        entry = outcome["pools"]["sin"]
-        self.assertEqual(entry["status"], "ok")
-        self.assertTrue(all(not p["synced"] for p in entry["playlists"]))
-        self.assertTrue(any(e["leg"].startswith("refresh:sync:") for e in self.store.state["last_errors"]))
-        self.assertTrue(self.service.status()["ok"])
 
 
 class TestMusicBrainzCaching(ServiceCase):
@@ -709,6 +691,12 @@ class TestLocalApiAndPairing(ServiceCase):
         self.assertEqual(status.status_code, 200)
         self.assertEqual(status.get_json()["node_id"], self.service.identity.node_id)
         self.assertNotIn(first, self.client.get("/").get_data(as_text=True), "the key is shown only once")
+
+        # SoulSync's daily chart pull rides the same key.
+        self.assertEqual(self.client.get("/local/charts").status_code, 401)
+        charts = self.client.get("/local/charts", headers=self._auth(first))
+        self.assertEqual(charts.status_code, 200)
+        self.assertEqual(set(charts.get_json()), {"week", "playlists"})
 
         second = self._shown_local_key()
         self.assertNotEqual(first, second)

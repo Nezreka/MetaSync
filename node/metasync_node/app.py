@@ -267,6 +267,13 @@ def create_app(service: NodeService) -> Flask:
     def local_status():
         return service.local_status()
 
+    @app.get("/local/charts")
+    @local_key_required
+    def local_charts():
+        # SoulSync's daily "Refresh MetaSync Charts" automation reads this.
+        # Offers only: SoulSync shows them as playlists a person can open.
+        return service.local_charts()
+
     @app.post("/local/disconnect")
     @local_key_required
     def local_disconnect():

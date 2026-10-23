@@ -20,7 +20,7 @@ described below.
 
 | Piece | What it is |
 |---|---|
-| [`node/`](node/) | **MetaSync itself** — the program you run next to your SoulSync (Python, own web UI on port 8790, Docker or bare metal). It reads your SoulSync locally, computes the weekly signals, sends them to the pools you joined, and pulls the shared playlists back into your SoulSync. |
+| [`node/`](node/) | **MetaSync itself** — the program you run next to your SoulSync (Python, own web UI on port 8790, Docker or bare metal). It reads your SoulSync locally, computes the weekly signals, sends them to the pools you joined, and offers the network's charts to your SoulSync, which shows them as playlists you can open. |
 | [`src/sin`](src/sin) | The SIN pool server (the backend behind the portal's pool URL). Takes reports, folds them into counts, and builds the charts. |
 | [`portal/`](portal/) | The website — [metasync.ssync.net](https://metasync.ssync.net) — where you sign in, create your pool key, and approve your node. |
 | [`src/metasync`](src/metasync) | A second, future network (a shared *metadata* service keyed by SoulID). Scaffold only — not part of the beta, and not used by SIN. |
@@ -140,11 +140,11 @@ and Just Landed fill their empty slots from ListenBrainz's public weekly
 charts. The playlist name says so ("Trending · from ListenBrainz"), and
 network data replaces public data automatically as installs report.
 
-Your node pulls the finished track lists and creates/updates them as
-playlists in your SoulSync. Matching those tracks to your music source —
-and downloading anything — stays your choice, per playlist. Nothing is
-ever grabbed automatically. (A browseable rail on SoulSync's Discover
-page is in the works; today the charts arrive as playlists.)
+Your node pulls the finished charts, and SoulSync fetches them from your
+node once a day, matches every track in the background, and shows the
+ready ones as **SoulSync Charts** on its dashboard and Discover page.
+Opening one gives you that playlist, already matched. **Nothing is synced
+or downloaded until you press Sync & download** on it.
 
 ## How a report flows
 

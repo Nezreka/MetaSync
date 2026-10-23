@@ -102,18 +102,10 @@ and again server-side by the (week, token, signal, mbid) unique index):
 pool key in `X-SIN-Key`. The token rotates weekly (§5), so the same
 payload shape works for every pool.
 
-**PROVIDE / UPDATE.** A refresh pulls the pool's canonical playlists
-(`{week, playlists: [{key, name, tracks}]}`; tracks are already in
-SoulSync's Spotify-shaped sync format) and syncs each into the local
-SoulSync under a **stable minted id**, `metasync_<pool>_<key>`
-(e.g. `metasync_sin_trending`), with explicit `sync_mode: "replace"`.
-Why explicit: SoulSync resolves an omitted mode to its configured default
-`"reconcile"` (`api/source_playlists.py`, verified on dev), which would
-preserve stale server-side state instead of replacing content. Replace +
-stable id = the user's existing playlist is updated in place, never a
-new playlist per week. Unchanged content (hash of track ids+names) is
-skipped; an empty track list is never synced (a replace of zero tracks
-would wipe the user's playlist).
+**PROVIDE.** *[Superseded Oct 23, 2026; see §13.]* The node used to
+sync each canonical playlist into SoulSync. It now only caches them and
+offers them on `GET /local/charts`; SoulSync pulls, matches and shows
+them, and nothing syncs or downloads until a person presses the button.
 
 **Global playlists** (names are part of the canonical definition):
 - `trending` → **SIN · Trending in SoulSync**
@@ -347,3 +339,29 @@ As built now (`signals.py`, `service.py`, `run.py`):
   legacy direct-key fallback (§1, `pool.py`) applies only to a
   loopback pool: any other pool that 404s the exchange is an error,
   never a reason to start sending the raw key.
+
+## 13. Charts are offered, never pushed (Oct 23, 2026)
+
+The node used to deliver each chart by calling SoulSync's playlist sync
+(`POST /api/v1/playlists/<id>/sync`). That sync builds a media-server
+playlist from the tracks the user already owns, and puts every missing
+track on the wishlist. SoulSync's default **Auto-Process Wishlist**
+automation then downloads the wishlist every 30 minutes. Every node
+would have started downloading up to 25 albums × 5 tracks per chart, per
+week, with nobody asking. The automatic wishlist adds would also have
+come back to SIN as `wishlist_add` signals, inflating the very albums
+that charted. No chart had published yet, so nothing was ever downloaded
+this way.
+
+As built now:
+
+- The node caches the pool's charts and serves them on
+  `GET /local/charts` (local key). It has no code path that writes to
+  SoulSync: `SoulSyncClient.sync_playlist` is gone.
+- SoulSync pulls them with its daily **"Refresh MetaSync Charts"** system
+  automation, matches them in the background, and offers the ready ones
+  on its dashboard and Discover page (SoulSync `core/metasync_charts.py`).
+- A person opens one, gets it as their own playlist with the matches
+  already in it, and presses Sync & download if they want it. That is the
+  only path to a download, and only a deliberate wishlist add ever
+  becomes a signal.

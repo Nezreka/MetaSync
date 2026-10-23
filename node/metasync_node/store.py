@@ -6,7 +6,7 @@
                                        (step B: join a pool; SIN is one pool)
   plus dry_run and the UI admin password hash.
 - state.json: runtime state — last report per pool, cached pool index,
-  canonical playlists cache, the SoulSync playlist ids this node manages,
+  canonical playlists cache (offered to SoulSync on GET /local/charts),
   MusicBrainz caches, recent errors.
 
 Both files are written 0600 (they contain API keys). SQLite stays the
@@ -65,7 +65,6 @@ class Store:
             "last_refresh_at": None,
             "index_cache": {},       # pool_id -> {fetched_at, week, trending, most_wanted, breakouts}
             "playlists_cache": {},   # pool_id -> {fetched_at, week, playlists}
-            "managed_playlists": {},  # pool_id -> {key -> {playlist_id, name, content_hash, track_count, last_sync_at, last_error}}
             "built_definitions": {},  # pool_id -> canonical playlists built in admin mode
             "release_to_group": {},  # MusicBrainz release mbid -> release-group mbid
             "mb_cache": {},          # MusicBrainz URL path -> JSON
