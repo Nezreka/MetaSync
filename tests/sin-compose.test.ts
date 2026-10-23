@@ -65,6 +65,19 @@ describe("selectChartSpecs", () => {
     assert.ok(!keys.includes("breakouts"));
     assert.ok(keys.includes("most-wanted"));
   });
+
+  test("on-repeat charts listen_album only, and only when someone opted in", () => {
+    assert.ok(!selectChartSpecs(rows(), W, [], null).some((s) => s.key === "on-repeat"));
+    const withListens = [
+      ...rows(),
+      { week: W, signal: "listen_album" as const, mbid: RG(2), nodeCount: 18 },
+      { week: W, signal: "listen_album" as const, mbid: RG(5), nodeCount: 26 },
+      { week: PW, signal: "listen_album" as const, mbid: RG(7), nodeCount: 90 },
+    ];
+    const onRepeat = selectChartSpecs(withListens, W, [PW], PW).find((s) => s.key === "on-repeat")!;
+    assert.deepEqual(onRepeat.items.map((i) => i.mbid), [RG(5), RG(2)]);
+    assert.equal(onRepeat.name, "On Repeat");
+  });
 });
 
 describe("download signals in scoring", () => {

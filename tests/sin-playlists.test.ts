@@ -10,6 +10,7 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
+  isoWeekOf,
   MAX_PLAYLISTS_PER_PUBLISH,
   MAX_TRACKS_PER_PLAYLIST,
   validatePlaylistsPublish,
@@ -287,7 +288,7 @@ describe("routes: key split (no live database)", () => {
         method: "POST",
         headers: { "x-sin-key": key },
         body: JSON.stringify({
-          week: WEEK,
+          week: isoWeekOf(new Date()),
           token: "a".repeat(64),
           signals: [{ type: "watchlist_add", mbid: "11111111-1111-1111-1111-111111111111" }],
         }),
@@ -365,7 +366,7 @@ describe("routes: key split (no live database)", () => {
         method: "POST",
         headers: { "x-sin-key": NODE_KEY },
         body: JSON.stringify({
-          week: WEEK,
+          week: isoWeekOf(new Date()),
           token: "a".repeat(64),
           signals: [{ type: "watchlist_add", mbid: "11111111-1111-1111-1111-111111111111" }],
         }),

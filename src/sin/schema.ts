@@ -1,12 +1,17 @@
 /**
  * SIN Drizzle schema — see db/migrations/0001_sin_init.sql for the matching SQL.
  *
- * raw_reports: short-lived ingest rows. One row per (token, week, signal, mbid);
- *   the unique index IS the binary-contribution rule in the database.
- *   Rows are deleted 24h after receipt (see logic.ts RAW_REPORT_RETENTION_MS).
+ * report_tokens: one row per (week, token) — the ONLY trace of a report
+ *   beyond its counts. It refuses a second report for the same week and
+ *   holds nothing else; pruned after REPORT_TOKEN_RETENTION_WEEKS.
+ * aggregate_counts: private running distinct-node counts per (week,
+ *   signal, mbid), incremented as each report arrives (migration 0008).
+ *   Includes below-k counts, so NO route ever reads it.
+ * raw_reports: the pre-0008 per-node ingest rows. Nothing writes it any
+ *   more; aggregation drains leftover rows into aggregate_counts.
  * aggregates: the ONLY table the public index routes read. One row per
- *   (week, signal, mbid) with the distinct-node count, written by aggregation
- *   after the k threshold has been applied.
+ *   (week, signal, mbid) with the distinct-node count, copied from
+ *   aggregate_counts by aggregation once the k threshold is met.
  * index_publications: audit/bookkeeping for each aggregation run.
  * canonical_playlists: the week's shared playlist definitions, written
  *   only by the official MetaSync (admin key) — see 0002 migration.
@@ -51,6 +56,27 @@ export const rawReports = pgTable(
     index("raw_reports_received_at_idx").on(t.receivedAt),
     index("raw_reports_week_signal_mbid_idx").on(t.week, t.signal, t.mbid),
   ],
+);
+
+export const reportTokens = pgTable(
+  "report_tokens",
+  {
+    week: varchar("week", { length: 8 }).notNull(),
+    /** Rotating dedupe token hash(node_key + week) — never linked to signals. */
+    tokenHash: varchar("token_hash", { length: 128 }).notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.week, t.tokenHash] })],
+);
+
+export const aggregateCounts = pgTable(
+  "aggregate_counts",
+  {
+    week: varchar("week", { length: 8 }).notNull(),
+    signal: varchar("signal", { length: 32 }).notNull(),
+    mbid: uuid("mbid").notNull(),
+    nodeCount: integer("node_count").notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.week, t.signal, t.mbid] })],
 );
 
 export const aggregates = pgTable(

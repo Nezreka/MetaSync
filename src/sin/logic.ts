@@ -7,9 +7,10 @@
  * Privacy invariants baked in here (see README / SIDECAR-ARCHITECTURE-SKETCH.md §2):
  * - Signals are keyed ONLY by MusicBrainz IDs. SoulID is NOT used by SIN —
  *   SoulID belongs exclusively to the metadata MetaSync service.
- * - Exactly seven signal types exist. Anything else is rejected.
+ * - Exactly eight signal types exist. Anything else is rejected.
  * - Contributions are binary: one node can contribute at most 1 per
- *   (week, signal, MBID), enforced by dedupe on the rotating weekly token.
+ *   (week, signal, MBID), and a node's token is accepted once per week.
+ * - Reports are counted on arrival and never stored per node.
  * - Nothing is published below the k-anonymity threshold.
  */
 
@@ -23,20 +24,26 @@ export const BREAKOUT_MIN_NODES = 20;
 /** A breakout needs week-over-week watchlist_add growth of at least this factor. */
 export const BREAKOUT_GROWTH_FACTOR = 2;
 
-/** Raw reports are deleted this long after receipt (24 hours). */
-export const RAW_REPORT_RETENTION_MS = 24 * 60 * 60 * 1000;
+/** Hard cap on a single POST /v1/report body, in bytes. A report carries
+ *  one week of events (DESIGN-NODE.md §12), not a library listing, so it
+ *  is a few hundred signals; this leaves headroom while rejecting abuse. */
+export const MAX_REPORT_BODY_BYTES = 1024 * 1024;
 
-/** Hard cap on a single POST /v1/report body, in bytes. A report from a
- *  large library carries one signal per distinct release group owned, which
- *  at real scale (a 71k-album library) is tens of thousands of signals and
- *  low single-digit MB; this cap leaves headroom while rejecting abuse. */
-export const MAX_REPORT_BODY_BYTES = 16 * 1024 * 1024;
+/** Hard cap on the number of signals in a single report. */
+export const MAX_SIGNALS_PER_REPORT = 5_000;
 
-/** Hard cap on the number of signals in a single report. Sized for the
- *  largest real libraries, not the average one. */
-export const MAX_SIGNALS_PER_REPORT = 100_000;
+/** Per-type cap in one report. The node suppresses a bulk import rather
+ *  than reporting it (it is a migration, not taste), so a real report
+ *  sits far below this; a report above it is a library dump and is
+ *  refused rather than stored. */
+export const MAX_SIGNALS_PER_TYPE = 1_000;
 
-/** The only seven signal types SIN accepts (see DESIGN-DOWNLOAD-SIGNALS.md). */
+/** listen_album is the most personal signal, so its cap is tighter: the
+ *  node sends at most its top 50 albums of the week (DESIGN-LISTEN-SIGNALS.md). */
+export const MAX_LISTEN_SIGNALS = 100;
+
+/** The only eight signal types SIN accepts (DESIGN-DOWNLOAD-SIGNALS.md,
+ *  DESIGN-LISTEN-SIGNALS.md). */
 export const SIGNAL_TYPES = [
   "watchlist_add",
   "wishlist_add",
@@ -45,6 +52,7 @@ export const SIGNAL_TYPES = [
   "recent_add",
   "download_grab",
   "download_churn",
+  "listen_album",
 ] as const;
 
 export type SignalType = (typeof SIGNAL_TYPES)[number];
@@ -58,7 +66,36 @@ export const SIGNAL_MBID_KIND: Record<SignalType, "artist" | "release-group"> = 
   recent_add: "release-group",
   download_grab: "release-group",
   download_churn: "release-group",
+  listen_album: "release-group",
 };
+
+function signalTypeCap(type: SignalType): number {
+  return type === "listen_album" ? MAX_LISTEN_SIGNALS : MAX_SIGNALS_PER_TYPE;
+}
+
+/** ISO-8601 week of a UTC instant, e.g. "2026-W43" (weeks start Monday;
+ *  week 1 holds the year's first Thursday). Same rule as the node's
+ *  weekutil.iso_week_string. */
+export function isoWeekOf(when: Date): string {
+  const d = new Date(Date.UTC(when.getUTCFullYear(), when.getUTCMonth(), when.getUTCDate()));
+  const weekday = d.getUTCDay() || 7;
+  d.setUTCDate(d.getUTCDate() + 4 - weekday); // the Thursday of this week
+  const yearStart = Date.UTC(d.getUTCFullYear(), 0, 1);
+  const week = Math.ceil(((d.getTime() - yearStart) / 86_400_000 + 1) / 7);
+  return `${d.getUTCFullYear()}-W${String(week).padStart(2, "0")}`;
+}
+
+/** The weeks a report may be filed for: the one that just closed (what a
+ *  current node sends) and the current one. Anything older or in the
+ *  future is refused, so nobody can backfill or pre-stuff a week. */
+export function openReportWeeks(now: Date = new Date()): string[] {
+  const previous = new Date(now.getTime() - 7 * 86_400_000);
+  return [isoWeekOf(previous), isoWeekOf(now)];
+}
+
+/** Report tokens older than this many weeks can no longer collide with
+ *  an accepted report (the window is two weeks), so they are pruned. */
+export const REPORT_TOKEN_RETENTION_WEEKS = 3;
 
 export interface SignalInput {
   type: SignalType;
@@ -173,6 +210,17 @@ export function validateReport(input: unknown): ValidationResult {
         errors.push(`signals[${i}].mbid must be a UUID-shaped MusicBrainz ID`);
       }
     });
+    if (errors.length === 0) {
+      const perType = new Map<SignalType, number>();
+      for (const s of dedupeSignals(obj.signals as SignalInput[])) {
+        perType.set(s.type, (perType.get(s.type) ?? 0) + 1);
+      }
+      for (const [type, count] of perType) {
+        if (count > signalTypeCap(type)) {
+          errors.push(`${type} exceeds max of ${signalTypeCap(type)} per report`);
+        }
+      }
+    }
   }
 
   if (errors.length > 0) return { ok: false, errors };
@@ -201,17 +249,24 @@ export function dedupeSignals(signals: SignalInput[]): SignalInput[] {
   return out;
 }
 
-/** Expand a validated report into one raw row per signal. */
-export function reportToRawRows(
-  report: ReportInput,
-  receivedAt: string | number | Date = new Date(),
-): RawReportRow[] {
+/** One +1 for the running count of (week, signal, mbid). */
+export interface CountIncrement {
+  week: string;
+  signal: SignalType;
+  mbid: string;
+}
+
+/**
+ * Expand a validated report into one count increment per distinct
+ * signal. This is ALL the server keeps of a report: the token is used
+ * once, to refuse a second report for the same week, and never stored
+ * beside the signals — no per-node row ever exists at rest.
+ */
+export function reportToCountIncrements(report: ReportInput): CountIncrement[] {
   return dedupeSignals(report.signals).map((s) => ({
     week: report.week,
-    token: report.token,
     signal: s.type,
     mbid: s.mbid,
-    receivedAt,
   }));
 }
 
@@ -228,29 +283,11 @@ export function dedupeRawReports(rows: RawReportRow[]): RawReportRow[] {
   return out;
 }
 
-function toEpochMs(value: string | number | Date): number {
-  if (value instanceof Date) return value.getTime();
-  if (typeof value === "number") return value;
-  return Date.parse(value);
-}
-
-/** Cutoff for the 24h raw-report purge: rows received before this are deleted. */
-export function rawReportCutoff(now: Date = new Date()): Date {
-  return new Date(now.getTime() - RAW_REPORT_RETENTION_MS);
-}
-
-export function isRawReportExpired(
-  receivedAt: string | number | Date,
-  now: Date = new Date(),
-): boolean {
-  return toEpochMs(receivedAt) < rawReportCutoff(now).getTime();
-}
-
 /**
- * Aggregate raw rows into published aggregates:
- * count DISTINCT tokens per (week, signal, mbid), keep only groups at or
- * above the k threshold. Groups below k are dropped entirely — below the
- * threshold, the data point does not exist publicly.
+ * Count DISTINCT tokens per (week, signal, mbid) and keep groups at or
+ * above k. Used only to drain raw_reports rows left by the pre-0008
+ * ingest path into the running counts (with k = 1); new reports never
+ * create raw rows.
  */
 export function aggregateRawReports(
   rows: RawReportRow[],
@@ -1318,7 +1355,9 @@ export function selectChartSpecs(
       .map((i) => ({ mbid: i.mbid, kind: "release-group" as const, score: i.nodeCount })),
   );
 
-  // Loved & Kept: keeps net of churn. download_churn aggregates only
+  // Loved & Kept: albums that passed 14 days in installs' libraries this
+  // week (import_keep fires once per album, at that mark), net of churn
+  // (also once per album, at the drop). download_churn aggregates only
   // exist for albums at/above k within the toggle-on population, so
   // subtracting them never mixes populations; where no churn aggregate
   // exists there is no dampening. Albums whose churn meets or beats
@@ -1340,6 +1379,15 @@ export function selectChartSpecs(
     "just-landed",
     "Just Landed",
     topItems(sumsFor(aggregates, week, ["recent_add"]), "release-group", CHART_ALBUM_LIMIT),
+  );
+
+  // On Repeat: albums the most installs actually played this week
+  // (listen_album — opt-in on the node, DESIGN-LISTEN-SIGNALS.md). Like
+  // churn, it only exists where >= k opted-in installs played the album.
+  push(
+    "on-repeat",
+    "On Repeat",
+    topItems(sumsFor(aggregates, week, ["listen_album"]), "release-group", CHART_ALBUM_LIMIT),
   );
 
   // Trending: this week's heat per release group (max of wishlist adds

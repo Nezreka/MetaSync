@@ -13,13 +13,15 @@ import {
   dedupeRawReports,
   dedupeSignals,
   isIsoWeekString,
-  isRawReportExpired,
+  isoWeekOf,
   isUuidShape,
   K_PUBLISH_THRESHOLD,
   keepRateReason,
+  MAX_LISTEN_SIGNALS,
   MAX_SIGNALS_PER_REPORT,
-  rawReportCutoff,
-  reportToRawRows,
+  MAX_SIGNALS_PER_TYPE,
+  openReportWeeks,
+  reportToCountIncrements,
   trendingScore,
   validateReport,
   type AggregateRow,
@@ -106,22 +108,47 @@ describe("validation", () => {
     assert.equal(withExtra.ok, false);
   });
 
-  test("accepts recent_add signals and a large-library-sized report", () => {
+  test("accepts recent_add; refuses a library-dump-sized report", () => {
     const recent = validateReport({
       week: WEEK,
       token: TOKEN_1,
       signals: [{ type: "recent_add", mbid: MBID_A }],
     });
     assert.equal(recent.ok, true);
-    // A 71k-album library produces tens of thousands of import_keep signals;
-    // the cap must sit far above that (see MAX_SIGNALS_PER_REPORT).
-    const large = Array.from({ length: 50_000 }, (_, i) => ({
-      type: "import_keep",
-      mbid: `aaaaaaaa-aaaa-4aaa-8aaa-${String(i).padStart(12, "0")}`,
-    }));
+    // A report is one week of events, never a library listing: a type
+    // above its cap is a dump and is refused outright.
+    const dump = (n: number, type = "import_keep") =>
+      Array.from({ length: n }, (_, i) => ({
+        type,
+        mbid: `aaaaaaaa-aaaa-4aaa-8aaa-${String(i).padStart(12, "0")}`,
+      }));
     assert.equal(
-      validateReport({ week: WEEK, token: TOKEN_1, signals: large }).ok,
+      validateReport({ week: WEEK, token: TOKEN_1, signals: dump(MAX_SIGNALS_PER_TYPE) }).ok,
       true,
+    );
+    const over = validateReport({
+      week: WEEK,
+      token: TOKEN_1,
+      signals: dump(MAX_SIGNALS_PER_TYPE + 1),
+    });
+    assert.equal(over.ok, false);
+    if (!over.ok) assert.match(over.errors.join(" "), /import_keep exceeds max/);
+  });
+
+  test("listen_album validates and has its own tighter cap", () => {
+    const listens = (n: number) =>
+      Array.from({ length: n }, (_, i) => ({
+        type: "listen_album",
+        mbid: `bbbbbbbb-bbbb-4bbb-8bbb-${String(i).padStart(12, "0")}`,
+      }));
+    assert.equal(validateReport({ week: WEEK, token: TOKEN_1, signals: listens(1) }).ok, true);
+    assert.equal(
+      validateReport({ week: WEEK, token: TOKEN_1, signals: listens(MAX_LISTEN_SIGNALS) }).ok,
+      true,
+    );
+    assert.equal(
+      validateReport({ week: WEEK, token: TOKEN_1, signals: listens(MAX_LISTEN_SIGNALS + 1) }).ok,
+      false,
     );
   });
 
@@ -180,17 +207,33 @@ describe("dedupe", () => {
     assert.equal(dedupeRawReports([row, row, other]).length, 2);
   });
 
-  test("reportToRawRows emits one row per deduped signal", () => {
-    const rows = reportToRawRows({
+  test("reportToCountIncrements: one +1 per distinct signal, and no token", () => {
+    const inc = reportToCountIncrements({
       week: WEEK,
       token: TOKEN_1,
       signals: [
         { type: "watchlist_add", mbid: MBID_A },
         { type: "watchlist_add", mbid: MBID_A },
+        { type: "listen_album", mbid: MBID_B },
       ],
     });
-    assert.equal(rows.length, 1);
-    assert.equal(rows[0]?.token, TOKEN_1);
+    assert.equal(inc.length, 2);
+    assert.ok(!JSON.stringify(inc).includes(TOKEN_1));
+  });
+});
+
+describe("report weeks", () => {
+  test("isoWeekOf follows ISO-8601 (Monday weeks, week 1 holds Jan 4)", () => {
+    assert.equal(isoWeekOf(new Date("2026-10-23T12:00:00Z")), "2026-W43");
+    assert.equal(isoWeekOf(new Date("2026-10-19T00:00:00Z")), "2026-W43"); // Monday
+    assert.equal(isoWeekOf(new Date("2026-10-18T23:59:59Z")), "2026-W42"); // Sunday
+    assert.equal(isoWeekOf(new Date("2021-01-03T12:00:00Z")), "2020-W53");
+    assert.equal(isoWeekOf(new Date("2024-12-30T12:00:00Z")), "2025-W01");
+  });
+
+  test("only the week that just closed and the current week are open", () => {
+    const now = new Date("2026-10-19T00:05:00Z"); // Monday of W43
+    assert.deepEqual(openReportWeeks(now), ["2026-W42", "2026-W43"]);
   });
 });
 
@@ -213,12 +256,6 @@ describe("aggregation + k threshold", () => {
     assert.equal(aggregateRawReports(rawRows(3), 4).length, 0);
   });
 
-  test("raw rows expire after 24h", () => {
-    const now = new Date("2026-10-22T12:00:00Z");
-    assert.equal(rawReportCutoff(now).toISOString(), "2026-10-21T12:00:00.000Z");
-    assert.equal(isRawReportExpired(new Date("2026-10-21T11:59:59Z"), now), true);
-    assert.equal(isRawReportExpired(new Date("2026-10-21T12:00:01Z"), now), false);
-  });
 });
 
 describe("scoring", () => {
@@ -294,6 +331,7 @@ describe("routes (no live database)", () => {
   test("sin: health is public, writes fail closed without/with wrong key", async () => {
     process.env.SIN_INGEST_KEY = "test-ingest-secret-0123456789";
     delete process.env.DATABASE_URL;
+    const openWeek = isoWeekOf(new Date());
     const { default: sinApp } = await import("../src/sin/index.ts");
 
     const health = await sinApp.request("/health");
@@ -318,7 +356,7 @@ describe("routes (no live database)", () => {
       method: "POST",
       headers: { "x-sin-key": "test-ingest-secret-0123456789" },
       body: JSON.stringify({
-        week: WEEK,
+        week: openWeek,
         token: TOKEN_1,
         signals: [{ type: "watchlist_add", mbid: MBID_A }],
       }),
