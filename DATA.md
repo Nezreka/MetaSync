@@ -134,7 +134,7 @@ refused, not trimmed. Unknown fields, extra keys inside a signal, or
 a title/artist field smuggled into a signal are all 400s. (The unit
 tests pin the "a signal carrying a title is rejected" case.)
 
-## 4. MusicBrainz — the only third party that sees anything
+## 4. MusicBrainz and ListenBrainz — the only third parties that see anything
 
 MusicBrainz receives **MBIDs in URL paths and nothing else** — no user
 data, no library data; the queries are "what is this public ID".
@@ -159,6 +159,16 @@ budget (default 40, max 200). Results are cached permanently in
 `mb_resolutions` (§8). Cover art is **not fetched** — only a
 Cover Art Archive URL is constructed
 (`https://coverartarchive.org/release-group/<mbid>/front-500`).
+
+**ListenBrainz, from the composer only** (`src/sin/mb.ts`,
+`ListenBrainzPopularity`): `POST https://api.listenbrainz.org/1/popularity/recording`
+with `{recording_mbids: [...]}` — the recording MBIDs of a **charted**
+album's tracklist, taken from MusicBrainz's public catalogue. The answer is
+ListenBrainz's catalogue-wide listen and listener counts per recording,
+used to pick the album's 5 most popular tracks for the playlists (§9).
+Once per album, cached in its `mb_resolutions` bundle (`topTrackIds`). No
+node ever talks to ListenBrainz for this, and nothing in the request came
+from a SIN user: SIN collects no track-level data at all.
 
 ## 5. Identity, tokens, and the wire protocol
 
@@ -315,7 +325,7 @@ Schema: `src/sin/schema.ts`, migrations `db/migrations/0001`–`0008`.
 | `portal_keys` | `id`, `user_id`, `key_hash`, `key_prefix`, `label`, `last_used_at`, `expires_at`, `created_at`, `updated_at`, `revoked_at`, `bound_node_id`, `bound_node_public_key`, `bound_at`, `pending_node_id`, `pending_node_public_key`, `pending_requested_at` | Pool keys (§10). Only `sha256(API_KEY_PEPPER + raw_key)` is stored; the raw key exists only on the user's machine. `user_id` exists in the table but **SIN function code never selects or returns it** (privacy rule P3); the portal app is the only reader of that column. |
 | `sin_request_nonces` | `node_id`, `nonce_hash`, `expires_at` | Replay defence (§5). Hashes only, no bodies, no report content; rows expire with the ±5-minute window and are deleted opportunistically. |
 | `canonical_playlists` | `week`, `key`, `name`, `tracks` (jsonb), `published_at` (PK = week+key) | The published charts (§9). `tracks` is the Spotify-shaped subset: per track `{id (MusicBrainz recording MBID), name, artists: [{name}], album: {name, images: [{url}]}, duration_ms?, image_url}`. |
-| `mb_resolutions` | `mbid`, `kind`, `bundle` (jsonb), `resolved_at` | Composer's permanent MusicBrainz cache. Release-group bundle: `{mbid, kind, title, artistName, artistMbid?, genre?, year?, tracks}`; artist bundle: `{mbid, kind, name, genre?, releaseGroupMbids}`. **Public catalogue data only** — nothing in it came from a user. |
+| `mb_resolutions` | `mbid`, `kind`, `bundle` (jsonb), `resolved_at` | Composer's permanent MusicBrainz cache. Release-group bundle: `{mbid, kind, title, artistName, artistMbid?, genre?, year?, tracks, topTrackIds?}` (`topTrackIds`: the 5 most popular recordings, from ListenBrainz); artist bundle: `{mbid, kind, name, genre?, releaseGroupMbids}`. **Public catalogue data only** — nothing in it came from a user. |
 
 ## 9. Aggregation and composition — how counts become charts
 
@@ -367,6 +377,10 @@ inputs are `aggregates` only — composition never reads raw reports.
   Wanted only, built from resolved bundles; an edition needs ≥ 8
   chart items sharing the tag (`CHART_MIN_EDITION_ITEMS`). Playlists
   cap at 400 tracks (`CHART_MAX_TRACKS`); flagship album charts at 25.
+
+**Tracks per album**: each charted album contributes at most **5
+tracks**, its most popular by distinct ListenBrainz listeners (then total
+listens), or its first 5 when ListenBrainz has no data for it.
 
 A chart spec is published (upserted into `canonical_playlists`)
 **only when every item in it resolved** through MusicBrainz within

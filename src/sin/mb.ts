@@ -29,6 +29,11 @@ export interface ReleaseGroupBundle {
   genre?: string;
   year?: number;
   tracks: PlaylistTrack[];
+  /** The album's most popular tracks (recording MBIDs, best first), from
+   *  ListenBrainz's public popularity data — at most CHART_TRACKS_PER_ALBUM.
+   *  Absent = not looked up yet; [] = looked up, no popularity data (the
+   *  playlist then takes the album's first tracks). */
+  topTrackIds?: string[];
 }
 
 export interface ArtistBundle {
@@ -206,5 +211,110 @@ export class MbResolver {
       `/artist/${mbid}?inc=genres+release-groups&fmt=json`,
     )) as MbArtistJson;
     return artistBundle(artist);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Track picking: the album's most popular tracks, from public data.   */
+/*                                                                     */
+/* A charted album becomes at most CHART_TRACKS_PER_ALBUM tracks, not   */
+/* its whole tracklist. "Most popular" comes from ListenBrainz's public */
+/* per-recording listen statistics — catalogue-wide data about the      */
+/* recordings, nothing from SIN's users. SIN itself never collects      */
+/* track-level signals (DESIGN-LISTEN-SIGNALS.md §1, DATA.md §14).       */
+/* ------------------------------------------------------------------ */
+
+export const CHART_TRACKS_PER_ALBUM = 5;
+const LB_BASE = "https://api.listenbrainz.org/1";
+/** ListenBrainz caps batch popularity requests; stay well under. */
+const LB_BATCH = 100;
+
+export interface RecordingPopularity {
+  listens: number;
+  users: number;
+}
+
+/**
+ * Pick up to `limit` recording MBIDs, most popular first: ranked by
+ * distinct listeners (breadth: one person on repeat cannot carry a
+ * track), then total listens, then album order. Tracks with no data are
+ * never picked; [] means nothing on the album had popularity data.
+ */
+export function pickTopTrackIds(
+  tracks: PlaylistTrack[],
+  popularity: Map<string, RecordingPopularity>,
+  limit: number = CHART_TRACKS_PER_ALBUM,
+): string[] {
+  const seen = new Set<string>();
+  return tracks
+    .map((t, order) => ({ id: t.id, order, pop: popularity.get(t.id.toLowerCase()) }))
+    .filter((t) => {
+      if (!t.pop || (t.pop.users <= 0 && t.pop.listens <= 0) || seen.has(t.id)) return false;
+      seen.add(t.id);
+      return true;
+    })
+    .sort((a, b) => b.pop!.users - a.pop!.users || b.pop!.listens - a.pop!.listens || a.order - b.order)
+    .slice(0, limit)
+    .map((t) => t.id);
+}
+
+/**
+ * The tracks a charted album contributes to a playlist: its picked top
+ * tracks in popularity order, or — when there is no popularity data —
+ * its first `limit` tracks in album order.
+ */
+export function chartTracksFor(
+  bundle: ReleaseGroupBundle,
+  limit: number = CHART_TRACKS_PER_ALBUM,
+): PlaylistTrack[] {
+  const byId = new Map(bundle.tracks.map((t) => [t.id, t]));
+  const picked = (bundle.topTrackIds ?? [])
+    .map((id) => byId.get(id))
+    .filter((t): t is PlaylistTrack => t !== undefined);
+  return (picked.length > 0 ? picked : bundle.tracks).slice(0, limit);
+}
+
+/** ListenBrainz batch recording popularity (public, no key). Injectable
+ *  fetch for tests. Throws on a failed request so the caller retries the
+ *  album on the next compose pass instead of caching "no data". */
+export class ListenBrainzPopularity {
+  private readonly fetchFn: (
+    url: string,
+    init: { method: string; headers: Record<string, string>; body: string },
+  ) => Promise<{ ok: boolean; status: number; json: () => Promise<unknown> }>;
+
+  constructor(fetchFn?: ListenBrainzPopularity["fetchFn"]) {
+    this.fetchFn =
+      fetchFn ??
+      (async (url, init) => {
+        const res = await fetch(url, init);
+        return { ok: res.ok, status: res.status, json: () => res.json() };
+      });
+  }
+
+  async recordings(mbids: string[]): Promise<Map<string, RecordingPopularity>> {
+    const out = new Map<string, RecordingPopularity>();
+    const unique = [...new Set(mbids.map((m) => m.toLowerCase()))];
+    for (let i = 0; i < unique.length; i += LB_BATCH) {
+      const res = await this.fetchFn(`${LB_BASE}/popularity/recording`, {
+        method: "POST",
+        headers: { "User-Agent": MB_USER_AGENT, "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ recording_mbids: unique.slice(i, i + LB_BATCH) }),
+      });
+      if (!res.ok) throw new Error(`listenbrainz ${res.status} for popularity/recording`);
+      const rows = (await res.json()) as {
+        recording_mbid?: string;
+        total_listen_count?: number | null;
+        total_user_count?: number | null;
+      }[];
+      for (const row of Array.isArray(rows) ? rows : []) {
+        if (!row?.recording_mbid) continue;
+        out.set(row.recording_mbid.toLowerCase(), {
+          listens: row.total_listen_count ?? 0,
+          users: row.total_user_count ?? 0,
+        });
+      }
+    }
+    return out;
   }
 }

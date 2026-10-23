@@ -133,7 +133,9 @@ SoulSync**, **Most Wanted**, **Breakout Artists**, **Loved & Kept**,
 signal), plus genre and decade editions when enough
 charted albums share a tag. The shared work happens once, on the server:
 only charted albums get looked up on MusicBrainz (track lists, genre,
-year), cached for everyone.
+year), and each contributes its 5 most popular tracks by ListenBrainz's
+public listening statistics — SIN itself never collects track data.
+Everything is cached for everyone.
 
 Your node pulls the finished track lists and creates/updates them as
 playlists in your SoulSync. Matching those tracks to your music source —
