@@ -398,11 +398,13 @@ knows who a user is:
 - **`portal_users`**: `id`, `email` (unique, lowercased), `name`,
   `image`, `email_verified`, `role` (`user` | `admin`, from the
   `ADMIN_EMAILS` env list), timestamps.
-- **`portal_accounts`**: the Auth.js adapter table — provider,
-  provider account id, and the OAuth tokens Auth.js stores
-  (`access_token`, `refresh_token`, `id_token`, scopes, expiry).
-  This is standard Auth.js storage for Google/GitHub sign-in; SIN
-  never reads it.
+- **`portal_accounts`**: the Auth.js adapter table — provider and
+  provider account id only, the link that says "this GitHub/Google
+  account signs in as this user". The OAuth tokens a provider returns at
+  sign-in are **not stored** (`portal/src/lib/oauth-account.ts`; migration
+  0009 cleared those stored before): the portal never calls GitHub or
+  Google on anyone's behalf, so it keeps no credential to call them
+  with. SIN never reads this table.
 - **`portal_sessions`**, **`portal_verification_tokens`**: Auth.js
   session tokens / (unused-at-launch) magic-link tokens.
 - **`portal_keys`** (§8): label (user-chosen), hash, 12-char prefix,
