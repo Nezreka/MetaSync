@@ -13,9 +13,11 @@ portal/.next/
 # MetaSync node runtime state: settings, identity keys, pairing, local dbs.
 # Written wherever the node runs from; never source, never commit it.
 node/data/
+node/state/
 data/*
 !data/.gitignore
 .pytest_cache/
 .venv/
 venv/
+env/
 *.log
