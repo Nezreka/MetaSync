@@ -11,7 +11,7 @@
 <section class="card auth-card">
   <h1>Sign in</h1>
   <p class="card-sub">Enter the admin password for this node’s local UI.</p>
-  <form method="post" class="form">
+  <form method="post" class="form"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <label>Admin password <input type="password" name="password" required autofocus></label>
     <button class="primary btn-block" type="submit">Sign in</button>
   </form>

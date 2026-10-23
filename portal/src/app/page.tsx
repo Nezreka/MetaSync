@@ -30,8 +30,10 @@ export default async function LandingPage() {
           </ol>
           <p className="mt-4 text-sm leading-relaxed text-white/60">
             Your key is checked at the pool&apos;s door, then set aside —
-            reports are stored under a nickname that rotates weekly and is
-            never attached to your account. Revoke or regenerate your key
+            and it only works from the one MetaSync you approve. Reports
+            are counted the moment they arrive and never stored per
+            install: what stays is a tally per album, never attached to
+            you or your account. Revoke or regenerate your key
             any time; only the fingerprint lives in the database, so a lost
             key is replaced, never recovered.
           </p>

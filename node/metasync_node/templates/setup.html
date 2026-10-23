@@ -12,7 +12,7 @@
   <h1>Welcome to MetaSync</h1>
   <p class="card-sub">First run: set an admin password for this local UI. It protects the SoulSync
   and pool API keys stored on this machine. There is no account and nothing is sent anywhere.</p>
-  <form method="post" class="form">
+  <form method="post" class="form"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <label>Admin password <input type="password" name="password" required autofocus></label>
     <label>Confirm password <input type="password" name="confirm" required></label>
     <button class="primary btn-block" type="submit">Set password</button>

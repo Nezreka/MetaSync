@@ -2,7 +2,7 @@
 {% block title %}MetaSync · SoulSync connection{% endblock %}
 
 {% macro soulsync_form(form_class) %}
-<form method="post" class="{{ form_class }}">
+<form method="post" class="{{ form_class }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <label>SoulSync URL
     <input type="url" name="url" value="{{ current.url or '' }}" placeholder="http://soulsync:8000" required>
   </label>
@@ -38,8 +38,8 @@
     created it and handed it over when you approved the code) or you pasted it in the form below.</dd>
   </dl>
   <div class="row">
-    <form method="post"><button type="submit" name="action" value="test_saved">Test connection</button></form>
-    <form method="post"><button class="danger" type="submit" name="action" value="disconnect">Disconnect from SoulSync</button></form>
+    <form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button type="submit" name="action" value="test_saved">Test connection</button></form>
+    <form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="danger" type="submit" name="action" value="disconnect">Disconnect from SoulSync</button></form>
   </div>
   <p class="muted">Disconnecting here only clears this machine's copy of the address and key. To unlink
   fully, also use Disconnect in SoulSync → Settings → Advanced → MetaSync — that side revokes the key.</p>
@@ -101,9 +101,9 @@
   <p>No local API key has been issued yet.</p>
   {% endif %}
   <div class="row">
-    <form method="post" action="{{ url_for('local_key_regenerate') }}"><button type="submit">{{ "Regenerate local key" if status.local_api_key.configured else "Generate local key" }}</button></form>
+    <form method="post" action="{{ url_for('local_key_regenerate') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button type="submit">{{ "Regenerate local key" if status.local_api_key.configured else "Generate local key" }}</button></form>
     {% if status.local_api_key.configured %}
-    <form method="post" action="{{ url_for('local_key_revoke') }}"><button class="danger" type="submit">Revoke local key</button></form>
+    <form method="post" action="{{ url_for('local_key_revoke') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="danger" type="submit">Revoke local key</button></form>
     {% endif %}
   </div>
 </section>

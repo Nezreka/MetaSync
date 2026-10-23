@@ -26,7 +26,6 @@ from metasync_node.app import create_app  # noqa: E402
 from metasync_node.config import load_config  # noqa: E402
 from metasync_node.service import NodeService  # noqa: E402
 from metasync_node.store import default_pool_from_env  # noqa: F401  (re-exported for tests)
-from metasync_node.weekutil import iso_week_string  # noqa: E402
 
 
 def build_service() -> NodeService:
@@ -39,10 +38,11 @@ def scheduler_loop(service: NodeService, stop: threading.Event) -> None:
     while not stop.is_set():
         try:
             now = datetime.now(timezone.utc)
-            week = iso_week_string(now)
-            last = service.store.state.get("last_report") or {}
-            due = [p for p in service.pools() if (last.get(p["id"]) or {}).get("week") != week]
-            if due:
+            # Once per closed week, after this node's slot, with a back-off
+            # after a failure (service.report_due) — never every tick, and
+            # never alongside a report the UI already started.
+            job = service.report_job() or {}
+            if job.get("status") != "running" and service.report_due(now):
                 service.run_report(now)
             last_refresh = service.store.state.get("last_refresh_at")
             refresh_due = True

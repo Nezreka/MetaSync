@@ -289,3 +289,61 @@ publish the moment the endpoint exists.
   §3A.9 (the node build delta).**
 - No editing of canonical playlist contents by user nodes — by design
   (§2), not omission.
+
+## 12. Reporting a closed week (review amendment, Oct 23, 2026)
+
+The MVP's scheduler sent the report the minute a new ISO week began, and
+computed it **for that new week**. Every "this week" signal
+(`watchlist_add`, `wishlist_add`, `recent_add`, `download_grab`)
+therefore covered about a minute and was almost always empty. Only the
+standing signals carried any data. Meanwhile `import_keep` fired every
+week for every album older than 14 days, so each report was close to a
+full listing of the library's release groups. That contradicted §5
+("a report contains only {type, mbid} pairs") in spirit, if not in
+form.
+
+As built now (`signals.py`, `service.py`, `run.py`):
+
+- **The report covers the last full ISO week**, `[Monday 00:00 UTC,
+  next Monday 00:00 UTC)`. Event signals are events inside it. The age
+  rules (7 days for `hunt_demand`, 14 for `import_keep` and churn) are
+  measured at the week's end. The library itself is read when the
+  report runs. Download and listening activity are read with
+  `since`/`until` bounded to the week.
+- **A report describes what happened, never what the library is.**
+  `import_keep` fires once, in the week an album crosses its 14-day
+  mark. Churn fires once, in the week of the second absence.
+- **Bulk operations are not taste.** More than 500 events of one type
+  in a week (a library import, a wishlist migration, a drive coming
+  back online) suppresses that type for the week, and the Payload
+  preview says so. Standing `hunt_demand` is a real state, so a big
+  wishlist is sampled to 500 rather than dropped. The sample is a hash
+  of (week, mbid): deterministic within a week, rotating across weeks.
+  The pool refuses more than 1,000 of a type in any case.
+- **Churn snapshots are weekly.** One complete library snapshot per
+  reported week, three kept. "Absent from two consecutive reads" now
+  means two weeks, however often the report is re-run. Before this it
+  rotated on every run, so two runs a minute apart could fire a false
+  drop signal.
+- **Once per week, on a per-node slot.** The scheduler runs when a
+  pool has no report for the closed week. It waits until this node's
+  fixed slot (0–6 h into Monday, derived from the node secret: it
+  spreads load and keeps arrival times from lining up). After a failed
+  send it waits 6 h (`REPORT_RETRY_INTERVAL_H`), where it used to
+  re-read the whole library every 60-second tick. A dry-run node
+  previews each closed week once. A run lock keeps the UI job and the
+  scheduler from overlapping.
+- **A quiet week sends nothing** (a pool refuses an empty report) and
+  still counts as done.
+- **One report per week, accepted once.** The pool counts a node's
+  first report for a week and acknowledges a repeat as `duplicate`
+  without counting it. The node shows that as `already_sent`.
+- **Upgrade path.** A node upgraded from start-of-week reporting has a
+  `last_report` naming the following week. "Last report is this week or
+  later" counts as done, so no week is ever re-sent and double-counted.
+  The cost is one under-reported week at the switch.
+- **Transport.** A pool URL must be HTTPS unless it is on loopback
+  (`METASYNC_ALLOW_INSECURE_POOLS` overrides, for development). The
+  legacy direct-key fallback (§1, `pool.py`) applies only to a
+  loopback pool: any other pool that 404s the exchange is an error,
+  never a reason to start sending the raw key.

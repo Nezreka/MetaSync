@@ -25,6 +25,10 @@ class Config:
     release_resolution_cap: int = 5000
     index_stale_days: int = 7
     scheduler_tick_s: int = 60
+    # After a failed weekly report, the scheduler waits this long before
+    # trying again (it used to retry — re-reading the whole library — on
+    # every 60-second tick).
+    report_retry_interval_h: int = 6
     refresh_interval_h: int = 24
     http_timeout_s: int = 15
 
@@ -51,5 +55,6 @@ def load_config(env: dict[str, str] | None = None) -> Config:
         library_max_pages=_int(env, "LIBRARY_MAX_PAGES", 5000),
         release_resolution_cap=_int(env, "RELEASE_RESOLUTION_CAP", 5000),
         index_stale_days=_int(env, "INDEX_STALE_DAYS", 7),
+        report_retry_interval_h=_int(env, "REPORT_RETRY_INTERVAL_H", 6),
         http_timeout_s=_int(env, "HTTP_TIMEOUT_MS", 15_000) // 1000 or 15,
     )

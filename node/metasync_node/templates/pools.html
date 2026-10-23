@@ -44,14 +44,14 @@
     </dl>
 
     <div class="row pool-actions">
-      <form method="post" action="{{ url_for('pool_toggle', pool_id=p.id) }}"><button type="submit">{{ "Disable" if p.enabled else "Enable" }}</button></form>
-      <form method="post" action="{{ url_for('pool_delete', pool_id=p.id) }}"><button class="danger" type="submit">Remove</button></form>
+      <form method="post" action="{{ url_for('pool_toggle', pool_id=p.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button type="submit">{{ "Disable" if p.enabled else "Enable" }}</button></form>
+      <form method="post" action="{{ url_for('pool_delete', pool_id=p.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="danger" type="submit">Remove</button></form>
     </div>
 
     <details class="fallback-box">
       <summary>Manual fallback — replace this pool key directly</summary>
       <p class="muted">Use this only when the normal SoulSync handoff is unavailable. Saving a key resets the token state and immediately attempts the exchange.</p>
-      <form method="post" class="form">
+      <form method="post" class="form"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <input type="hidden" name="pool_id" value="{{ p.id }}">
         <label>Pool name <input type="text" name="name" value="{{ p.name }}"></label>
         <label>Pool URL <input type="url" name="url" value="{{ p.url }}"></label>
@@ -73,7 +73,7 @@
 <details class="card fallback-card">
   <summary>Manual fallback — add a pool directly</summary>
   <p class="muted">This is the development/manual path, collapsed so the page reads as status first. The preferred path is to enter the pool key in SoulSync and let SoulSync hand it to MetaSync.</p>
-  <form method="post" class="form">
+  <form method="post" class="form"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <label>Pool name <input type="text" name="name" placeholder="SIN" required></label>
     <label>Pool URL <input type="url" name="url" placeholder="https://..." required></label>
     <label>Pool API key <input type="password" name="api_key" placeholder="pool key"></label>

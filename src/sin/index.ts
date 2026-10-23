@@ -8,9 +8,10 @@
  *                               node signature → short-lived access token
  *                               (§3A.4); 202 binding_pending when a portal
  *                               key's node is not approved yet
- *   POST /v1/report             legacy X-SIN-Key (admin / node / portal
- *                               key) OR Bearer access token + node
- *                               signature
+ *   POST /v1/report             legacy X-SIN-Key (admin / shared env
+ *                               key only) OR Bearer access token + node
+ *                               signature; one report per token per
+ *                               open week, counted on arrival
  *   GET  /v1/whoami             same doors as report — connection test
  *   POST /v1/aggregate          X-SIN-Key: admin key ONLY (SIN_ADMIN_KEY),
  *                               or an admin-scope access token
@@ -29,7 +30,9 @@
  * its raw key, signed with the Ed25519 key it is bound to, for a
  * 24-hour pool-signed token, and routine calls carry the token plus a
  * fresh node signature. The legacy direct-key door is kept for the
- * official node and the transition. Only the official MetaSync can run
+ * operator's env keys only (official node, development pools): a raw
+ * portal key is accepted nowhere but the exchange, so it is useless
+ * on any machine other than the one its owner approved. Only the official MetaSync can run
  * aggregation and publish the shared playlist definitions.
  *
  * Production hardening (neon-functions skill): this function has a public
@@ -40,7 +43,7 @@
  * Signals are keyed by MusicBrainz IDs only. SoulID is NOT used by SIN.
  */
 import { timingSafeEqual } from "node:crypto";
-import { and, desc, eq, inArray, isNull, lt, max, or, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNotNull, isNull, lt, max, or, sql } from "drizzle-orm";
 import { Hono } from "hono";
 import { getDb, type SinDb } from "./db.ts";
 import {
@@ -64,7 +67,11 @@ import {
   PLAYLIST_KEYS,
   poolTokenPublicKeyRaw,
   portalKeyHash,
-  rawReportCutoff,
+  openReportWeeks,
+  reportToCountIncrements,
+  REPORT_TOKEN_RETENTION_WEEKS,
+  isoWeekOf,
+  K_PUBLISH_THRESHOLD,
   RequestRateLimiter,
   sha256Hex,
   USER_TOKEN_SCOPES,
@@ -77,14 +84,17 @@ import {
   type CanonicalPlaylist,
   type PlaylistKey,
   type PlaylistsPublishInput,
+  type ReportInput,
 } from "./logic.ts";
 import {
+  aggregateCounts,
   aggregates,
   canonicalPlaylists,
   indexPublications,
   mbResolutions,
   portalKeys,
   rawReports,
+  reportTokens,
   sinRequestNonces,
 } from "./schema.ts";
 import {
@@ -247,16 +257,16 @@ export type KeyAuth =
     };
 
 /**
- * The door check (§3.1), in order: admin key, shared node key, portal
- * key. The result of a portal lookup is consumed ONLY by pass/fail, the
- * rate-limit bucket, and the last_used_at touch — it is never passed to
- * the report insert path (P2). Fails closed: 503 when no verification
- * path is configured; when API_KEY_PEPPER is unset the portal-key path
- * is simply disabled and env keys are unaffected.
+ * The legacy key door (§3.1): the operator's env keys only — admin,
+ * then shared. A raw PORTAL key is deliberately not accepted here: it
+ * would skip the node binding entirely, so a copied key could report
+ * from any machine. Portal keys go through POST /v1/auth/exchange,
+ * where only the approved node gets a token. Every other key — a
+ * portal key included — gets the same 401. Fails closed (503) when
+ * no verification path is configured at all.
  */
 export async function authenticateKey(
   request: Request,
-  resolveDb: () => SinDb | null,
 ): Promise<{ auth: KeyAuth } | { response: Response }> {
   const ingest = process.env.SIN_INGEST_KEY;
   const admin = process.env.SIN_ADMIN_KEY;
@@ -268,38 +278,6 @@ export async function authenticateKey(
   }
   if (matchesKey(provided, ingest)) {
     return { auth: { kind: "shared", bucket: "env:shared" } };
-  }
-
-  if (pepper && provided) {
-    const db = resolveDb();
-    if (!db) {
-      return {
-        response: Response.json(
-          { error: "database_not_configured" },
-          { status: 503 },
-        ),
-      };
-    }
-    let row: PortalKeyRow | null;
-    try {
-      row = await lookupPortalKey(db, provided, pepper);
-    } catch {
-      return {
-        response: Response.json(
-          { error: "database_unavailable" },
-          { status: 503 },
-        ),
-      };
-    }
-    if (row && isPortalKeyValid(row)) {
-      return {
-        auth: { kind: "portal", bucket: `portal:${row.id}`, portal: row },
-      };
-    }
-    // Unknown, revoked, or expired — the same 401 as any bad key.
-    return {
-      response: Response.json({ error: "unauthorized" }, { status: 401 }),
-    };
   }
 
   if (!ingest && !admin && !pepper) {
@@ -591,8 +569,8 @@ export async function authenticateToken(
 
 /**
  * The data-route door: a Bearer token goes through the token door
- * (§3A); anything else falls back to the legacy key door
- * (authenticateKey), kept for the official node and the transition.
+ * (§3A); anything else falls back to the legacy env-key door
+ * (authenticateKey), kept for the official node and development pools.
  * A malformed Bearer header never falls back — presenting a token is
  * a commitment to the token door.
  */
@@ -606,7 +584,7 @@ export async function authenticateDataRequest(
   if (authorization && /^Bearer\b/i.test(authorization)) {
     return authenticateToken(request, bodyText, requiredScope, resolveDb);
   }
-  return authenticateKey(request, resolveDb);
+  return authenticateKey(request);
 }
 
 /**
@@ -684,16 +662,6 @@ export function resetRateLimiterForTests(): void {
 }
 
 const app = new Hono();
-
-/** Touch last_used_at for a portal-key request; never fails it. */
-async function touchAuth(auth: KeyAuth, db: SinDb): Promise<void> {
-  if (auth.kind !== "portal") return;
-  try {
-    await touchPortalKeyLastUsed(db, auth.portal.id);
-  } catch {
-    // Fire-and-forget by design (§3.3).
-  }
-}
 
 app.get("/health", (c) =>
   c.json({ ok: true, service: "sin", version: "0.1.0", build: "composer-1" }),
@@ -887,10 +855,6 @@ app.get("/v1/whoami", async (c) => {
     return c.json({ error: "rate_limited" }, 429);
   }
   if (auth.kind === "portal") {
-    if (!auth.viaToken) {
-      const found = requireDb();
-      if (!("response" in found)) await touchAuth(auth, found.db);
-    }
     return c.json({ ok: true, keyPrefix: auth.portal.keyPrefix });
   }
   return c.json({ ok: true });
@@ -934,54 +898,80 @@ app.post("/v1/report", async (c) => {
   if (!validation.ok) {
     return c.json({ error: "invalid_report", details: validation.errors }, 400);
   }
+  const report = validation.value;
+  // Only the week that just closed (what a node sends) or the current
+  // one: nobody can backfill an old week or pre-stuff a future one.
+  if (!openReportWeeks().includes(report.week)) {
+    return c.json({ error: "week_not_open", openWeeks: openReportWeeks() }, 400);
+  }
 
   const found = requireDb();
   if ("response" in found) return found.response;
-  const { db } = found;
 
-  const report = validation.value;
-  // Binary per node per item per week: the unique index + onConflictDoNothing
-  // make a re-sent report a no-op, exactly as the privacy model promises.
-  // Inserts run in chunks: one statement for a whole large-library report
-  // (tens of thousands of rows) exceeds Postgres' per-query parameter limit.
-  const rows = report.signals.map((s) => ({
-    week: report.week,
-    tokenHash: report.token,
-    signal: s.type,
-    mbid: s.mbid,
-  }));
-  let insertedCount = 0;
-  const INSERT_CHUNK = 1_000;
-  for (let i = 0; i < rows.length; i += INSERT_CHUNK) {
-    const inserted = await db
-      .insert(rawReports)
-      .values(rows.slice(i, i + INSERT_CHUNK))
-      .onConflictDoNothing()
-      .returning({ id: rawReports.id });
-    insertedCount += inserted.length;
+  // Count on arrival (migration 0008): claim the week's token, then add
+  // +1 per distinct signal to the private running counts — one
+  // transaction, so a report is either fully counted or not at all.
+  // Nothing per-node is stored: the token row and the counts are never
+  // linked. The rows are built ONLY from the validated body, so no
+  // key/account reference exists anywhere in them (P1/P2/P7).
+  const accepted = await countReport(found.db, report);
+  if (accepted === null) {
+    return c.json({ accepted: 0, duplicate: true, week: report.week }, 200);
   }
-  const inserted = { length: insertedCount };
-
-  // Portal keys only: refresh last_used_at (throttled, fire-and-forget).
-  // The rows above were built ONLY from the validated body — week,
-  // token, signals — so no key/account reference exists in raw_reports
-  // (P1/P2). Token-door calls already touched inside the gate (§3A).
-  if (!auth.viaToken) await touchAuth(auth, db);
-
-  return c.json(
-    {
-      accepted: inserted.length,
-      duplicatesIgnored: report.signals.length - inserted.length,
-      week: report.week,
-    },
-    201,
-  );
+  return c.json({ accepted, duplicate: false, week: report.week }, 201);
 });
 
 /**
- * Run one aggregation pass: read raw rows, dedupe + count distinct tokens +
- * k-threshold via the pure `aggregateRawReports`, upsert into `aggregates`,
- * delete raw reports older than 24h, and log the publication.
+ * Count one validated report: claim (week, token) in report_tokens and,
+ * if the claim is new, increment aggregate_counts once per distinct
+ * signal. Returns the number of signals counted, or null when this
+ * token already reported this week (binary per node per week: the
+ * second report counts nothing). Exported for tests.
+ */
+export async function countReport(
+  db: SinDb,
+  report: ReportInput,
+): Promise<number | null> {
+  const increments = reportToCountIncrements(report);
+  return db.transaction(async (tx) => {
+    const claimed = await tx
+      .insert(reportTokens)
+      .values({ week: report.week, tokenHash: report.token })
+      .onConflictDoNothing()
+      .returning({ week: reportTokens.week });
+    if (claimed.length === 0) return null;
+    await addToCounts(tx, increments.map((i) => ({ ...i, nodeCount: 1 })));
+    return increments.length;
+  });
+}
+
+/** Add node counts into aggregate_counts (chunked multi-row upserts). */
+async function addToCounts(
+  db: Pick<SinDb, "insert">,
+  rows: { week: string; signal: string; mbid: string; nodeCount: number }[],
+): Promise<void> {
+  const CHUNK = 500;
+  for (let i = 0; i < rows.length; i += CHUNK) {
+    await db
+      .insert(aggregateCounts)
+      .values(rows.slice(i, i + CHUNK))
+      .onConflictDoUpdate({
+        target: [aggregateCounts.week, aggregateCounts.signal, aggregateCounts.mbid],
+        set: { nodeCount: sql`${aggregateCounts.nodeCount} + excluded.node_count` },
+      });
+  }
+}
+
+/**
+ * Run one aggregation (publication) pass:
+ *  1. drain raw_reports rows left by the pre-0008 ingest path into the
+ *     running counts (distinct tokens per item), deleting them;
+ *  2. publish every running count at or above k into `aggregates`, the
+ *     only table the public routes read;
+ *  3. prune report tokens for weeks that can no longer be reported;
+ *  4. log the run.
+ * Counts are exact however reports are spread over the week: they were
+ * added as reports arrived and are never recounted from a subset.
  * Exported for tests / a future Function Trigger (schedule) to call.
  */
 export async function aggregateOnce(
@@ -990,31 +980,39 @@ export async function aggregateOnce(
 ): Promise<{ aggregatesWritten: number; rawDeleted: number; week: string | null }> {
   const now = opts.now ?? new Date();
 
-  const rows = opts.week
-    ? await db
-        .select()
-        .from(rawReports)
-        .where(eq(rawReports.week, opts.week))
-    : await db.select().from(rawReports);
+  const drained = await db
+    .delete(rawReports)
+    .where(opts.week ? eq(rawReports.week, opts.week) : isNotNull(rawReports.id))
+    .returning();
+  if (drained.length > 0) {
+    const legacy = aggregateRawReports(
+      drained.map((r) => ({
+        week: r.week,
+        token: r.tokenHash,
+        signal: r.signal as AggregateRow["signal"],
+        mbid: r.mbid,
+        receivedAt: r.receivedAt,
+      })),
+      1,
+    );
+    await addToCounts(db, legacy);
+  }
 
-  const computed = aggregateRawReports(
-    rows.map((r) => ({
-      week: r.week,
-      token: r.tokenHash,
-      signal: r.signal as AggregateRow["signal"],
-      mbid: r.mbid,
-      receivedAt: r.receivedAt,
-    })),
-  );
+  const publishable = await db
+    .select()
+    .from(aggregateCounts)
+    .where(
+      opts.week
+        ? and(eq(aggregateCounts.week, opts.week), gte(aggregateCounts.nodeCount, K_PUBLISH_THRESHOLD))
+        : gte(aggregateCounts.nodeCount, K_PUBLISH_THRESHOLD),
+    );
 
-  // Chunked multi-row upserts: one statement per row does not survive a
-  // large library's aggregate set (tens of thousands of rows).
   const AGG_CHUNK = 500;
-  for (let i = 0; i < computed.length; i += AGG_CHUNK) {
+  for (let i = 0; i < publishable.length; i += AGG_CHUNK) {
     await db
       .insert(aggregates)
       .values(
-        computed.slice(i, i + AGG_CHUNK).map((a) => ({
+        publishable.slice(i, i + AGG_CHUNK).map((a) => ({
           week: a.week,
           signal: a.signal,
           mbid: a.mbid,
@@ -1031,21 +1029,23 @@ export async function aggregateOnce(
       });
   }
 
-  const deleted = await db
-    .delete(rawReports)
-    .where(lt(rawReports.receivedAt, rawReportCutoff(now)))
-    .returning({ id: rawReports.id });
+  const oldestKeptWeek = isoWeekOf(
+    new Date(now.getTime() - REPORT_TOKEN_RETENTION_WEEKS * 7 * 86_400_000),
+  );
+  await db.delete(reportTokens).where(lt(reportTokens.week, oldestKeptWeek));
 
-  const week = opts.week ?? computed[0]?.week ?? null;
+  const week =
+    opts.week ??
+    publishable.reduce<string | null>((w, a) => (w === null || a.week > w ? a.week : w), null);
   await db.insert(indexPublications).values({
     week: week ?? "none",
     trigger: opts.trigger ?? "manual",
-    aggregateCount: computed.length,
-    rawDeleted: deleted.length,
+    aggregateCount: publishable.length,
+    rawDeleted: drained.length,
     publishedAt: now,
   });
 
-  return { aggregatesWritten: computed.length, rawDeleted: deleted.length, week };
+  return { aggregatesWritten: publishable.length, rawDeleted: drained.length, week };
 }
 
 app.post("/v1/aggregate", async (c) => {
@@ -1298,7 +1298,6 @@ app.get("/v1/index/trending", async (c) => {
   const found = requireDb();
   if ("response" in found) return found.response;
   const { db } = found;
-  if (!gate.auth.viaToken) await touchAuth(gate.auth, db);
   const week = await resolveWeek(db, c.req.query("week"));
   if (!week) return c.json({ week: null, items: [] });
   const priors = await priorWeeksOf(db, week);
@@ -1312,7 +1311,6 @@ app.get("/v1/index/most-wanted", async (c) => {
   const found = requireDb();
   if ("response" in found) return found.response;
   const { db } = found;
-  if (!gate.auth.viaToken) await touchAuth(gate.auth, db);
   const week = await resolveWeek(db, c.req.query("week"));
   if (!week) return c.json({ week: null, items: [] });
   const rows = await loadAggregates(db, [week]);
@@ -1325,7 +1323,6 @@ app.get("/v1/index/breakouts", async (c) => {
   const found = requireDb();
   if ("response" in found) return found.response;
   const { db } = found;
-  if (!gate.auth.viaToken) await touchAuth(gate.auth, db);
   const week = await resolveWeek(db, c.req.query("week"));
   if (!week) return c.json({ week: null, items: [] });
   const priors = await priorWeeksOf(db, week);
@@ -1429,7 +1426,6 @@ app.get("/v1/playlists", async (c) => {
   if ("response" in gate) return gate.response;
   const found = requireDb();
   if ("response" in found) return found.response;
-  if (!gate.auth.viaToken) await touchAuth(gate.auth, found.db);
   return c.json(await loadLatestPlaylists(found.db));
 });
 

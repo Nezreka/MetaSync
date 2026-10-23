@@ -66,7 +66,9 @@ class MusicBrainzResolver:
         self._lock = threading.Lock()
         self._last_call_at = 0.0
 
-    def _get_json(self, path: str) -> dict[str, Any]:
+    def _get_json(self, path: str, *, keep: bool = True) -> dict[str, Any]:
+        """GET a MusicBrainz path, paced. ``keep=False`` skips the response
+        cache for lookups whose caller keeps the answer itself."""
         if path in self.cache:
             return self.cache[path]
         with self._lock:
@@ -89,13 +91,16 @@ class MusicBrainzResolver:
             if not res.ok:
                 raise MusicBrainzError(f"MusicBrainz HTTP {res.status_code} for {path}", status=res.status_code)
             body = res.json()
-            self.cache[path] = body
+            if keep:
+                self.cache[path] = body
             return body
 
     # -- deterministic id mapping (all nodes, for their own signals) -------
     def release_to_group(self, release_mbid: str) -> str | None:
+        # The caller keeps the answer (state["release_to_group"]); caching
+        # the whole release JSON as well cost ~3 KB per album forever.
         try:
-            body = self._get_json(f"/release/{release_mbid}?inc=release-groups&fmt=json")
+            body = self._get_json(f"/release/{release_mbid}?inc=release-groups&fmt=json", keep=False)
         except MusicBrainzError as err:
             if err.status == 404:
                 return None

@@ -76,22 +76,29 @@ needing attention.
 
 ## What SIN collects
 
-Seven signals, computed on your machine, keyed **only by MusicBrainz
+Eight signals, computed on your machine, keyed **only by MusicBrainz
 IDs** — one shared ID per album family, identical across every install
-and every music source:
+and every music source. Each weekly report covers the **last full week**
+and lists that week's events, never your library:
 
 | Signal | Meaning | Key |
 |---|---|---|
 | `watchlist_add` | You started watching this artist this week | artist MBID |
 | `wishlist_add` | You wishlisted this album this week | release-group MBID |
 | `hunt_demand` | Wishlisted 7+ days ago, still not downloaded | release-group MBID |
-| `import_keep` | Imported 14+ days ago and still in your library | release-group MBID |
+| `import_keep` | Reached 14 days in your library this week (sent once per album) | release-group MBID |
 | `recent_add` | Landed in your library this week | release-group MBID |
 | `download_grab` | Re-grabbed, upgraded, or gap-filled an album you already own this week (new arrivals are `recent_add`'s job) | release-group MBID |
 | `download_churn` | **Optional, off by default.** Downloaded 14+ days ago, then removed from your library — confirmed by two weekly reads in a row | release-group MBID |
+| `listen_album` | **Optional, off by default.** You played 3+ different tracks from this album this week (at most your 50 most-played albums; only SoulSync's shared listening history, never a profile that keeps its own) | release-group MBID |
 
-**Never collected, never sent:** listening history or play counts, track
-titles or artist/album names as text, file paths, library listings or
+A week with more than 500 of one kind of event (a bulk import, a
+migration) is held back rather than reported, so a report is never a
+listing of your library or wishlist.
+
+**Never collected, never sent:** listening history, play counts or play
+times (the optional `listen_album` is one yes/no per album per week),
+track titles or artist/album names as text, file paths, library listings or
 library size, usernames, emails, IP-based identity, or your SoulSync URL.
 
 ### The privacy rules
@@ -105,12 +112,15 @@ library size, usernames, emails, IP-based identity, or your SoulSync URL.
 - **k = 15 publish threshold.** An item appears in a chart only if at
   least 15 distinct nodes reported it. Below that, the data point does
   not exist publicly.
-- **Raw reports are deleted after aggregation.** The server keeps only
-  `(week, signal, MBID, node_count)`.
+- **Reports are counted on arrival, never stored.** The server adds +1
+  per item to a running tally and keeps only `(week, signal, MBID,
+  node_count)`; the weekly token is kept apart, only to accept one
+  report per install per week.
 - **Keys are hashes.** The portal stores SHA-256 hashes of keys, never
   the keys themselves. Your node signs its requests with its own Ed25519
   key; the pool trades your pool key for a 24-hour access token at
-  exchange time, so the key itself is almost never sent.
+  exchange time, so the key itself is almost never sent — and it works
+  only from the one node you approved, never presented directly.
 - **Users can never publish.** Nodes only push their own signals and pull
   data. The shared charts are composed and published only by the official
   MetaSync (admin role).
@@ -119,7 +129,8 @@ library size, usernames, emails, IP-based identity, or your SoulSync URL.
 
 Every week the server composes charts from the counts: **Trending in
 SoulSync**, **Most Wanted**, **Breakout Artists**, **Loved & Kept**,
-**Just Landed**, **Rising**, plus genre and decade editions when enough
+**Just Landed**, **Rising**, **On Repeat** (from the optional listening
+signal), plus genre and decade editions when enough
 charted albums share a tag. The shared work happens once, on the server:
 only charted albums get looked up on MusicBrainz (track lists, genre,
 year), cached for everyone.
@@ -132,14 +143,15 @@ page is in the works; today the charts arrive as playlists.)
 
 ## How a report flows
 
-1. The node reads your watchlist, wishlist, and library from your
-   SoulSync's API — locally, on your machine.
-2. It computes the seven signals, bridging edition IDs to release-group
-   IDs via MusicBrainz where needed (cached permanently).
+1. Early each Monday (UTC), the node reads your watchlist, wishlist,
+   library, and last week's download (and, if you opted in, listening)
+   counts from your SoulSync's API — locally, on your machine.
+2. It computes last week's signals, bridging edition IDs to
+   release-group IDs via MusicBrainz where needed (cached permanently).
 3. It exchanges your pool key + a node signature for a 24-hour token,
    then sends one signed report per joined pool.
-4. The pool validates and stores the raw report; aggregation folds the
-   week's reports into anonymous counts and deletes the raw rows.
+4. The pool validates the report and counts it on arrival — one +1 per
+   item, one report per install per week; nothing per install is stored.
 5. The composer turns counts into charts (only items at or above k = 15)
    and publishes them for nodes to pull.
 
@@ -152,10 +164,10 @@ Pool URL is shown on your portal dashboard after sign-in.
 | `GET /health` | public | `{ ok, service: "sin", version }` |
 | `GET /v1/auth/public-key` | public | The pool's token-signing public key, so a node can verify its access token |
 | `POST /v1/auth/exchange` | pool key + node signature | Trades key + signature for a 24h token; unbound keys get `202 binding_pending` and no token |
-| `POST /v1/report` | token + signature (or key) | One weekly report: `{ week, token, signals: [{ type, mbid }] }` — max 100,000 signals / 16 MB, strict validation, unknown fields rejected |
-| `GET /v1/whoami` | token or key | Connection test for a node |
-| `GET /v1/index/trending` · `most-wanted` · `breakouts` | token or key | The public chart indexes for a week |
-| `GET /v1/playlists` | token or key | The latest published charts as full track lists |
+| `POST /v1/report` | token + signature (or the operator's env key) | One weekly report: `{ week, token, signals: [{ type, mbid }] }` for the closed or current week, once per token — max 5,000 signals (1,000 per type, 100 `listen_album`) / 1 MB, strict validation, unknown fields rejected |
+| `GET /v1/whoami` | token or env key | Connection test for a node |
+| `GET /v1/index/trending` · `most-wanted` · `breakouts` | token or env key | The public chart indexes for a week |
+| `GET /v1/playlists` | token or env key | The latest published charts as full track lists |
 | `POST /v1/aggregate` | admin only | Run one aggregation pass |
 | `POST /v1/compose` | admin only | Build and publish this week's charts (budget-resumable) |
 
@@ -172,7 +184,9 @@ python3 -m unittest discover -s tests -v   # node tests, all on localhost mocks
 Design docs: [DESIGN-NODE.md](DESIGN-NODE.md) (the node),
 [PORTAL-DESIGN.md](PORTAL-DESIGN.md) (portal, keys, and the key
 exchange), [PORTAL-EXPLAINED.md](PORTAL-EXPLAINED.md) (the plain-English
-version), [DATA.md](DATA.md) (the data map: exactly what data exists,
+version), [DESIGN-DOWNLOAD-SIGNALS.md](DESIGN-DOWNLOAD-SIGNALS.md) and
+[DESIGN-LISTEN-SIGNALS.md](DESIGN-LISTEN-SIGNALS.md) (the optional
+signals), [DATA.md](DATA.md) (the data map: exactly what data exists,
 where it flows, and how it is used).
 
 ---

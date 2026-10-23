@@ -51,7 +51,9 @@ records cannot be keyed to albums today, so v1 does not build it.
 
 Vocabulary discipline: SIN shipped with four types, gained `recent_add`
 as the fifth, and these would make seven. That is the cap this design
-proposes — no further types without retiring one.
+proposes — no further types without retiring one. **[Amended Oct 23,
+2026: the cap is eight, adding `listen_album` — see
+DESIGN-LISTEN-SIGNALS.md §8.]**
 
 ## 3. Where the data lives (verified Oct 23, 2026)
 
@@ -244,6 +246,12 @@ signals by sensitivity:
   because a wrongful "people hate this album" signal is worse than a
   missing one. If these guards make churn rare, that is the correct
   failure direction.
+- **[Review, Oct 23, 2026]** Two of the "as built" rules above changed
+  in DESIGN-NODE.md §12: the report now covers the closed week (so the
+  endpoint is read with `since` **and** `until`), and the churn
+  snapshots are one per reported week instead of one per run. Before
+  that, two runs minutes apart counted as the "two consecutive
+  absences".
 - **Re-downloads and upgrades.** Quality upgrades delete and
   re-import; the album is present, so no churn, and the re-grab counts
   as a grab. Correct on both ends.

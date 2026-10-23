@@ -19,19 +19,16 @@ import {
 import { describe, test } from "node:test";
 import {
   issueAccessToken,
+  isoWeekOf,
+  K_PUBLISH_THRESHOLD,
   loadPoolTokenPrivateKey,
   portalKeyHash,
 } from "../src/sin/logic.ts";
-import {
-  aggregates as aggregatesTable,
-  canonicalPlaylists as playlistsTable,
-  portalKeys as portalKeysTable,
-  rawReports as rawReportsTable,
-  sinRequestNonces as noncesTable,
-} from "../src/sin/schema.ts";
 import type { SinDb } from "../src/sin/db.ts";
+import { FakeSinDb, type PortalRow } from "./fake-db.ts";
 
-const WEEK = "2026-W43";
+// The live week: the report route only accepts the open weeks.
+const WEEK = isoWeekOf(new Date());
 const MBID = "11111111-1111-1111-1111-111111111111";
 const SHARED_KEY = "test-shared-secret-0123456789";
 const ADMIN_KEY = "test-admin-secret-0123456789";
@@ -103,58 +100,7 @@ function nodeHeaders(
   return headers;
 }
 
-/* ---------------- fake DB ---------------- */
-
-function sqlParams(cond: unknown, out: unknown[] = []): unknown[] {
-  if (!cond || typeof cond !== "object") return out;
-  const obj = cond as Record<string, unknown>;
-  if (obj.constructor?.name === "Param") {
-    out.push(obj.value);
-    return out;
-  }
-  if (Array.isArray(cond)) {
-    for (const c of cond) sqlParams(c, out);
-    return out;
-  }
-  if (obj.constructor?.name === "SQL" && Array.isArray(obj.queryChunks)) {
-    for (const c of obj.queryChunks) sqlParams(c, out);
-  }
-  return out;
-}
-
-interface PortalRow {
-  id: string;
-  userId: string;
-  keyHash: string;
-  keyPrefix: string;
-  label: string;
-  lastUsedAt: Date | null;
-  expiresAt: Date | null;
-  createdAt: Date;
-  revokedAt: Date | null;
-  boundNodeId: string | null;
-  boundNodePublicKey: string | null;
-  boundAt: Date | null;
-  pendingNodeId: string | null;
-  pendingNodePublicKey: string | null;
-  pendingRequestedAt: Date | null;
-}
-
-interface RawRow {
-  week: string;
-  tokenHash: string;
-  signal: string;
-  mbid: string;
-  receivedAt: Date;
-}
-
-interface PlaylistRow {
-  week: string;
-  key: string;
-  name: string;
-  tracks: unknown[];
-  publishedAt: Date;
-}
+/* ---------------- fake DB rows ---------------- */
 
 function portalRow(overrides: Partial<PortalRow> = {}): PortalRow {
   return {
@@ -185,256 +131,6 @@ function boundRow(node: NodeKeys): PortalRow {
   });
 }
 
-class FakeQuery {
-  private cond: unknown = undefined;
-  private fake: FakeExchangeDb;
-  private table: unknown;
-  private selection: Record<string, unknown> | undefined;
-  constructor(
-    fake: FakeExchangeDb,
-    table: unknown,
-    selection: Record<string, unknown> | undefined,
-  ) {
-    this.fake = fake;
-    this.table = table;
-    this.selection = selection;
-  }
-  where(cond: unknown) {
-    this.cond = cond;
-    return this;
-  }
-  orderBy() {
-    return this;
-  }
-  limit(n: number) {
-    return Promise.resolve(this.rows().slice(0, n));
-  }
-  then(
-    onFulfilled?: (value: unknown[]) => unknown,
-    onRejected?: (reason: unknown) => unknown,
-  ) {
-    return Promise.resolve(this.rows()).then(onFulfilled, onRejected);
-  }
-  private rows(): Record<string, unknown>[] {
-    const params = sqlParams(this.cond);
-    if (this.table === portalKeysTable) {
-      return this.fake.portalRows
-        .filter(
-          (r) =>
-            params.length === 0 ||
-            params.some((p) => p === r.keyHash || p === r.id),
-        )
-        .map((r) => ({ ...r }));
-    }
-    if (this.table === rawReportsTable) {
-      return this.fake.rawRows
-        .filter((r) => params.length === 0 || params.some((p) => p === r.week))
-        .map((r) => ({ ...r }));
-    }
-    if (this.table === aggregatesTable) {
-      if (this.selection && "latest" in this.selection) {
-        const weeks = this.fake.aggregateRows.map((r) => r.week as string);
-        return [{ latest: weeks.length ? weeks.sort().at(-1)! : null }];
-      }
-      if (this.selection && "week" in this.selection) {
-        const weeks = [
-          ...new Set(this.fake.aggregateRows.map((r) => r.week as string)),
-        ];
-        return weeks
-          .filter((w) => params.length === 0 || (params[0] as string) > w)
-          .sort()
-          .reverse()
-          .map((week) => ({ week }));
-      }
-      return this.fake.aggregateRows
-        .filter((r) => params.length === 0 || params.includes(r.week))
-        .map((r) => ({ ...r }));
-    }
-    if (this.table === playlistsTable) {
-      return this.fake.playlistRows.map((r) => ({ ...r }));
-    }
-    return [];
-  }
-}
-
-class InsertQuery {
-  private mode: "plain" | "nothing" | "update" = "plain";
-  private updateSet: Record<string, unknown> | undefined;
-  private fake: FakeExchangeDb;
-  private table: unknown;
-  private vals: unknown;
-  constructor(fake: FakeExchangeDb, table: unknown, vals: unknown) {
-    this.fake = fake;
-    this.table = table;
-    this.vals = vals;
-  }
-  onConflictDoNothing() {
-    this.mode = "nothing";
-    return this;
-  }
-  onConflictDoUpdate(cfg: { set: Record<string, unknown> }) {
-    this.mode = "update";
-    this.updateSet = cfg.set;
-    return this;
-  }
-  returning() {
-    return Promise.resolve(this.execute());
-  }
-  then(
-    onFulfilled?: (value: unknown[]) => unknown,
-    onRejected?: (reason: unknown) => unknown,
-  ) {
-    return Promise.resolve(this.execute()).then(onFulfilled, onRejected);
-  }
-  private execute(): Record<string, unknown>[] {
-    const fake = this.fake;
-    if (this.table === rawReportsTable) {
-      const rows = (Array.isArray(this.vals) ? this.vals : [this.vals]) as RawRow[];
-      const inserted: Record<string, unknown>[] = [];
-      for (const row of rows) {
-        const dupe = fake.rawRows.some(
-          (r) =>
-            r.tokenHash === row.tokenHash &&
-            r.week === row.week &&
-            r.signal === row.signal &&
-            r.mbid === row.mbid,
-        );
-        if (!dupe) {
-          fake.rawRows.push({ ...row, receivedAt: row.receivedAt ?? new Date() });
-          inserted.push({ id: `raw-${fake.rawRows.length}` });
-        }
-      }
-      return inserted;
-    }
-    if (this.table === noncesTable) {
-      const v = this.vals as { nodeId: string; nonceHash: string; expiresAt: Date };
-      const k = `${v.nodeId}|${v.nonceHash}`;
-      if (fake.nonceRows.has(k)) return [];
-      fake.nonceRows.set(k, { ...v });
-      return [{ nodeId: v.nodeId }];
-    }
-    if (this.table === aggregatesTable) {
-      // Production inserts chunked arrays with excluded.* conflict updates.
-      const rows = (Array.isArray(this.vals) ? this.vals : [this.vals]) as Record<string, unknown>[];
-      for (const v of rows) {
-        const k = `${v.week}|${v.signal}|${v.mbid}`;
-        const existing = fake.aggregateRows.find(
-          (r) => `${r.week}|${r.signal}|${r.mbid}` === k,
-        );
-        if (existing) {
-          existing.nodeCount = v.nodeCount;
-          existing.computedAt = v.computedAt;
-        } else fake.aggregateRows.push({ ...v });
-      }
-      return [];
-    }
-    if (this.table === playlistsTable) {
-      const v = this.vals as PlaylistRow;
-      const existing = fake.playlistRows.find(
-        (r) => r.week === v.week && r.key === v.key,
-      );
-      if (existing && this.updateSet) Object.assign(existing, this.updateSet);
-      else if (!existing) fake.playlistRows.push({ ...v });
-      return [];
-    }
-    // indexPublications and anything else: accept and forget.
-    return [];
-  }
-}
-
-class FakeExchangeDb {
-  portalRows: PortalRow[];
-  rawRows: RawRow[] = [];
-  aggregateRows: Record<string, unknown>[] = [];
-  playlistRows: PlaylistRow[] = [];
-  nonceRows = new Map<string, { nodeId: string; nonceHash: string; expiresAt: Date }>();
-  touchAttempts = 0;
-  touchApplied = 0;
-
-  constructor(rows: PortalRow[]) {
-    this.portalRows = rows;
-  }
-
-  select(selection?: Record<string, unknown>) {
-    return {
-      from: (table: unknown) => new FakeQuery(this, table, selection),
-    };
-  }
-
-  insert(table: unknown) {
-    return {
-      values: (vals: unknown) => new InsertQuery(this, table, vals),
-    };
-  }
-
-  update(table: unknown) {
-    return {
-      set: (v: Record<string, unknown>) => ({
-        where: (cond: unknown) => ({
-          returning: async () => {
-            if (table !== portalKeysTable) return [];
-            const [firstParam, secondParam] = sqlParams(cond);
-            if ("pendingNodeId" in v) {
-              const row = this.portalRows.find((r) => r.id === firstParam);
-              if (!row) return [];
-              row.pendingNodeId = v.pendingNodeId as string;
-              row.pendingNodePublicKey = v.pendingNodePublicKey as string;
-              row.pendingRequestedAt = v.pendingRequestedAt as Date;
-              return [{ id: row.id }];
-            }
-            if ("lastUsedAt" in v) {
-              this.touchAttempts += 1;
-              const threshold = secondParam as Date;
-              const row = this.portalRows.find((r) => r.id === firstParam);
-              if (row && (row.lastUsedAt === null || row.lastUsedAt < threshold)) {
-                row.lastUsedAt = v.lastUsedAt as Date;
-                this.touchApplied += 1;
-                return [{ id: row.id }];
-              }
-              return [];
-            }
-            return [];
-          },
-        }),
-      }),
-    };
-  }
-
-  delete(table: unknown) {
-    return {
-      where: (cond: unknown) => {
-        const run = (): Record<string, unknown>[] => {
-          const [param] = sqlParams(cond);
-          if (table === noncesTable) {
-            const cutoff = param as Date;
-            for (const [k, v] of this.nonceRows) {
-              if (v.expiresAt < cutoff) this.nonceRows.delete(k);
-            }
-            return [];
-          }
-          if (table === rawReportsTable) {
-            const cutoff = param as Date;
-            const before = this.rawRows.length;
-            this.rawRows = this.rawRows.filter((r) => r.receivedAt >= cutoff);
-            return Array.from(
-              { length: before - this.rawRows.length },
-              (_, i) => ({ id: `del-${i}` }),
-            );
-          }
-          return [];
-        };
-        return {
-          returning: async () => run(),
-          then: (
-            onFulfilled?: (value: unknown[]) => unknown,
-            onRejected?: (reason: unknown) => unknown,
-          ) => Promise.resolve(run()).then(onFulfilled, onRejected),
-        };
-      },
-    };
-  }
-}
-
 /* ---------------- setup + call helpers ---------------- */
 
 async function setup(rows: PortalRow[]) {
@@ -443,7 +139,7 @@ async function setup(rows: PortalRow[]) {
   process.env.API_KEY_PEPPER = PEPPER;
   process.env.SIN_TOKEN_PRIVATE_KEY = POOL_PRIVATE_B64;
   const mod = await import("../src/sin/index.ts");
-  const fake = new FakeExchangeDb(rows);
+  const fake = new FakeSinDb(rows);
   mod.setDbResolverForTests(() => fake as unknown as SinDb);
   mod.resetRateLimiterForTests();
   return { app: mod.default, fake, mod };
@@ -620,19 +316,23 @@ describe("sin §3A: key exchange + access tokens (fake db)", () => {
     assert.equal(reported.status, 201);
     assert.deepEqual(await reported.json(), {
       accepted: 1,
-      duplicatesIgnored: 0,
+      duplicate: false,
       week: WEEK,
     });
-    assert.equal(fake.rawRows.length, 1);
-    // P7: the stored row carries nothing about the credential, token,
-    // signature, or binding.
-    assert.deepEqual(Object.keys(fake.rawRows[0]).sort(), [
+    // Counted on arrival, never stored per node: no raw row exists, and
+    // the count row carries nothing about the credential, token,
+    // signature, or binding (P7).
+    assert.equal(fake.rawRows.length, 0);
+    assert.equal(fake.countRows.length, 1);
+    assert.deepEqual(Object.keys(fake.countRows[0]!).sort(), [
       "mbid",
-      "receivedAt",
+      "nodeCount",
       "signal",
-      "tokenHash",
       "week",
     ]);
+    assert.equal(fake.countRows[0]!.nodeCount, 1);
+    // The portal-token call is the node's check-in (§3.3).
+    assert.ok(fake.portalRows[0]!.lastUsedAt instanceof Date);
 
     const playlists = await tokenGet(app, token, node, "/v1/playlists");
     assert.equal(playlists.status, 200);
@@ -876,5 +576,76 @@ describe("sin §3A: key exchange + access tokens (fake db)", () => {
     assert.deepEqual(await unknown.json(), { error: "unauthorized" });
     const revokedRes = await exchange(app, RAW, node);
     assert.equal(revokedRes.status, 401);
+  });
+  test("one report per node per week: a second report for the week counts nothing", async () => {
+    const node = makeNode();
+    const { app, fake } = await setup([boundRow(node)]);
+    const token = await exchangeForToken(app, RAW, node);
+    const weekToken = "w".repeat(64);
+    const body = (mbid: string) =>
+      JSON.stringify({ week: WEEK, token: weekToken, signals: [{ type: "watchlist_add", mbid }] });
+    const first = await tokenReport(app, token, node, body(MBID));
+    assert.equal(first.status, 201);
+    const again = await tokenReport(app, token, node, body("22222222-2222-4222-8222-222222222222"));
+    assert.equal(again.status, 200);
+    assert.deepEqual(await again.json(), { accepted: 0, duplicate: true, week: WEEK });
+    assert.equal(fake.countRows.length, 1);
+    assert.equal(fake.transactions, 2);
+  });
+
+  test("a closed or future week is refused before anything is counted", async () => {
+    const node = makeNode();
+    const { app, fake } = await setup([boundRow(node)]);
+    const token = await exchangeForToken(app, RAW, node);
+    for (const week of ["2020-W01", "2099-W01"]) {
+      const res = await tokenReport(
+        app,
+        token,
+        node,
+        JSON.stringify({ week, token: "z".repeat(64), signals: [{ type: "watchlist_add", mbid: MBID }] }),
+      );
+      assert.equal(res.status, 400);
+      assert.equal(((await res.json()) as { error: string }).error, "week_not_open");
+    }
+    assert.equal(fake.countRows.length, 0);
+    assert.equal(fake.reportTokens.size, 0);
+  });
+
+  test("counts are exact across aggregation passes (no 24h recount loss)", async () => {
+    const { fake, mod } = await setup([]);
+    const db = fake as unknown as SinDb;
+    const report = (i: number) => ({
+      week: WEEK,
+      token: `node-${i}`.padEnd(64, "x"),
+      signals: [{ type: "recent_add" as const, mbid: MBID }],
+    });
+    // 8 installs report, a pass runs (below k: nothing public) ...
+    for (let i = 0; i < 8; i += 1) await mod.countReport(db, report(i));
+    const firstPass = await mod.aggregateOnce(db);
+    assert.equal(firstPass.aggregatesWritten, 0);
+    assert.equal(fake.aggregateRows.length, 0);
+    // ... days later 7 more report: together they reach k exactly.
+    for (let i = 8; i < K_PUBLISH_THRESHOLD; i += 1) await mod.countReport(db, report(i));
+    const secondPass = await mod.aggregateOnce(db);
+    assert.equal(secondPass.aggregatesWritten, 1);
+    assert.equal(fake.aggregateRows[0]!.nodeCount, K_PUBLISH_THRESHOLD);
+  });
+
+  test("raw portal keys are refused on every data route: only the bound node's token works", async () => {
+    const node = makeNode();
+    const { app, fake } = await setup([boundRow(node)]);
+    const body = reportBody();
+    const direct = await app.request("/v1/report", {
+      method: "POST",
+      headers: { "x-sin-key": RAW },
+      body,
+    });
+    assert.equal(direct.status, 401);
+    for (const path of ["/v1/whoami", "/v1/playlists", "/v1/index/trending"]) {
+      const res = await app.request(path, { headers: { "x-sin-key": RAW } });
+      assert.equal(res.status, 401, path);
+      assert.deepEqual(await res.json(), { error: "unauthorized" });
+    }
+    assert.equal(fake.countRows.length, 0);
   });
 });

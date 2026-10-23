@@ -123,10 +123,22 @@ export async function approveBindingAction(keyId: string): Promise<ActionResult>
   if (!key.pendingNodePublicKey) return { error: 'No pending binding request on this key.' }
 
   const { approveBindingUpdate } = await import('@/lib/binding')
-  await prisma.portalKey.update({
-    where: { id: keyId },
-    data: approveBindingUpdate(key),
-  })
+  try {
+    await prisma.portalKey.update({
+      where: { id: keyId },
+      data: approveBindingUpdate(key),
+    })
+  } catch (err) {
+    // portal_keys_bound_node_public_key_uq: one MetaSync can be bound to
+    // one key. Without this the approve button threw an unhandled error.
+    if ((err as { code?: string }).code === 'P2002') {
+      return {
+        error:
+          'That MetaSync is already approved on another key. Unbind it there first, or reject this request.',
+      }
+    }
+    throw err
+  }
   revalidatePath(REVALIDATE)
   return {}
 }

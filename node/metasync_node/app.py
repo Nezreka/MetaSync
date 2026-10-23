@@ -8,15 +8,26 @@ Docker healthchecks work.
 """
 from __future__ import annotations
 
+import hmac
 import json
 import secrets
+import time
 from functools import wraps
 from typing import Any
 
-from flask import Flask, flash, redirect, render_template, request, session, url_for
+from flask import Flask, abort, flash, redirect, render_template, request, session, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
 
-from .service import NodeService, PairingError, PairingRateLimited
+from .service import NodeService, PairingError, PairingRateLimited, check_pool_url
+
+# POST routes SoulSync calls (no browser session, no form): CSRF-exempt.
+MACHINE_POST_PATHS = frozenset({
+    "/local/pair/request", "/local/pair/claim",
+    "/local/handoff/pool-key", "/local/disconnect",
+})
+
+LOGIN_MAX_FAILURES = 5
+LOGIN_WINDOW_S = 300
 
 
 def create_app(service: NodeService) -> Flask:
@@ -26,6 +37,34 @@ def create_app(service: NodeService) -> Flask:
     app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
     store = service.store
+
+    # CSRF: every browser form POST carries the session's token. The
+    # session cookie alone is not enough — SameSite=Lax still sends it on
+    # requests from any page on the same site, and SoulSync (port 8000) is
+    # the same site as this UI (port 8790): a page there, or any other app
+    # on this host, could otherwise post to /pools or /actions/dry-run as
+    # the logged-in admin. The machine-to-machine routes SoulSync calls are
+    # exempt: they authenticate with the local API key (or a pairing
+    # code), never with the cookie. /local/pair/confirm is NOT one of them:
+    # it is the dashboard's approve button.
+    def csrf_token() -> str:
+        token = session.get("csrf_token")
+        if not token:
+            token = secrets.token_urlsafe(32)
+            session["csrf_token"] = token
+        return token
+
+    app.jinja_env.globals["csrf_token"] = csrf_token
+
+    @app.before_request
+    def check_csrf():
+        if request.method != "POST" or request.path in MACHINE_POST_PATHS:
+            return None
+        sent = request.form.get("csrf_token") or request.headers.get("X-CSRF-Token") or ""
+        expected = session.get("csrf_token") or ""
+        if not expected or not hmac.compare_digest(str(sent), str(expected)):
+            abort(400, description="This form expired or did not come from this page. Reload and try again.")
+        return None
 
     def password_set() -> bool:
         return bool(store.settings.get("ui_password_hash"))
@@ -81,15 +120,30 @@ def create_app(service: NodeService) -> Flask:
                 return redirect(url_for("dashboard"))
         return render_template("setup.html")
 
+    # Failed logins per client address, for a small brute-force brake: the
+    # UI is often reachable from the whole LAN, and the password guards the
+    # pool key and the SoulSync key.
+    failed_logins: dict[str, list[float]] = {}
+
     @app.route("/login", methods=["GET", "POST"])
     def login():
         if not password_set():
             return redirect(url_for("setup"))
         if request.method == "POST":
+            client_addr = request.remote_addr or "?"
+            now = time.monotonic()
+            recent = [t for t in failed_logins.get(client_addr, []) if now - t < LOGIN_WINDOW_S]
+            if len(recent) >= LOGIN_MAX_FAILURES:
+                failed_logins[client_addr] = recent
+                flash("Too many wrong passwords. Wait a few minutes and try again.", "error")
+                return render_template("login.html"), 429
             password = request.form.get("password", "")
             if check_password_hash(store.settings["ui_password_hash"], password):
+                failed_logins.pop(client_addr, None)
+                session.clear()
                 session["ui_admin"] = True
                 return redirect(url_for("dashboard"))
+            failed_logins[client_addr] = [*recent, now]
             flash("Wrong password.", "error")
         return render_template("login.html")
 
@@ -174,7 +228,7 @@ def create_app(service: NodeService) -> Flask:
     @app.post("/local/pair/request")
     def pair_request():
         try:
-            return service.request_pairing()
+            return service.request_pairing(requested_from=request.remote_addr)
         except PairingRateLimited:
             return {"ok": False, "error": "rate_limited"}, 429
         except PairingError:
@@ -248,6 +302,14 @@ def create_app(service: NodeService) -> Flask:
         store.settings["dry_run"] = request.form.get("dry_run") == "on"
         store.save_settings()
         flash(f"Dry run is now {'ON' if store.settings['dry_run'] else 'OFF'}.", "ok")
+        return redirect(url_for("dashboard"))
+
+    @app.post("/actions/share-listening")
+    @login_required
+    def action_share_listening():
+        store.settings["share_listening"] = request.form.get("share_listening") == "on"
+        store.save_settings()
+        flash(f"Listening signals are now {'ON' if store.settings['share_listening'] else 'OFF'}.", "ok")
         return redirect(url_for("dashboard"))
 
     @app.post("/actions/share-churn")
@@ -346,6 +408,8 @@ def create_app(service: NodeService) -> Flask:
                         flash(str(err), "error")
             elif not name or not url:
                 flash("A pool needs at least a name and a URL.", "error")
+            elif (url_error := _pool_url_error(url)) is not None:
+                flash(url_error, "error")
             else:
                 pool_id = secrets.token_hex(4)
                 store.settings.setdefault("pools", []).append({
@@ -356,6 +420,13 @@ def create_app(service: NodeService) -> Flask:
                 flash(f"Pool '{name}' added.", "ok")
             return redirect(url_for("pools"))
         return render_template("pools.html", pools=service.status()["pools"])
+
+    def _pool_url_error(url: str) -> str | None:
+        try:
+            check_pool_url(url, allow_insecure=service.allow_insecure_pools)
+        except ValueError as err:
+            return str(err)
+        return None
 
     @app.post("/pools/<pool_id>/toggle")
     @login_required

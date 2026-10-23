@@ -76,7 +76,7 @@ WISHLIST = [
 ]
 
 ALBUMS = [
-    {"id": 1, "title": "Fixture Album", "album_artist_id": 1, "created_at": "2026-09-01T08:00:00",
+    {"id": 1, "title": "Fixture Album", "album_artist_id": 1, "created_at": "2026-10-06T08:00:00",
      "file_path": "/music/fixture", "track_count": 10, "total_duration": 2000, "musicbrainz_release_id": REL_A},
     {"id": 2, "title": "New Import", "album_artist_id": 1, "created_at": "2026-10-20T08:00:00",
      "file_path": "/music/new", "track_count": 8, "total_duration": 1600, "musicbrainz_release_id": REL_A},
@@ -121,19 +121,27 @@ def _serve(handler_cls) -> tuple[ThreadingHTTPServer, str]:
 
 
 class MockSoulSync:
-    def __init__(self, watchlist=WATCHLIST, wishlist=WISHLIST, albums=ALBUMS, fail_sync=False, downloads=None):
+    def __init__(self, watchlist=WATCHLIST, wishlist=WISHLIST, albums=ALBUMS, fail_sync=False, downloads=None,
+                 listening=None):
+        """``listening=None`` means a SoulSync build without the
+        listening-activity endpoint (404)."""
         outer = self
         self.syncs: list[dict] = []
         self.downloads = downloads
+        self.listening = listening
+        self.gets: list[tuple[str, dict]] = []  # (path, query params) of every GET
 
         class Handler(_Base):
             def do_GET(self):
                 parsed = urlparse(self.path)
                 params = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+                outer.gets.append((parsed.path, params))
                 if parsed.path == "/api/v1/watchlist":
                     return self._send(200, _envelope({"artists": watchlist}))
                 if parsed.path == "/api/v1/library/download-activity":
                     return self._send(200, _envelope({"albums": outer.downloads or []}))
+                if parsed.path == "/api/v1/library/listening-activity" and outer.listening is not None:
+                    return self._send(200, _envelope({"albums": outer.listening}))
                 if parsed.path in ("/api/v1/wishlist", "/api/v1/library/albums"):
                     key = "tracks" if parsed.path.endswith("wishlist") else "albums"
                     all_items = wishlist if key == "tracks" else albums
@@ -186,6 +194,7 @@ class MockPool:
     ):
         outer = self
         self.reports: list[dict] = []
+        self.claimed: set[tuple] = set()
         self.published: list[dict] = []
         self.aggregate_calls = 0
         self.hits: list[str] = []
@@ -277,8 +286,15 @@ class MockPool:
                             return self._send(401, {"error": "invalid_token"})
                     elif not self.headers.get("X-SIN-Key"):
                         return self._send(401, {"error": "invalid_key"})
-                    outer.reports.append(self._body())
-                    return self._send(201, {"accepted": 1, "duplicatesIgnored": 0, "week": "2026-W43"})
+                    body = self._body()
+                    # SIN counts one report per (week, token): a repeat is
+                    # acknowledged with 200 duplicate and counts nothing.
+                    claim = (body.get("week"), body.get("token"))
+                    if claim in outer.claimed:
+                        return self._send(200, {"accepted": 0, "duplicate": True, "week": body.get("week")})
+                    outer.claimed.add(claim)
+                    outer.reports.append(body)
+                    return self._send(201, {"accepted": len(body.get("signals") or []), "duplicate": False, "week": body.get("week")})
                 if parsed.path == "/v1/aggregate":
                     if not self._token_gate():
                         return self._send(401, {"error": "invalid_token"})
@@ -355,3 +371,26 @@ class MockMusicBrainz:
 
     def close(self):
         self.server.shutdown()
+
+
+def browser_client(app):
+    """A Flask test client that behaves like the browser rendering the UI:
+    every form POST carries the session's CSRF token, as the hidden field
+    in each template does. Machine routes (SoulSync's /local/* calls) are
+    posted as-is."""
+    from flask.testing import FlaskClient
+
+    from metasync_node.app import MACHINE_POST_PATHS
+
+    class BrowserClient(FlaskClient):
+        def post(self, path, *args, **kwargs):
+            if path not in MACHINE_POST_PATHS and "json" not in kwargs:
+                with self.session_transaction() as sess:
+                    token = sess.setdefault("csrf_token", secrets.token_urlsafe(16))
+                data = dict(kwargs.pop("data", None) or {})
+                data.setdefault("csrf_token", token)
+                kwargs["data"] = data
+            return super().post(path, *args, **kwargs)
+
+    app.test_client_class = BrowserClient
+    return app.test_client()
