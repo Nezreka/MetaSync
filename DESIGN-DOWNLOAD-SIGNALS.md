@@ -1,8 +1,13 @@
 # Download-based signals for SIN — design
 
-Status: **design, Oct 23, 2026.** Commissioned by Boulder after the
-extra-data inventory of SoulSync's database. Nothing here is built yet.
-Decisions needed from Boulder are in §7 and §10.
+Status: **built, Oct 23, 2026.** Commissioned by Boulder after the
+extra-data inventory of SoulSync's database. Boulder adopted the §7/§10
+recommendations ("do what you think is best") and the build followed
+§8: SIN backend (migration 0007, live), the SoulSync endpoint (PR
+#1848, awaiting Boulder's merge), and the node. §4/§5 below describe
+the contract as built; two build-time refinements are recorded there
+(failed attempts deferred — they cannot be keyed to albums; churn
+state is the node's own accumulated download history).
 
 ## 1. Why
 
@@ -38,13 +43,11 @@ per node per week, same as everything else in SIN:
 | `download_grab` | At least one track of this album finished downloading this week (status completed) **and the album was not newly added to the library this week** — re-grabs, upgrades, gap-fills, and grabs that never landed. New arrivals are `recent_add`'s job; the two never fire for the same album-week on one node. |
 | `download_churn` | This album was downloaded 14+ days ago, was in the library afterwards, and has now been absent from **two consecutive complete** library reads. Reported once per node per album (see §5). |
 
-Plus one rule extension, no new type:
-
-- `hunt_demand` also fires when a **wishlisted album had a failed
-  download attempt this week** and still has no successful download.
-  Today it only fires on wishlist age (7+ days). A failed grab is
-  stronger evidence than age, and the meaning of the signal does not
-  change: *wanted, still not got*.
+Plus one rule extension, no new type — **deferred at build time**
+(see §4): `hunt_demand` would also fire when a wishlisted album had
+a failed download attempt this week and still has no successful
+download. A failed grab is stronger evidence than age, but failure
+records cannot be keyed to albums today, so v1 does not build it.
 
 Vocabulary discipline: SIN shipped with four types, gained `recent_add`
 as the fifth, and these would make seven. That is the cap this design
@@ -82,32 +85,41 @@ not exposed today. New endpoint, same `sk_` admin-scope auth as the
 other MetaSync reads:
 
 ```
-GET /api/v1/library/download-activity
+GET /api/v1/library/download-activity?since=<ISO-8601>
 → {
     "albums": [
       {
         "musicbrainz_release_id": "<uuid>",
         "completed_downloads": 12,
-        "failed_downloads": 1,
-        "first_downloaded_at": "2026-09-30T…",
-        "last_downloaded_at": "2026-10-21T…",
-        "in_library": true
+        "completed_since": 3,
+        "first_downloaded_at": "2026-09-30 10:00:00",
+        "last_downloaded_at": "2026-10-21 09:30:00"
       }, …
     ]
   }
 ```
 
-Rules for the endpoint:
+Rules for the endpoint, as built (SoulSync PR #1848):
 
 - Aggregated **per album inside SoulSync** (the join above). One row
-  per album that has any download record, ever. Bounded by the user's
-  downloaded-album count; no pagination in v1.
+  per library album with at least one completed download. Bounded by
+  the user's downloaded-album count; no pagination in v1.
 - Only IDs, counts, and timestamps cross the wire — the same
   ID-only contract as every other MetaSync read. No titles, no paths.
-- `in_library` is SoulSync's own current truth for that album.
-- Failed = a download record that never reached completed for that
-  album in the window the node asks about; SoulSync counts from the
-  rows it has, the node applies the week windows.
+- `since` is the server-side week window (the cleaner option §5
+  hoped for): the node passes the report week's start and SoulSync
+  counts completions at or after it into `completed_since`, compared
+  as UTC instants, never as text. A malformed `since` is a 400.
+  Without `since`, `completed_since` equals `completed_downloads`.
+- Albums whose tracks have left the library no longer join and drop
+  out of the response. That is load-bearing, not a gap: the node
+  accumulates its own download history from weekly reads (§5), so a
+  row disappearing is part of how churn is detected.
+- **Failed attempts are deferred.** Verified at build time:
+  `track_downloads` reliably records completions, while failure
+  records (`download_decisions`) cannot be keyed to albums — so the
+  §2 `hunt_demand` failed-attempt extension is out of v1 rather than
+  built on a fuzzy join.
 
 This is the only SoulSync change. Everything else is node + SIN
 backend, in the same repo as the rest of MetaSync.
@@ -122,42 +134,43 @@ New read in the weekly report flow, after the library read:
    already bridged by the main pass. Download-only releases (grabbed
    and already gone, or never imported) resolve **first** in the
    fresh-lookup budget — they are few and high-value.
-3. `download_grab`: any row with a download completed this week
-   whose group did **not** produce a `recent_add` this run — the
-   exclusion is computed locally from the same run's library read
-   (album in the library with `created_at` in the report week), so
-   grab and recent_add stay disjoint by construction. (SoulSync's
-   per-album `last_downloaded_at` plus a `completed_this_week` count
-   would be cleaner; if the endpoint can cheaply add
-   `completed_downloads_this_week` computed server-side against a
-   `?week=` parameter, prefer that — decide at build time, the
-   node-side window check is the fallback.)
-4. `download_churn` (only when the §7 toggle is on):
-   - Candidate: completed download with `last_downloaded_at` ≥ 14
-     days before the report week, **and** the group was present in a
-     previous week's library snapshot, **and** the group is absent
-     from this week's library groups, **and** the group was also
-     absent from the *previous* completed run's library groups
+3. `download_grab`: any row with `completed_since ≥ 1` (SoulSync
+   counted this week's completions server-side against the `since`
+   the node passed) whose group did **not** produce a `recent_add`
+   this run — the exclusion is computed locally from the same run's
+   library read (album in the library with `created_at` in the
+   report week), so grab and recent_add stay disjoint by
+   construction.
+4. `download_churn` (only when the §7 toggle is on), as built:
+   - Candidate: the group is in the node's own accumulated download
+     history with a first download ≥ 14 days ago, **and** it was
+     present in the library snapshot from **two runs ago**, **and**
+     absent from the previous run's snapshot **and** this run's
      (two consecutive absences — a rescan gap or a drive dropping
      offline must never read as churn).
+   - State: the node keeps `downloaded_groups` (group → first/last
+     download, accumulated from weekly endpoint reads while albums
+     live — the endpoint itself forgets deleted albums) and
+     `library_group_snapshots` (the last two **complete** reads).
+     Snapshots rotate only on complete reads.
    - The library read must be **complete**: if `albums_truncated` is
-     set, or the read errored, churn is skipped entirely that run.
-   - State: the node keeps `churn_reported` (set of group MBIDs) and
-     `last_library_groups` in its state store. A churn is reported
-     once; if the album **returns** to the library, the group leaves
-     `churn_reported`, so a later genuine drop can count again.
-   - v1 resolves churn candidates from the **cache only**: a group
-     the node never resolved while the album lived in the library
-     cannot churn. That bounds lookups to zero extra and keeps
-     precision high; pre-node download history warms up as albums
-     are seen in the library over time.
-5. Diagnostics gain: download rows seen, grabs computed, churn
-   candidates suppressed (and why: truncated read, first absence,
-   unresolved), download rows with no joinable album.
+     set, churn is suppressed that run (candidates still counted in
+     diagnostics, fired = 0).
+   - Fires **once** per drop by construction: after firing, the
+     two-absence window has moved past the last present snapshot.
+     If the album **returns**, it re-enters the snapshots and a
+     later genuine drop can count again (heals silently).
+   - Candidates come only from accumulated state, which only ever
+     contains groups resolved while the album lived in the library —
+     zero extra lookups, and pre-node deletions are simply unknowable.
+5. Diagnostics gain: download rows seen, unjoined rows, grabs
+   computed, churn candidates vs fired, and `downloads_available`
+   (false when the SoulSync build has no endpoint yet — the report
+   still runs, minus download signals).
 
-The Payload preview page gains a **Downloads** section listing exactly
-the grab/churn signals in the outgoing report, same as the other
-signals. Dry-run behavior is unchanged: computed, shown, not sent.
+The Payload preview shows the download counts in its diagnostics and
+the outgoing payload lists the grab/churn signals like every other
+signal. Dry-run behavior is unchanged: computed, shown, not sent.
 
 ## 6. SIN backend + composer
 

@@ -76,7 +76,7 @@ needing attention.
 
 ## What SIN collects
 
-Five signals, computed on your machine, keyed **only by MusicBrainz
+Seven signals, computed on your machine, keyed **only by MusicBrainz
 IDs** — one shared ID per album family, identical across every install
 and every music source:
 
@@ -87,6 +87,8 @@ and every music source:
 | `hunt_demand` | Wishlisted 7+ days ago, still not downloaded | release-group MBID |
 | `import_keep` | Imported 14+ days ago and still in your library | release-group MBID |
 | `recent_add` | Landed in your library this week | release-group MBID |
+| `download_grab` | Re-grabbed, upgraded, or gap-filled an album you already own this week (new arrivals are `recent_add`'s job) | release-group MBID |
+| `download_churn` | **Optional, off by default.** Downloaded 14+ days ago, then removed from your library — confirmed by two weekly reads in a row | release-group MBID |
 
 **Never collected, never sent:** listening history or play counts, track
 titles or artist/album names as text, file paths, library listings or
@@ -132,7 +134,7 @@ page is in the works; today the charts arrive as playlists.)
 
 1. The node reads your watchlist, wishlist, and library from your
    SoulSync's API — locally, on your machine.
-2. It computes the five signals, bridging edition IDs to release-group
+2. It computes the seven signals, bridging edition IDs to release-group
    IDs via MusicBrainz where needed (cached permanently).
 3. It exchanges your pool key + a node signature for a 24-hour token,
    then sends one signed report per joined pool.
