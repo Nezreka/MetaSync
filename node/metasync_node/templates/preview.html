@@ -1,26 +1,38 @@
 {% extends "base.html" %}
 {% block title %}MetaSync · Payload preview{% endblock %}
 {% block content %}
-<h1>Weekly report preview</h1>
-<p class="muted">This is the exact payload that will be POSTed to each joined pool as
-<code>POST /v1/report</code>. Nothing else leaves this machine: no titles, no play counts,
-no listening history — just this week's binary signals.
-{% if dry_run %}Dry run is <strong>ON</strong>, so running the report computes this preview and sends nothing.{% endif %}</p>
+<div class="page-head">
+  <p class="eyebrow-chip">Weekly report</p>
+  <h1>Weekly report preview</h1>
+  <p class="page-sub">This is the exact payload that will be POSTed to each joined pool as
+  <code>POST /v1/report</code>. Nothing else leaves this machine: no titles, no play counts,
+  no listening history — just this week's binary signals.
+  {% if dry_run %}Dry run is <strong>ON</strong>, so running the report computes this preview and sends nothing.{% endif %}</p>
+</div>
 {% if error %}<div class="flash error">Could not compute a fresh preview: {{ error }} (showing the last saved preview if any)</div>{% endif %}
 {% if diagnostics %}
 <section class="card">
-  <h2>Diagnostics</h2>
-  <p>Seen: {{ diagnostics.watchlist_seen }} watchlist artists, {{ diagnostics.wishlist_seen }} wishlist tracks,
-  {{ diagnostics.albums_seen }} library albums.</p>
-  <p>Skipped honestly (see DESIGN-NODE.md gaps): {{ diagnostics.gaps }}</p>
+  <div class="card-head">
+    <p class="eyebrow">What this node saw</p>
+    <h2>Diagnostics</h2>
+  </div>
+  <div class="stat-row">
+    <div class="stat"><span class="stat-num">{{ diagnostics.watchlist_seen }}</span><span class="stat-label">Watchlist artists seen</span></div>
+    <div class="stat"><span class="stat-num">{{ diagnostics.wishlist_seen }}</span><span class="stat-label">Wishlist tracks seen</span></div>
+    <div class="stat"><span class="stat-num">{{ diagnostics.albums_seen }}</span><span class="stat-label">Library albums seen</span></div>
+  </div>
+  <p class="muted" style="margin-top:16px">Skipped honestly (see DESIGN-NODE.md gaps): {{ diagnostics.gaps }}</p>
 </section>
 {% endif %}
 {% for name, payload in previews.items() %}
 <section class="card">
-  <h2>{{ name }}</h2>
+  <div class="payload-head">
+    <h2>{{ name }}</h2>
+    <span class="payload-route">POST /v1/report</span>
+  </div>
   <pre>{{ payload }}</pre>
 </section>
 {% else %}
-<p>No pool joined, or SoulSync is not connected yet — there is no payload to preview.</p>
+<div class="empty-state"><strong>No payload to preview</strong>No pool joined, or SoulSync is not connected yet.</div>
 {% endfor %}
 {% endblock %}

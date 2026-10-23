@@ -1,10 +1,12 @@
 {% extends "base.html" %}
 {% block title %}MetaSync · Pools{% endblock %}
 {% block content %}
-<p class="eyebrow">Step B · Optional</p>
-<h1>Pools</h1>
-<p class="muted">A pool is a network this node exchanges data with; SIN is one pool. Normally the pool key is entered in <strong>SoulSync</strong>, handed to MetaSync over the protected local connection, and exchanged here for a short-lived access token. This page is therefore mainly connection status. The manual key form remains available below as a labelled fallback.</p>
-<p class="muted">A normal node can only push its weekly report and pull index/playlist data. The <strong>admin</strong> role is only for Boulder's official MetaSync, which publishes the shared playlist data — user nodes never publish.</p>
+<div class="page-head">
+  <p class="eyebrow-chip">Step B · Optional</p>
+  <h1>Pools</h1>
+  <p class="page-sub">A pool is a network this node exchanges data with; SIN is one pool. Normally the pool key is entered in <strong>SoulSync</strong>, handed to MetaSync over the protected local connection, and exchanged here for a short-lived access token. This page is therefore mainly connection status. The manual key form remains available below as a labelled fallback.</p>
+  <p class="page-sub">A normal node can only push its weekly report and pull index/playlist data. The <strong>admin</strong> role is only for Boulder's official MetaSync, which publishes the shared playlist data — user nodes never publish.</p>
+</div>
 
 {% if pools %}
 <div class="pool-list">
@@ -14,7 +16,7 @@
       <div>
         <p class="eyebrow">{{ p.role }} pool</p>
         <h2>{{ p.name }}</h2>
-        <code class="break">{{ p.url }}</code>
+        <code class="break pool-url">{{ p.url }}</code>
       </div>
       <span class="status-pill {{ p.binding_status }}">{{ p.binding_status.replace('_', ' ') }}</span>
     </div>
@@ -25,7 +27,7 @@
       Compare this node fingerprint there: <code>{{ p.pending_node_fingerprint or "see Dashboard" }}</code>
     </div>
     {% endif %}
-    {% if p.status_note %}<p class="muted">{{ p.status_note }}</p>{% endif %}
+    {% if p.status_note %}<p class="pool-note">{{ p.status_note }}</p>{% endif %}
 
     <dl class="pool-details">
       <dt>Key prefix</dt><dd><code>{{ p.key_prefix or "no key stored" }}</code></dd>
@@ -65,8 +67,10 @@
 {% endif %}
 
 <form method="post" class="card form">
-  <p class="eyebrow">Manual fallback</p>
-  <h2>Add a pool directly</h2>
+  <div class="card-head">
+    <p class="eyebrow">Manual fallback</p>
+    <h2>Add a pool directly</h2>
+  </div>
   <p class="muted">This is the development/manual path. The preferred path is to enter the pool key in SoulSync and let SoulSync hand it to MetaSync.</p>
   <label>Pool name <input type="text" name="name" placeholder="SIN" required></label>
   <label>Pool URL <input type="url" name="url" placeholder="https://..." required></label>
@@ -77,6 +81,6 @@
       <option value="admin">admin — official MetaSync only (publishes playlist data)</option>
     </select>
   </label>
-  <button type="submit">Add pool manually</button>
+  <button class="primary" type="submit">Add pool manually</button>
 </form>
 {% endblock %}

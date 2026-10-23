@@ -4,22 +4,29 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}MetaSync{% endblock %}</title>
+  <link rel="icon" type="image/png" href="{{ url_for('static', filename='favicon.png') }}">
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
-<body>
+<body class="{% block body_class %}{% endblock %}">
   <header class="topbar">
-    <div class="brand">MetaSync <span class="tag">node</span></div>
-    {% if session.get('ui_admin') %}
-    <nav>
-      <a href="{{ url_for('dashboard') }}">Dashboard</a>
-      <a href="{{ url_for('soulsync_settings') }}">SoulSync</a>
-      <a href="{{ url_for('pools') }}">Pools</a>
-      <a href="{{ url_for('preview') }}">Payload preview</a>
-      <a href="{{ url_for('logout') }}">Sign out</a>
-    </nav>
-    {% endif %}
+    <div class="topbar-inner">
+      <a class="brand" href="{{ url_for('dashboard') }}">
+        <img class="brand-logo" src="{{ url_for('static', filename='logo.png') }}" alt="SoulSync">
+        <span class="brand-name">MetaSync</span>
+        <span class="tag">node</span>
+      </a>
+      {% if session.get('ui_admin') %}
+      <nav>
+        <a href="{{ url_for('dashboard') }}"{% if request.endpoint == 'dashboard' %} class="active"{% endif %}>Dashboard</a>
+        <a href="{{ url_for('soulsync_settings') }}"{% if request.endpoint == 'soulsync_settings' %} class="active"{% endif %}>SoulSync</a>
+        <a href="{{ url_for('pools') }}"{% if request.endpoint == 'pools' %} class="active"{% endif %}>Pools</a>
+        <a href="{{ url_for('preview') }}"{% if request.endpoint == 'preview' %} class="active"{% endif %}>Payload preview</a>
+        <a class="nav-signout" href="{{ url_for('logout') }}">Sign out</a>
+      </nav>
+      {% endif %}
+    </div>
   </header>
-  <main>
+  <main class="{% block main_class %}{% endblock %}">
     {% with messages = get_flashed_messages(with_categories=true) %}
       {% for category, message in messages %}
         <div class="flash {{ category }}">{{ message }}</div>
@@ -27,5 +34,11 @@
     {% endwith %}
     {% block content %}{% endblock %}
   </main>
+  <footer class="app-footer">
+    <img src="{{ url_for('static', filename='logo.png') }}" alt="">
+    <span>MetaSync node</span>
+    <span class="sep">·</span>
+    <span>the local companion for SoulSync</span>
+  </footer>
 </body>
 </html>

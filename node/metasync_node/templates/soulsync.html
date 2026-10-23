@@ -1,10 +1,18 @@
 {% extends "base.html" %}
 {% block title %}MetaSync · SoulSync connection{% endblock %}
 {% block content %}
-<h1>Connect to your SoulSync</h1>
-<p class="muted">Step A. Create an API key in SoulSync under Settings → API keys, then paste it here.
-Connecting SoulSync alone does <strong>not</strong> join any network — pools are separate, on the Pools page.</p>
+<div class="page-head">
+  <p class="eyebrow-chip">Step A · Connect</p>
+  <h1>Connect to your SoulSync</h1>
+  <p class="page-sub">Create an API key in SoulSync under Settings → API keys, then paste it here.
+  Connecting SoulSync alone does <strong>not</strong> join any network — pools are separate, on the Pools page.</p>
+</div>
+
 <form method="post" class="card form">
+  <div class="card-head">
+    <p class="eyebrow">MetaSync → SoulSync</p>
+    <h2>Your SoulSync</h2>
+  </div>
   <label>SoulSync URL
     <input type="url" name="url" value="{{ current.url or '' }}" placeholder="http://soulsync:8000" required>
   </label>
@@ -13,22 +21,28 @@ Connecting SoulSync alone does <strong>not</strong> join any network — pools a
   </label>
   <div class="row">
     <button type="submit" name="action" value="save">Save</button>
-    <button type="submit" name="action" value="test">Save &amp; test connection</button>
+    <button class="primary" type="submit" name="action" value="test">Save &amp; test connection</button>
   </div>
 </form>
 
 <section class="card">
-  <p class="eyebrow">Reverse direction · SoulSync → MetaSync</p>
-  <h2>MetaSync local API key</h2>
+  <div class="card-head">
+    <p class="eyebrow">Reverse direction · SoulSync → MetaSync</p>
+    <h2>MetaSync local API key</h2>
+  </div>
   <p class="muted">For the manual setup, paste this key into SoulSync’s MetaSync settings. SoulSync presents it when handing over a pool key or reading this node’s status. Only a hash is stored here; the raw key is shown once when created.</p>
   {% if local_key_once %}
   <div class="secret-box">
     <span class="secret-label">Copy this local API key now — it is shown only once</span>
-    <code id="local-api-key-once-settings">{{ local_key_once }}</code>
-    <button type="button" onclick="navigator.clipboard.writeText(document.getElementById('local-api-key-once-settings').textContent)">Copy key</button>
+    <div class="secret-key">
+      <code id="local-api-key-once-settings">{{ local_key_once }}</code>
+      <button type="button" onclick="navigator.clipboard.writeText(document.getElementById('local-api-key-once-settings').textContent)">Copy key</button>
+    </div>
   </div>
   {% elif status.local_api_key.configured %}
-  <p>Current key: <code>{{ status.local_api_key.prefix }}…</code> <span class="muted">(created {{ status.local_api_key.created_at }})</span></p>
+  <dl>
+    <dt>Current key</dt><dd><code>{{ status.local_api_key.prefix }}…</code> <span class="muted">(created {{ status.local_api_key.created_at }})</span></dd>
+  </dl>
   {% else %}
   <p>No local API key has been issued yet.</p>
   {% endif %}
