@@ -492,15 +492,26 @@ official node's admin credential), `API_KEY_PEPPER`,
 ## 13. What comes back to the user
 
 Nodes pull `GET /v1/playlists` (the week's canonical charts with
-full track lists) and cache them in state. Materialization
-(`service.py::_materialize`) writes each chart into the user's
-SoulSync via `POST /api/v1/playlists/<id>/sync` with
-`{playlist_name, tracks, image_url: "", sync_mode: "replace"}` under
-a stable local playlist id derived from (pool id, chart key).
-Unchanged charts (same content hash) are skipped. **Nothing
-auto-downloads**: a chart arriving creates/updates a playlist
-definition in SoulSync; SoulSync's own mirroring decides what to
-fetch, when the user syncs it. Dry-run mode materializes nothing.
+full track lists) every `refresh_interval_h` hours and cache them in
+state. **The node never writes into SoulSync.** It offers the cache on
+its local API, `GET /local/charts` (local key), and SoulSync pulls from
+there:
+
+- SoulSync's system automation **"Refresh MetaSync Charts"** (daily)
+  fetches the charts (`core/metasync_charts.py`), stores them, and
+  matches every track in the background. That is the same identify pass
+  My Playlists use, and its cache makes repeats instant.
+- A chart is shown only once every track is matched: a **SoulSync Charts**
+  tab on SoulSync's dashboard, and a shelf on Discover.
+- Opening one gives that profile its own playlist with the matches
+  already in it, and lands on it in Sync. **Nothing is synced to a media
+  server, wishlisted or downloaded until that person presses Sync &
+  download** (or schedules Auto-Sync on it).
+
+Until Oct 23, 2026 the node pushed each chart through SoulSync's
+`POST /api/v1/playlists/<id>/sync`. That call also put every missing
+track on the wishlist, which SoulSync's default wishlist automation then
+downloaded. It was removed before any chart had published.
 
 ## 14. Never collected — anywhere in the system
 

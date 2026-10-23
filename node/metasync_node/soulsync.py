@@ -20,22 +20,14 @@ GitHub API:
 - GET /library/albums -> data.albums[] (serialize_album), PAGINATED:
     { id, title, created_at, musicbrainz_release_id, ... }
     NOTE: albums expose a MusicBrainz RELEASE id, not a release-GROUP id.
-- POST /playlists/<id>/sync with body
-    { playlist_name, tracks, image_url?, sync_mode? }
-  STARTS an async sync in SoulSync (this is how the Companion
-  creates/updates a playlist). Track objects are Spotify-shaped:
-    { id, name, artists: [{name}] | [str], album: {name, images:[{url}]} | str,
-      duration_ms, image_url }
-  sync_mode "replace" deletes the server playlist and recreates it from
-  the payload; when sync_mode is OMITTED SoulSync resolves it to its
-  configured default "reconcile" (api/source_playlists.py
-  start_playlist_sync_from_payload), so the node always sends "replace".
-- GET /playlists and /playlists/<id> list Spotify/Tidal SOURCE playlists
-  only — not the server playlists a sync creates — so the node tracks the
-  playlist ids it manages in its own state.
 
-HARD RULE: this client is the node's ONLY way at SoulSync data.
-The node never opens SoulSync's database.
+HARD RULES: this client is the node's ONLY way at SoulSync data, and it
+only READS. The node never opens SoulSync's database and never writes a
+playlist into SoulSync: the charts go the other way, SoulSync pulling them
+from GET /local/charts and showing them as playlists a person can open.
+(The node used to push each chart through POST /playlists/<id>/sync, which
+also wishlisted every missing track for SoulSync's wishlist automation to
+download, so that call was removed.)
 """
 from __future__ import annotations
 
@@ -144,28 +136,3 @@ class SoulSyncClient:
         env = self.get("/watchlist")
         artists = (env["data"] or {}).get("artists") or []
         return {"ok": True, "watchlist_artists": len(artists)}
-
-    def sync_playlist(self, playlist_id: str, playlist_name: str, tracks: list[dict[str, Any]], sync_mode: str = "replace") -> None:
-        """Start a playlist sync in SoulSync. Always explicit sync_mode."""
-        from urllib.parse import quote
-
-        url = f"{self.base}/playlists/{quote(playlist_id, safe='')}/sync"
-        try:
-            res = self.session.post(
-                url,
-                json={"playlist_name": playlist_name, "tracks": tracks, "image_url": "", "sync_mode": sync_mode},
-                headers={**self._headers(), "Content-Type": "application/json"},
-                timeout=self.timeout_s,
-            )
-        except requests.RequestException as err:
-            raise SoulSyncError(f"SoulSync unreachable at playlist sync: {err}", code="UNREACHABLE") from err
-        body: dict[str, Any] = {}
-        try:
-            body = res.json()
-        except ValueError:
-            pass
-        if not res.ok or (body and not body.get("success")):
-            error = body.get("error") or {}
-            code = error.get("code") or f"HTTP_{res.status_code}"
-            message = error.get("message") or f"HTTP {res.status_code}"
-            raise SoulSyncError(f"Playlist sync {playlist_id} failed: {code}: {message}", code=code, status=res.status_code)

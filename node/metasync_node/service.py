@@ -12,6 +12,7 @@ SoulSync) down.
 from __future__ import annotations
 
 import hashlib
+import re
 import hmac
 import secrets
 import threading
@@ -23,7 +24,7 @@ from urllib.parse import urlparse
 from .config import Config
 from .identity import NodeIdentity, load_or_create_identity, token_for_week
 from .musicbrainz import MusicBrainzResolver
-from .playlists import build_canonical_playlists, content_hash, local_playlist_id
+from .playlists import build_canonical_playlists
 from .pool import PoolBindingPending, PoolClient, PoolError, PoolNotAvailable, is_loopback_url
 from .signals import compute_signals, is_uuid_shape
 from .soulsync import SoulSyncClient, SoulSyncError
@@ -462,7 +463,7 @@ class NodeService:
             "pools": status["pools"],
             "last_report": status["last_report"],
             "last_refresh_at": status["last_refresh_at"],
-            "managed_playlists": status["managed_playlists"],
+            "charts_offered": status["charts_offered"],
             "pairing_status": pairing.get("status") if pairing else None,
             "last_pairing": self.store.state.get("last_pairing"),
         }
@@ -843,60 +844,19 @@ class NodeService:
         self.store.state["report_job"] = job
         self.store.save_state()
 
-    # -- refresh leg: provide + update --------------------------------------
-    def _materialize(self, pool: dict[str, Any], canonical: list[dict[str, Any]], now: datetime) -> list[dict[str, Any]]:
-        """Sync canonical playlists into the local SoulSync (stable ids, replace)."""
-        results: list[dict[str, Any]] = []
-        managed = self.store.state.setdefault("managed_playlists", {}).setdefault(pool["id"], {})
-        client = self.soulsync()
-        for playlist in canonical:
-            key = str(playlist.get("key"))
-            name = str(playlist.get("name") or key)
-            tracks = playlist.get("tracks") or []
-            playlist_id = local_playlist_id(pool["id"], key)
-            entry: dict[str, Any] = {
-                "key": key, "playlist_id": playlist_id, "track_count": len(tracks),
-                "synced": False, "skipped_unchanged": False, "error": None,
-            }
-            previous = managed.get(key) or {}
-            digest = content_hash(tracks)
-            if previous.get("content_hash") == digest and previous.get("last_sync_at"):
-                entry["skipped_unchanged"] = True
-                entry["synced"] = True
-                results.append(entry)
-                continue
-            if self.dry_run or not tracks:
-                # Dry-run by design; empty by design too — a "replace" sync of
-                # zero tracks would wipe the user's existing playlist.
-                results.append(entry)
-                continue
-            try:
-                client.sync_playlist(playlist_id, name, tracks, "replace")
-                entry["synced"] = True
-                managed[key] = {
-                    "playlist_id": playlist_id, "name": name, "content_hash": digest,
-                    "track_count": len(tracks), "last_sync_at": now.isoformat(), "last_error": None,
-                }
-            except Exception as err:
-                self.store.record_error(f"refresh:sync:{pool['id']}:{key}", err)
-                managed[key] = {
-                    "playlist_id": playlist_id, "name": name,
-                    "content_hash": previous.get("content_hash", ""), "track_count": previous.get("track_count", 0),
-                    "last_sync_at": previous.get("last_sync_at"), "last_error": str(err),
-                }
-                entry["error"] = str(err)
-            results.append(entry)
-        return results
-
+    # -- refresh leg: pull the pool's charts, offer them to SoulSync ----------
     def run_refresh(self, now: datetime | None = None) -> dict[str, Any]:
-        """For every enabled pool: get canonical playlist data, materialize locally.
+        """For every enabled pool: get its canonical playlist data and keep it.
 
         Node-role pools PULL published playlist data. Admin-role pools (the
         official node) BUILD the definitions from the index via MusicBrainz
-        and PUBLISH them to the pool, then materialize the same definitions
-        locally. A pool that does not implement playlist endpoints yet
-        reports status "playlist_data_unavailable" — nothing is invented
-        and nothing is synced.
+        and PUBLISH them. Either way the result is cached here and offered to
+        SoulSync on GET /local/charts, which SoulSync's own daily automation
+        reads. The node never writes a playlist into SoulSync, never
+        wishlists and never downloads: SoulSync shows the charts as playlists
+        a person can open, and only that person's Sync & download moves
+        anything. A pool that does not implement playlist endpoints yet
+        reports "playlist_data_unavailable"; nothing is invented.
         """
         now = now or datetime.now(timezone.utc)
         outcome: dict[str, Any] = {"pools": {}, "error": None, "dry_run": self.dry_run}
@@ -919,7 +879,7 @@ class NodeService:
                     except PoolNotAvailable as err:
                         entry["status"] = "publish_unavailable"
                         entry["error"] = str(err)
-                    canonical = built["playlists"]
+                    week, playlists = built["week"], built["playlists"]
                 else:
                     try:
                         pulled = client.get_playlists()
@@ -928,12 +888,15 @@ class NodeService:
                         entry["error"] = str(err)
                         outcome["pools"][pool["id"]] = entry
                         continue
-                    entry["week"] = pulled["week"]
-                    self.store.state.setdefault("playlists_cache", {})[pool["id"]] = {
-                        "fetched_at": now.isoformat(), "week": pulled["week"], "playlists": pulled["playlists"],
-                    }
-                    canonical = pulled["playlists"]
-                entry["playlists"] = self._materialize(pool, canonical, now)
+                    week, playlists = pulled["week"], pulled["playlists"]
+                entry["week"] = week
+                self.store.state.setdefault("playlists_cache", {})[pool["id"]] = {
+                    "fetched_at": now.isoformat(), "week": week, "playlists": playlists,
+                }
+                entry["playlists"] = [
+                    {"key": str(p.get("key")), "name": p.get("name"), "track_count": len(p.get("tracks") or [])}
+                    for p in playlists
+                ]
             except PoolBindingPending as err:
                 entry["status"] = "binding_pending"
                 entry["error"] = str(err)
@@ -945,6 +908,33 @@ class NodeService:
         self.store.state["last_refresh_at"] = now.isoformat()
         self.store.save_state()
         return outcome
+
+    def local_charts(self) -> dict[str, Any]:
+        """What SoulSync's "Refresh MetaSync Charts" automation reads
+        (GET /local/charts): every enabled pool's cached charts, as
+        {week, playlists: [{key, name, tracks}]}. SIN's charts keep their
+        keys; another pool's are prefixed with its id (and its name in the
+        title) so two pools can never collide. Empty playlists are left out.
+        """
+        cache = self.store.state.get("playlists_cache") or {}
+        week: str | None = None
+        playlists: list[dict[str, Any]] = []
+        for pool in self.pools():
+            pool_id = str(pool.get("id") or "pool")
+            cached = cache.get(pool_id) or {}
+            week = week or cached.get("week")
+            prefix = "" if pool_id == "sin" else re.sub(r"[^a-z0-9]+", "-", pool_id.lower()).strip("-") + "-"
+            for chart in cached.get("playlists") or []:
+                tracks = chart.get("tracks") or []
+                if not tracks:
+                    continue
+                name = str(chart.get("name") or chart.get("key") or "")
+                playlists.append({
+                    "key": f"{prefix}{chart.get('key')}"[:64],
+                    "name": name if not prefix else f"{pool.get('name') or pool_id} · {name}",
+                    "tracks": tracks,
+                })
+        return {"week": week, "playlists": playlists}
 
     # -- status ---------------------------------------------------------------
     def status(self) -> dict[str, Any]:
@@ -969,7 +959,7 @@ class NodeService:
             "pools": [self.pool_public_status(p) for p in settings.get("pools") or []],
             "last_report": state.get("last_report") or {},
             "last_refresh_at": state.get("last_refresh_at"),
-            "managed_playlists": state.get("managed_playlists") or {},
+            "charts_offered": len(self.local_charts()["playlists"]),
             "last_errors": (state.get("last_errors") or [])[:5],
         }
 

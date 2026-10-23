@@ -169,22 +169,9 @@
 <section class="card">
   <div class="card-head">
     <p class="eyebrow">Provided by this node</p>
-    <h2>Playlists this node manages in SoulSync</h2>
+    <h2>Charts offered to SoulSync</h2>
   </div>
-  {% if status.managed_playlists %}
-  <div class="table-scroll">
-  <table>
-    <thead><tr><th>Pool</th><th>Playlist</th><th>Tracks</th><th>Last sync</th><th>Error</th></tr></thead>
-    <tbody>
-    {% for pid, keys in status.managed_playlists.items() %}
-      {% for key, pl in keys.items() %}
-      <tr><td>{{ pid }}</td><td>{{ pl.name }} <code class="plain">({{ pl.playlist_id }})</code></td><td>{{ pl.track_count }}</td><td>{{ pl.last_sync_at or "never" }}</td><td>{{ pl.last_error or "" }}</td></tr>
-      {% endfor %}
-    {% endfor %}
-    </tbody>
-  </table>
-  </div>
-  {% else %}<div class="empty-state"><strong>No managed playlists yet</strong>They appear here after the first playlist refresh.</div>{% endif %}
+  <p>{{ status.charts_offered }} chart{{ "" if status.charts_offered == 1 else "s" }} ready for SoulSync. SoulSync fetches them once a day (its "Refresh MetaSync Charts" automation), matches them, and shows them on its dashboard and Discover page. Nothing is synced or downloaded until someone opens one there and presses Sync &amp; download.</p>
 </section>
 {% if status.last_errors %}
 <section class="card">
