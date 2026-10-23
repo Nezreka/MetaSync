@@ -544,6 +544,19 @@ class TestLocalApiAndPairing(ServiceCase):
         self.assertEqual(stored["api_key"], "")
         self.assertEqual(self.store.state["pool_auth"][pool_id], {})
 
+    def test_handoff_accepts_pool_key_spelling(self):
+        # The §3A contract names the field pool_key; the node also keeps
+        # accepting its original pool_api_key spelling.
+        token_pool = MockPool(exchange_mode="token")
+        self.addCleanup(token_pool.close)
+        raw_key = self.service.issue_local_api_key()
+        body = {"pool_url": token_pool.url, "pool_key": "pool-key", "pool_name": "SIN"}
+        response = self.client.post("/local/handoff/pool-key", json=body, headers=self._auth(raw_key))
+        self.assertEqual(response.status_code, 200)
+        pool_id = response.get_json()["pool"]["id"]
+        stored = next(p for p in self.store.settings["pools"] if p["id"] == pool_id)
+        self.assertEqual(stored["api_key"], "pool-key")
+
     def test_pairing_happy_path_and_single_use_claim(self):
         request_response = self.client.post("/local/pair/request")
         self.assertEqual(request_response.status_code, 200)

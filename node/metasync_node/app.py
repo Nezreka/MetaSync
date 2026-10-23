@@ -172,7 +172,7 @@ def create_app(service: NodeService) -> Flask:
         try:
             return service.receive_pool_key(
                 str(body.get("pool_url") or body.get("url") or ""),
-                str(body.get("pool_api_key") or body.get("api_key") or ""),
+                str(body.get("pool_api_key") or body.get("pool_key") or body.get("api_key") or ""),
                 pool_name=str(body.get("pool_name") or body.get("name") or ""),
                 pool_id=str(body["pool_id"]) if body.get("pool_id") else None,
             )
