@@ -27,7 +27,7 @@ from .pool import PoolBindingPending, PoolClient, PoolError, PoolNotAvailable
 from .signals import compute_signals, is_uuid_shape
 from .soulsync import SoulSyncClient, SoulSyncError
 from .store import Store, default_pool_from_env
-from .weekutil import iso_week_string
+from .weekutil import iso_week_string, week_start_utc
 
 
 class PairingError(Exception):
@@ -63,6 +63,9 @@ class NodeService:
             if "METASYNC_DRY_RUN" in env or "DRY_RUN" in env:
                 raw = env.get("METASYNC_DRY_RUN", env.get("DRY_RUN", ""))
                 settings["dry_run"] = raw.lower() not in ("0", "false", "no", "off")
+                changed = True
+            if "METASYNC_SHARE_CHURN" in env:
+                settings["share_churn"] = env["METASYNC_SHARE_CHURN"].lower() not in ("0", "false", "no", "off")
                 changed = True
         if changed:
             self.store.save_settings()
@@ -442,34 +445,94 @@ class NodeService:
         wishlist = client.list_wishlist(self.config.library_max_pages, on_page=page_events("wishlist", "your wishlist", "wishlist"))
         emit({"phase": "albums", "detail": "Reading your library albums from SoulSync", "page": None, "pages_total": None})
         albums = client.list_albums(self.config.library_max_pages, on_page=page_events("albums", "your library albums", "albums"))
+        emit({"phase": "downloads", "detail": "Reading your download history from SoulSync", "page": None, "pages_total": None})
+        downloads: list[dict[str, Any]] | None = None
+        downloads_error: str | None = None
+        try:
+            downloads = client.download_activity(week_start_utc(now).isoformat())
+        except Exception as err:  # noqa: BLE001 — an older SoulSync 404s this endpoint; download signals are an addition, never a reason to fail the whole report.
+            downloads_error = str(err)
         emit({"phase": "resolving", "detail": "Matching albums to MusicBrainz release groups", "page": None, "pages_total": None})
-        release_to_group = self._resolve_album_groups(albums, progress=emit)
-        emit({"phase": "signals", "detail": "Building this week's signals", "page": None, "pages_total": None})
-        result = compute_signals(
-            watchlist=watchlist, wishlist=wishlist, albums=albums,
-            release_to_group=release_to_group, now=now,
+        download_release_ids = [
+            str(row.get("musicbrainz_release_id")) for row in (downloads or [])
+            if is_uuid_shape(row.get("musicbrainz_release_id"))
+        ]
+        release_to_group = self._resolve_album_groups(
+            albums, progress=emit, priority_release_ids=download_release_ids,
         )
+        emit({"phase": "signals", "detail": "Building this week's signals", "page": None, "pages_total": None})
+        # Download history the node keeps for itself: release group ->
+        # first/last completed download. SoulSync only reports albums
+        # still in the library, so this record (built while albums live)
+        # is what lets a later deletion be recognized as churn at all.
+        downloaded_groups: dict[str, dict[str, str]] = dict(self.store.state.get("downloaded_groups") or {})
+        if downloads is not None:
+            for row in downloads:
+                release_id = row.get("musicbrainz_release_id")
+                if not is_uuid_shape(release_id):
+                    continue
+                rg = release_to_group.get(release_id.lower())
+                if not rg:
+                    continue
+                entry = downloaded_groups.setdefault(rg, {})
+                first = row.get("first_downloaded_at")
+                last = row.get("last_downloaded_at")
+                if isinstance(first, str) and (not entry.get("first_downloaded_at") or first < entry["first_downloaded_at"]):
+                    entry["first_downloaded_at"] = first
+                if isinstance(last, str) and (not entry.get("last_downloaded_at") or last > entry["last_downloaded_at"]):
+                    entry["last_downloaded_at"] = last
+            self.store.state["downloaded_groups"] = downloaded_groups
+        snapshots = self.store.state.get("library_group_snapshots") or []
+        prev_groups = set(snapshots[0]) if len(snapshots) > 0 else set()
+        prev2_groups = set(snapshots[1]) if len(snapshots) > 1 else set()
         # A read that stopped at the page cap is a partial picture: say so in
         # the diagnostics every surface shows, never undercount quietly.
         truncated = getattr(client, "truncated_paths", set())
-        result["diagnostics"]["albums_truncated"] = "/library/albums" in truncated
+        albums_truncated = "/library/albums" in truncated
+        result = compute_signals(
+            watchlist=watchlist, wishlist=wishlist, albums=albums,
+            release_to_group=release_to_group, now=now,
+            downloads=downloads, downloaded_groups=downloaded_groups,
+            library_groups_prev=prev_groups, library_groups_prev2=prev2_groups,
+            share_churn=bool(self.store.settings.get("share_churn", False)),
+            library_complete=not albums_truncated,
+        )
+        result["diagnostics"]["albums_truncated"] = albums_truncated
         result["diagnostics"]["wishlist_truncated"] = "/wishlist" in truncated
+        result["diagnostics"]["downloads_available"] = downloads is not None
+        if downloads_error:
+            result["diagnostics"]["downloads_error"] = downloads_error
+        # Rotate the library snapshots only on a complete read: a partial
+        # picture must never become the "proof" that an album is gone.
+        if not albums_truncated:
+            history = [result["library_groups"]]
+            if snapshots:
+                history.append(list(snapshots[0]))
+            self.store.state["library_group_snapshots"] = history
         emit({"counts": {"signals": len(result["signals"])}})
         self.store.save_state()
         return result
 
-    def _resolve_album_groups(self, albums: list[dict[str, Any]], progress: Any = None) -> dict[str, str]:
+    def _resolve_album_groups(self, albums: list[dict[str, Any]], progress: Any = None,
+                              priority_release_ids: list[str] | None = None) -> dict[str, str]:
         emit = progress or (lambda event: None)
         mapping: dict[str, str] = dict(self.store.state.get("release_to_group") or {})
         budget = self.config.release_resolution_cap
         checked = 0
+        # Download rows resolve first: there are few of them and they carry
+        # this week's grab/churn value. The library tail spends the budget
+        # that remains (a 71k library catches up over several runs; the
+        # downloads are never the ones left waiting).
+        queue: list[str] = [rid.lower() for rid in (priority_release_ids or [])]
         for album in albums:
             release_id = album.get("musicbrainz_release_id")
-            if not is_uuid_shape(release_id):
+            if is_uuid_shape(release_id):
+                queue.append(release_id.lower())
+        seen: set[str] = set()
+        for key in queue:
+            if key in seen or key in mapping or budget <= 0:
                 continue
-            key = release_id.lower()
-            if key in mapping or budget <= 0:
-                continue
+            seen.add(key)
             budget -= 1
             checked += 1
             try:
@@ -744,6 +807,7 @@ class NodeService:
             "node_fingerprint": self.identity.fingerprint,
             "node_public_key": self.identity.public_key_b64url,
             "dry_run": self.dry_run,
+            "share_churn": bool(settings.get("share_churn", False)),
             "current_week": iso_week_string(datetime.now(timezone.utc)),
             "soulsync_connected": bool((settings.get("soulsync") or {}).get("url")),
             "soulsync_url": (settings.get("soulsync") or {}).get("url") or "",

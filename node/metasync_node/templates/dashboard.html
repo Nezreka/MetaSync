@@ -60,6 +60,10 @@
     <form method="post" action="{{ url_for('action_dry_run') }}" class="inline">
       <label class="switch"><input type="checkbox" name="dry_run" onchange="this.form.submit()" {% if status.dry_run %}checked{% endif %}> Dry run</label>
     </form>
+    <form method="post" action="{{ url_for('action_share_churn') }}" class="inline">
+      <label class="switch"><input type="checkbox" name="share_churn" onchange="this.form.submit()" {% if status.share_churn %}checked{% endif %}> Share drop signals (optional)</label>
+    </form>
+    <p class="muted">Drop signals say "I removed music I had downloaded" — they help the charts tell a fad from a keeper. Off by default; the exact signals are always visible on the Payload preview page before anything is sent.</p>
     <div class="row actions">
       <form method="post" action="{{ url_for('action_report') }}"><button class="primary" type="submit" {% if report_job and report_job.status == "running" %}disabled{% endif %}>{{ "Report running…" if report_job and report_job.status == "running" else "Run weekly report now" }}</button></form>
       <form method="post" action="{{ url_for('action_refresh') }}"><button type="submit">Refresh playlists now</button></form>

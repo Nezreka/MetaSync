@@ -121,9 +121,10 @@ def _serve(handler_cls) -> tuple[ThreadingHTTPServer, str]:
 
 
 class MockSoulSync:
-    def __init__(self, watchlist=WATCHLIST, wishlist=WISHLIST, albums=ALBUMS, fail_sync=False):
+    def __init__(self, watchlist=WATCHLIST, wishlist=WISHLIST, albums=ALBUMS, fail_sync=False, downloads=None):
         outer = self
         self.syncs: list[dict] = []
+        self.downloads = downloads
 
         class Handler(_Base):
             def do_GET(self):
@@ -131,6 +132,8 @@ class MockSoulSync:
                 params = {k: v[0] for k, v in parse_qs(parsed.query).items()}
                 if parsed.path == "/api/v1/watchlist":
                     return self._send(200, _envelope({"artists": watchlist}))
+                if parsed.path == "/api/v1/library/download-activity":
+                    return self._send(200, _envelope({"albums": outer.downloads or []}))
                 if parsed.path in ("/api/v1/wishlist", "/api/v1/library/albums"):
                     key = "tracks" if parsed.path.endswith("wishlist") else "albums"
                     all_items = wishlist if key == "tracks" else albums

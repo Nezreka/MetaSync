@@ -34,7 +34,10 @@ from typing import Any
 
 from .weekutil import days_between, iso_week_string
 
-SIGNAL_TYPES = ("watchlist_add", "wishlist_add", "import_keep", "hunt_demand")
+SIGNAL_TYPES = (
+    "watchlist_add", "wishlist_add", "import_keep", "hunt_demand",
+    "recent_add", "download_grab", "download_churn",
+)
 
 _UUID_SHAPE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
 
@@ -77,6 +80,12 @@ def compute_signals(
     albums: list[dict[str, Any]],
     release_to_group: dict[str, str],
     now: datetime,
+    downloads: list[dict[str, Any]] | None = None,
+    downloaded_groups: dict[str, dict[str, str]] | None = None,
+    library_groups_prev: set[str] | None = None,
+    library_groups_prev2: set[str] | None = None,
+    share_churn: bool = False,
+    library_complete: bool = True,
 ) -> dict[str, Any]:
     week = iso_week_string(now)
     found: dict[str, dict[str, str]] = {}
@@ -132,6 +141,7 @@ def compute_signals(
     # staple, a brand-new one is heat, and they chart separately ("Just
     # Landed"). Same release-group resolution, same binary rule.
     albums_recent = 0
+    recent_groups: set[str] = set()
     for album in albums:
         if not _in_week(album.get("created_at"), week):
             continue
@@ -142,6 +152,74 @@ def compute_signals(
         rg = release_to_group.get(release_id.lower())
         if rg:
             add("recent_add", rg)
+            recent_groups.add(rg)
+
+    # The library's release groups right now (resolved ones only) — the
+    # churn rule and the caller's snapshot rotation both key off this set.
+    current_groups: set[str] = set()
+    for album in albums:
+        release_id = album.get("musicbrainz_release_id")
+        if not is_uuid_shape(release_id):
+            continue
+        rg = release_to_group.get(release_id.lower())
+        if rg:
+            current_groups.add(rg)
+
+    # download_grab (DESIGN-DOWNLOAD-SIGNALS.md): acquisition this week
+    # that recent_add cannot see — re-grabs, upgrades and gap-fills of
+    # albums already owned, plus grabs that never landed in the library.
+    # Disjoint from recent_add by construction: a group that produced a
+    # recent_add this run never also grabs. ``downloads`` rows come from
+    # SoulSync's download-activity endpoint with completed_since counted
+    # from the report week's start, so completed_since >= 1 IS "grabbed
+    # this week"; no week math happens here.
+    downloads_seen = 0
+    downloads_unjoined = 0
+    grabs = 0
+    if downloads is not None:
+        downloads_seen = len(downloads)
+        for row in downloads:
+            release_id = row.get("musicbrainz_release_id")
+            if not is_uuid_shape(release_id):
+                downloads_unjoined += 1
+                continue
+            if int(row.get("completed_since") or 0) < 1:
+                continue
+            rg = release_to_group.get(release_id.lower())
+            if not rg:
+                downloads_unjoined += 1
+                continue
+            if rg in recent_groups:
+                continue
+            add("download_grab", rg)
+            grabs += 1
+
+    # download_churn — opt-in only (share_churn), and the most guarded
+    # rule in the node, because a false drop signal accuses a collector
+    # of deleting music they merely moved: the album was downloaded 14+
+    # days ago, sat in the library snapshot from two runs ago, and has
+    # now been absent from TWO consecutive complete library reads (the
+    # previous run's snapshot and this one). Absence from a truncated or
+    # failed read proves nothing, so an incomplete library disables the
+    # rule for the run. A group that returns heals silently: it is in
+    # current_groups and falls out of the snapshots on its own. The
+    # two-absence window also makes each drop fire exactly once.
+    churn_fired = 0
+    churn_candidates = 0
+    if share_churn and downloaded_groups:
+        prev = library_groups_prev or set()
+        prev2 = library_groups_prev2 or set()
+        for rg, info in downloaded_groups.items():
+            if rg in current_groups or rg in prev or rg not in prev2:
+                continue
+            churn_candidates += 1
+            if not library_complete:
+                continue
+            first = info.get("first_downloaded_at")
+            if not isinstance(first, str) or days_between(first, now) < 14:
+                continue
+            add("download_churn", rg)
+            churn_fired += 1
 
     signals = sorted(found.values(), key=lambda s: (s["type"], s["mbid"]))
     return {
@@ -152,6 +230,13 @@ def compute_signals(
             "wishlist_seen": len(wishlist),
             "albums_seen": len(albums),
             "albums_recent": albums_recent,
+            "downloads_seen": downloads_seen,
+            "downloads_unjoined": downloads_unjoined,
+            "download_grabs": grabs,
+            "churn_candidates": churn_candidates,
+            "churn_fired": churn_fired,
+            "library_groups_now": len(current_groups),
             "gaps": gaps,
         },
+        "library_groups": sorted(current_groups),
     }

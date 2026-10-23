@@ -51,11 +51,16 @@ class ServiceCase(unittest.TestCase):
     pool_token_ttl_s = 3600
     fail_sync = False
     dry_run = False
+    downloads = None
+    albums = None
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.soulsync = MockSoulSync(fail_sync=self.fail_sync)
+        self.soulsync = MockSoulSync(
+            fail_sync=self.fail_sync, downloads=self.downloads,
+            albums=self.albums if self.albums is not None else ALBUMS,
+        )
         self.pool = MockPool(
             playlists_endpoint=self.pool_playlists_endpoint,
             exchange_mode=self.pool_exchange_mode,
@@ -132,6 +137,118 @@ class TestSignals(unittest.TestCase):
         # 14-day keep rule makes a brand-new album heat, not a staple).
         self.assertEqual(keys, [f"recent_add:{RG_A}"])
         self.assertEqual(result["diagnostics"]["albums_recent"], 1)
+
+
+OLD_ALBUM = ({"id": 1, "title": "Owned", "created_at": "2026-08-01T08:00:00",
+              "musicbrainz_release_id": REL_A},)
+DL_ROW = {"musicbrainz_release_id": REL_A, "completed_downloads": 12,
+          "completed_since": 3, "first_downloaded_at": "2026-09-01 10:00:00",
+          "last_downloaded_at": "2026-10-21 09:30:00"}
+
+
+class TestDownloadSignals(unittest.TestCase):
+    def _keys(self, result):
+        return [f"{s['type']}:{s['mbid']}" for s in result["signals"]]
+
+    def test_grab_fires_for_regrab_of_an_owned_album(self):
+        result = compute_signals(
+            watchlist=[], wishlist=[], albums=OLD_ALBUM,
+            release_to_group={REL_A: RG_A}, now=NOW, downloads=[DL_ROW],
+        )
+        keys = self._keys(result)
+        self.assertIn(f"download_grab:{RG_A}", keys)
+        self.assertNotIn(f"recent_add:{RG_A}", keys)  # album is old: no double-fire either way
+        self.assertEqual(result["diagnostics"]["download_grabs"], 1)
+
+    def test_grab_never_doubles_a_fresh_library_add(self):
+        fresh = [{"id": 9, "title": "Fresh", "created_at": "2026-10-21T09:00:00+00:00",
+                  "musicbrainz_release_id": REL_A}]
+        result = compute_signals(
+            watchlist=[], wishlist=[], albums=fresh,
+            release_to_group={REL_A: RG_A}, now=NOW, downloads=[DL_ROW],
+        )
+        keys = self._keys(result)
+        self.assertIn(f"recent_add:{RG_A}", keys)
+        self.assertNotIn(f"download_grab:{RG_A}", keys)
+
+    def test_grab_needs_a_download_this_week(self):
+        row = {**DL_ROW, "completed_since": 0}
+        result = compute_signals(
+            watchlist=[], wishlist=[], albums=OLD_ALBUM,
+            release_to_group={REL_A: RG_A}, now=NOW, downloads=[row],
+        )
+        self.assertNotIn(f"download_grab:{RG_A}", self._keys(result))
+
+    def _churn(self, **overrides):
+        kwargs = {
+            "watchlist": [], "wishlist": [], "albums": [],
+            "release_to_group": {REL_A: RG_A}, "now": NOW,
+            "downloaded_groups": {RG_A: {"first_downloaded_at": "2026-09-01 10:00:00",
+                                          "last_downloaded_at": "2026-09-01 10:00:00"}},
+            "library_groups_prev": set(), "library_groups_prev2": {RG_A},
+            "share_churn": True,
+        }
+        kwargs.update(overrides)
+        return compute_signals(**kwargs)
+
+    def test_churn_fires_after_two_absences(self):
+        self.assertIn(f"download_churn:{RG_A}", self._keys(self._churn()))
+
+    def test_churn_is_off_by_default(self):
+        self.assertNotIn(f"download_churn:{RG_A}", self._keys(self._churn(share_churn=False)))
+
+    def test_churn_needs_the_second_absence(self):
+        result = self._churn(library_groups_prev={RG_A})
+        self.assertNotIn(f"download_churn:{RG_A}", self._keys(result))
+
+    def test_churn_needs_an_old_download(self):
+        result = self._churn(downloaded_groups={RG_A: {"first_downloaded_at": "2026-10-20 10:00:00"}})
+        self.assertNotIn(f"download_churn:{RG_A}", self._keys(result))
+
+    def test_churn_never_fires_on_an_incomplete_library_read(self):
+        result = self._churn(library_complete=False)
+        self.assertNotIn(f"download_churn:{RG_A}", self._keys(result))
+        self.assertEqual(result["diagnostics"]["churn_candidates"], 1)
+        self.assertEqual(result["diagnostics"]["churn_fired"], 0)
+
+    def test_churn_heals_when_the_album_returns(self):
+        result = self._churn(albums=OLD_ALBUM)
+        self.assertNotIn(f"download_churn:{RG_A}", self._keys(result))
+
+
+class TestDownloadFlow(ServiceCase):
+    downloads = (DL_ROW,)
+    # Only the old album: the shared ALBUMS fixture also carries a fresh
+    # REL_A import, whose recent_add would (correctly) suppress the grab.
+    albums = OLD_ALBUM
+
+    def test_grab_end_to_end_and_download_history_accumulates(self):
+        report = self.service.compute_report(NOW)
+        keys = [f"{s['type']}:{s['mbid']}" for s in report["signals"]]
+        self.assertIn(f"download_grab:{RG_A}", keys)
+        self.assertEqual(report["diagnostics"]["downloads_available"], True)
+        history = self.store.state["downloaded_groups"]
+        self.assertEqual(history[RG_A]["first_downloaded_at"], "2026-09-01 10:00:00")
+        self.assertIn(RG_A, self.store.state["library_group_snapshots"][0])
+
+
+class TestChurnFlow(ServiceCase):
+    albums = ()
+
+    def test_churn_end_to_end_from_node_state(self):
+        self.store.settings["share_churn"] = True
+        self.store.save_settings()
+        self.store.state["downloaded_groups"] = {
+            RG_A: {"first_downloaded_at": "2026-09-01 10:00:00",
+                   "last_downloaded_at": "2026-09-01 10:00:00"},
+        }
+        self.store.state["library_group_snapshots"] = [[], [RG_A]]
+        self.store.save_state()
+        # The service was built in setUp from the same store; state is
+        # shared, so the seeded history is what compute_report reads.
+        report = self.service.compute_report(NOW)
+        keys = [f"{s['type']}:{s['mbid']}" for s in report["signals"]]
+        self.assertIn(f"download_churn:{RG_A}", keys)
 
 
 class TestReportFlow(ServiceCase):
@@ -401,6 +518,18 @@ class TestUiFlows(unittest.TestCase):
         self.assertIn("2026-W", html)
         self.assertIn("watchlist_add", html)
         self.assertIn(ART_NEW, html)
+
+    def test_share_churn_toggle_defaults_off_and_persists(self):
+        self.client.post("/setup", data={"password": "test-password", "confirm": "test-password"})
+        self.assertFalse(self.store.settings.get("share_churn", False))
+        html = self.client.get("/").get_data(as_text=True)
+        self.assertIn("Share drop signals (optional)", html)
+        self.assertIn("Off by default", html)
+        self.client.post("/actions/share-churn", data={"share_churn": "on"})
+        self.assertTrue(self.store.settings["share_churn"])
+        # An unchecked box posts no field at all: that is the OFF path.
+        self.client.post("/actions/share-churn", data={})
+        self.assertFalse(self.store.settings["share_churn"])
 
 
 class TestSigningIdentity(unittest.TestCase):

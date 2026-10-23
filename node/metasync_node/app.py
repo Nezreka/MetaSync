@@ -250,6 +250,14 @@ def create_app(service: NodeService) -> Flask:
         flash(f"Dry run is now {'ON' if store.settings['dry_run'] else 'OFF'}.", "ok")
         return redirect(url_for("dashboard"))
 
+    @app.post("/actions/share-churn")
+    @login_required
+    def action_share_churn():
+        store.settings["share_churn"] = request.form.get("share_churn") == "on"
+        store.save_settings()
+        flash(f"Drop signals are now {'ON' if store.settings['share_churn'] else 'OFF'}.", "ok")
+        return redirect(url_for("dashboard"))
+
     @app.route("/settings/soulsync", methods=["GET", "POST"])
     @login_required
     def soulsync_settings():

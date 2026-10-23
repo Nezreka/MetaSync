@@ -111,6 +111,18 @@ class SoulSyncClient:
     def list_albums(self, max_pages: int = 5000, on_page=None) -> list[dict[str, Any]]:
         return self.get_all_pages("/library/albums", "albums", max_pages, on_page=on_page)
 
+    def download_activity(self, since: str) -> list[dict[str, Any]]:
+        """Per-album completed-download aggregates for the download signals.
+
+        One row per library album keyed by MusicBrainz RELEASE id:
+        {musicbrainz_release_id, completed_downloads, completed_since,
+        first_downloaded_at, last_downloaded_at}. Older SoulSync builds
+        404 here; the caller treats any failure as "no download data this
+        run", never as a failed report.
+        """
+        env = self.get("/library/download-activity", {"since": since})
+        return (env["data"] or {}).get("albums") or []
+
     def test_connection(self) -> dict[str, Any]:
         """Cheap read-only probe used by the UI's Test button."""
         env = self.get("/watchlist")

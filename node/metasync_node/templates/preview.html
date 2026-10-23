@@ -21,6 +21,14 @@
     <div class="stat"><span class="stat-num">{{ diagnostics.wishlist_seen }}</span><span class="stat-label">Wishlist tracks seen</span></div>
     <div class="stat"><span class="stat-num">{{ diagnostics.albums_seen }}</span><span class="stat-label">Library albums seen</span></div>
   </div>
+  {% if diagnostics.downloads_seen is defined %}
+  <div class="stat-row" style="margin-top:12px">
+    <div class="stat"><span class="stat-num">{{ diagnostics.downloads_seen }}</span><span class="stat-label">Albums with downloads</span></div>
+    <div class="stat"><span class="stat-num">{{ diagnostics.download_grabs }}</span><span class="stat-label">Download grabs this week</span></div>
+    <div class="stat"><span class="stat-num">{{ diagnostics.churn_fired }}</span><span class="stat-label">Drop signals this week</span></div>
+  </div>
+  {% if not diagnostics.downloads_available %}<p class="muted" style="margin-top:12px">Download data was not available this run (this SoulSync build has no download-activity endpoint yet), so no grab or drop signals were computed.</p>{% endif %}
+  {% endif %}
   <p class="muted" style="margin-top:16px">Skipped honestly (see DESIGN-NODE.md gaps): {{ diagnostics.gaps }}</p>
 </section>
 {% endif %}
