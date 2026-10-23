@@ -4,7 +4,7 @@
 <div class="page-head">
   <p class="eyebrow-chip">Step B · Optional</p>
   <h1>Pools</h1>
-  <p class="page-sub">A pool is a network this node exchanges data with; SIN is one pool. Normally the pool key is entered in <strong>SoulSync</strong>, handed to MetaSync over the protected local connection, and exchanged here for a short-lived access token. This page is therefore mainly connection status. The manual key form remains available below as a labelled fallback.</p>
+  <p class="page-sub">A pool is a network this node exchanges data with; SIN is one pool. Normally the pool key is entered in <strong>SoulSync</strong>, handed to MetaSync over the protected local connection, and exchanged here for a short-lived access token. This page is therefore mainly connection status. The manual key form stays at the bottom, collapsed, as a labelled fallback.</p>
   <p class="page-sub">A normal node can only push its weekly report and pull index/playlist data. The <strong>admin</strong> role is only for Boulder's official MetaSync, which publishes the shared playlist data — user nodes never publish.</p>
 </div>
 
@@ -66,21 +66,20 @@
 </div>
 {% endif %}
 
-<form method="post" class="card form">
-  <div class="card-head">
-    <p class="eyebrow">Manual fallback</p>
-    <h2>Add a pool directly</h2>
-  </div>
-  <p class="muted">This is the development/manual path. The preferred path is to enter the pool key in SoulSync and let SoulSync hand it to MetaSync.</p>
-  <label>Pool name <input type="text" name="name" placeholder="SIN" required></label>
-  <label>Pool URL <input type="url" name="url" placeholder="https://..." required></label>
-  <label>Pool API key <input type="password" name="api_key" placeholder="pool key"></label>
-  <label>Role
-    <select name="role">
-      <option value="node" selected>node — push report, pull data (normal)</option>
-      <option value="admin">admin — official MetaSync only (publishes playlist data)</option>
-    </select>
-  </label>
-  <button class="primary" type="submit">Add pool manually</button>
-</form>
+<details class="card fallback-card">
+  <summary>Manual fallback — add a pool directly</summary>
+  <p class="muted">This is the development/manual path, collapsed so the page reads as status first. The preferred path is to enter the pool key in SoulSync and let SoulSync hand it to MetaSync.</p>
+  <form method="post" class="form">
+    <label>Pool name <input type="text" name="name" placeholder="SIN" required></label>
+    <label>Pool URL <input type="url" name="url" placeholder="https://..." required></label>
+    <label>Pool API key <input type="password" name="api_key" placeholder="pool key"></label>
+    <label>Role
+      <select name="role">
+        <option value="node" selected>node — push report, pull data (normal)</option>
+        <option value="admin">admin — official MetaSync only (publishes playlist data)</option>
+      </select>
+    </label>
+    <button class="primary" type="submit">Add pool manually</button>
+  </form>
+</details>
 {% endblock %}

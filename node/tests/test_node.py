@@ -354,6 +354,19 @@ class TestUiFlows(unittest.TestCase):
         html = self.client.get("/settings/soulsync").get_data(as_text=True)
         self.assertIn("Pair from SoulSync", html)
 
+    def test_pools_page_manual_form_is_collapsed_by_default(self):
+        self.client.post("/setup", data={"password": "test-password", "confirm": "test-password"})
+        html = self.client.get("/pools").get_data(as_text=True)
+        # The add-a-pool form lives inside a closed details card, so the
+        # page reads as status first; the form itself is unchanged.
+        self.assertIn("Manual fallback — add a pool directly", html)
+        self.assertIn('<details class="card fallback-card">', html)
+        self.assertNotIn('<details class="card fallback-card" open', html)
+        self.assertIn("Add pool manually", html)
+        # Posting from the (folded) form still adds the pool.
+        self.client.post("/pools", data={"name": "SIN", "url": self.pool.url, "api_key": "pool-key", "role": "node"})
+        self.assertEqual(len(self.store.settings["pools"]), 1)
+
     def test_preview_page_shows_exact_payload(self):
         self.client.post("/setup", data={"password": "test-password", "confirm": "test-password"})
         self.client.post("/settings/soulsync", data={"url": self.soulsync.url, "api_key": "sk_abc", "action": "save"})

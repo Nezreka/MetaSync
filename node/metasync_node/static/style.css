@@ -708,6 +708,28 @@ pre::-webkit-scrollbar-track { background: transparent; }
 .fallback-box[open ] summary::before { transform: rotate(90deg); }
 .fallback-box summary:hover { color: #fff; }
 .fallback-box .form { margin-top: 16px; }
+.fallback-card summary {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  cursor: pointer;
+  list-style: none;
+  color: rgba(var(--text-bright-rgb), 0.9);
+  font-size: 15px;
+  font-weight: 650;
+}
+.fallback-card summary::-webkit-details-marker { display: none; }
+.fallback-card summary::before {
+  content: '›';
+  font-size: 19px;
+  line-height: 1;
+  color: var(--white-a45);
+  transition: transform var(--dur-quick) ease;
+}
+.fallback-card[open ] summary::before { transform: rotate(90deg); }
+.fallback-card summary:hover { color: #fff; }
+.fallback-card .form { margin-top: 16px; }
+.fallback-card > .muted { margin-top: 12px; }
 
 /* ── Empty states & diagnostics ─────────────────────────────────────── */
 
