@@ -107,6 +107,26 @@ def create_app(service: NodeService) -> Flask:
             local_key_once=session.pop("local_api_key_once", None),
         )
 
+    @app.get("/api/pairing-status")
+    @login_required
+    def pairing_status():
+        pairing = service.pending_pairing()
+        if pairing is None:
+            return {
+                "exists": False,
+                "session_id": None,
+                "pairing_code": None,
+                "status": None,
+                "expires_at": None,
+            }
+        return {
+            "exists": True,
+            "session_id": pairing.get("session_id"),
+            "pairing_code": pairing.get("pairing_code"),
+            "status": pairing.get("status"),
+            "expires_at": pairing.get("expires_at"),
+        }
+
     @app.post("/local-keys/regenerate")
     @login_required
     def local_key_regenerate():

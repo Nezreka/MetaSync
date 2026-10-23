@@ -557,6 +557,47 @@ class TestLocalApiAndPairing(ServiceCase):
         stored = next(p for p in self.store.settings["pools"] if p["id"] == pool_id)
         self.assertEqual(stored["api_key"], "pool-key")
 
+    def test_pairing_status_endpoint_and_dashboard_watcher(self):
+        from metasync_node.app import create_app
+
+        anonymous = create_app(self.service).test_client()
+        unauthenticated = anonymous.get("/api/pairing-status")
+        self.assertEqual(unauthenticated.status_code, 302)
+        self.assertIn("/login", unauthenticated.location)
+
+        empty = self.client.get("/api/pairing-status")
+        self.assertEqual(empty.status_code, 200)
+        self.assertEqual(empty.get_json(), {
+            "exists": False,
+            "session_id": None,
+            "pairing_code": None,
+            "status": None,
+            "expires_at": None,
+        })
+
+        dashboard = self.client.get("/").get_data(as_text=True)
+        self.assertIn("/api/pairing-status", dashboard)
+        self.assertIn("window.setInterval(checkPairingStatus, 2500)", dashboard)
+        self.assertIn('data-pairing-session-id=""', dashboard)
+        self.assertIn('data-pairing-status=""', dashboard)
+        self.assertIn("shownOnceKeyPresent", dashboard)
+        self.assertIn('document.getElementById("local-api-key-once")', dashboard)
+
+        request_data = self.client.post("/local/pair/request").get_json()
+        status_response = self.client.get("/api/pairing-status")
+        self.assertEqual(status_response.status_code, 200)
+        self.assertEqual(status_response.get_json(), {
+            "exists": True,
+            "session_id": request_data["session_id"],
+            "pairing_code": request_data["pairing_code"],
+            "status": "pending",
+            "expires_at": self.service.pending_pairing()["expires_at"],
+        })
+
+        dashboard = self.client.get("/").get_data(as_text=True)
+        self.assertIn(f'data-pairing-session-id="{request_data["session_id"]}"', dashboard)
+        self.assertIn('data-pairing-status="pending"', dashboard)
+
     def test_pairing_happy_path_and_single_use_claim(self):
         request_response = self.client.post("/local/pair/request")
         self.assertEqual(request_response.status_code, 200)

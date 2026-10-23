@@ -59,7 +59,9 @@
   </section>
 </div>
 
-<section class="card" id="soulsync-connection">
+<section class="card" id="soulsync-connection"
+  data-pairing-session-id="{{ status.pending_pairing.session_id if status.pending_pairing else '' }}"
+  data-pairing-status="{{ status.pending_pairing.status if status.pending_pairing else '' }}">
   <p class="eyebrow">SoulSync → MetaSync</p>
   <h2>SoulSync connection</h2>
   <p class="muted">SoulSync uses MetaSync’s own local API key when it hands over a pool key or checks this node’s status. Only a hash of the key is stored here.</p>
@@ -130,4 +132,38 @@
   <ul>{% for e in status.last_errors %}<li><code>{{ e.leg }}</code> — {{ e.message }} <span class="muted">{{ e.at }}</span></li>{% endfor %}</ul>
 </section>
 {% endif %}
+<script>
+(() => {
+  const section = document.getElementById("soulsync-connection");
+  if (!section) return;
+
+  const renderedSessionId = section.dataset.pairingSessionId || "";
+  const renderedStatus = section.dataset.pairingStatus || "";
+  // A reload would discard a just-issued local key before the admin can copy
+  // it. While that shown-once secret is on screen, leave the page untouched.
+  const shownOnceKeyPresent = Boolean(document.getElementById("local-api-key-once"));
+
+  async function checkPairingStatus() {
+    try {
+      const response = await fetch("{{ url_for('pairing_status') }}", {
+        headers: {"Accept": "application/json"},
+      });
+      if (!response.ok) return;
+      const data = await response.json();
+      const currentSessionId = data.exists ? (data.session_id || "") : "";
+      const currentStatus = data.exists ? (data.status || "") : "";
+      if (
+        (currentSessionId !== renderedSessionId || currentStatus !== renderedStatus) &&
+        !shownOnceKeyPresent
+      ) {
+        window.location.reload();
+      }
+    } catch (_) {
+      // Ignore a transient status-check failure; the next poll may succeed.
+    }
+  }
+
+  window.setInterval(checkPairingStatus, 2500);
+})();
+</script>
 {% endblock %}
