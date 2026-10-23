@@ -857,6 +857,8 @@ class TestReportJobUi(unittest.TestCase):
         self.assertEqual(payload.get("status"), "done")
         page = self.client.get("/")
         self.assertIn(b'id="report-job"', page.data)
+        # The dry-run switch saves itself: no separate Save click to forget.
+        self.assertIn(b'onchange="this.form.submit()"', page.data)
 
 
 if __name__ == "__main__":

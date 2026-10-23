@@ -58,8 +58,7 @@
       <dt>Last refresh</dt><dd>{{ status.last_refresh_at or "never" }}</dd>
     </dl>
     <form method="post" action="{{ url_for('action_dry_run') }}" class="inline">
-      <label class="switch"><input type="checkbox" name="dry_run" {% if status.dry_run %}checked{% endif %}> Dry run</label>
-      <button type="submit">Save</button>
+      <label class="switch"><input type="checkbox" name="dry_run" onchange="this.form.submit()" {% if status.dry_run %}checked{% endif %}> Dry run</label>
     </form>
     <div class="row actions">
       <form method="post" action="{{ url_for('action_report') }}"><button class="primary" type="submit" {% if report_job and report_job.status == "running" %}disabled{% endif %}>{{ "Report running…" if report_job and report_job.status == "running" else "Run weekly report now" }}</button></form>
