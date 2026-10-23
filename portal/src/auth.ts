@@ -2,6 +2,7 @@ import NextAuth from 'next-auth'
 import { PrismaAdapter } from '@auth/prisma-adapter'
 import { prisma } from '@/lib/prisma'
 import { authConfig } from './auth.config'
+import { withoutOAuthTokens } from '@/lib/oauth-account'
 
 // @auth/prisma-adapter hard-codes the DEFAULT model accessors
 // (p.user / p.account / p.session / p.verificationToken). The portal's
@@ -17,9 +18,17 @@ const adapterClient = {
   verificationToken: prisma.portalVerificationToken,
 }
 
+const baseAdapter = PrismaAdapter(adapterClient as Parameters<typeof PrismaAdapter>[0])
+
+// Store the sign-in link, never the provider's tokens (lib/oauth-account.ts).
+const adapter: typeof baseAdapter = {
+  ...baseAdapter,
+  linkAccount: (account) => baseAdapter.linkAccount!(withoutOAuthTokens(account)),
+}
+
 export const { handlers, signIn, signOut, auth } = NextAuth({
   ...authConfig,
-  adapter: PrismaAdapter(adapterClient as Parameters<typeof PrismaAdapter>[0]),
+  adapter,
   // Use JWT sessions so the role rides in the token (edge-readable).
   // The adapter still persists users/accounts for OAuth linking.
   session: { strategy: 'jwt' },

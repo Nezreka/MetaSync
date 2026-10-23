@@ -22,6 +22,7 @@ psql "$DATABASE_URL_UNPOOLED" -f db/migrations/0001_sin_init.sql
 | `0005_recent_add_signal.sql` | `recent_add` |
 | `0006_mb_resolutions.sql` | Composer MusicBrainz cache |
 | `0007_download_signals.sql` | `download_grab`, `download_churn` |
+| `0009_drop_stored_oauth_tokens.sql` | Clears stored OAuth tokens from `portal_accounts` (the portal no longer stores them) |
 | `0008_count_on_arrival_and_listen.sql` | `report_tokens`, `aggregate_counts` (count on arrival), `listen_album`. **Apply before deploying the matching backend**: the new report path writes these tables. |
 
 No migration has been run yet — Neon is not authenticated in the agent
