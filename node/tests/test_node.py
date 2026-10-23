@@ -331,6 +331,29 @@ class TestUiFlows(unittest.TestCase):
         self.assertIn("soulsync", on_disk)
         self.assertIn("pools", on_disk)
 
+    def test_soulsync_page_reflects_connection_state(self):
+        self.client.post("/setup", data={"password": "test-password", "confirm": "test-password"})
+        # Not connected: the page offers pairing + the manual form, and does
+        # not claim a connection.
+        html = self.client.get("/settings/soulsync").get_data(as_text=True)
+        self.assertIn("Pair from SoulSync", html)
+        self.assertNotIn("Connected to SoulSync", html)
+        # Connected (e.g. pairing filled the settings in): the page leads
+        # with the connected state, folds the edit form away, and offers a
+        # test of the saved values plus a disconnect.
+        self.client.post("/settings/soulsync", data={"url": self.soulsync.url, "api_key": "sk_abc", "action": "save"})
+        html = self.client.get("/settings/soulsync").get_data(as_text=True)
+        self.assertIn("Connected to SoulSync", html)
+        self.assertIn("Change the SoulSync URL or key", html)
+        self.assertNotIn("Pair from SoulSync", html)
+        self.client.post("/settings/soulsync", data={"action": "test_saved"})
+        self.assertEqual(self.store.settings["soulsync"]["api_key"], "sk_abc")
+        # Disconnect clears the stored address and key.
+        self.client.post("/settings/soulsync", data={"action": "disconnect"})
+        self.assertEqual(self.store.settings["soulsync"], {"url": "", "api_key": ""})
+        html = self.client.get("/settings/soulsync").get_data(as_text=True)
+        self.assertIn("Pair from SoulSync", html)
+
     def test_preview_page_shows_exact_payload(self):
         self.client.post("/setup", data={"password": "test-password", "confirm": "test-password"})
         self.client.post("/settings/soulsync", data={"url": self.soulsync.url, "api_key": "sk_abc", "action": "save"})

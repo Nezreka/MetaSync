@@ -244,28 +244,47 @@ def create_app(service: NodeService) -> Flask:
     @login_required
     def soulsync_settings():
         current = store.settings.get("soulsync") or {}
-        test_result: dict[str, Any] | None = None
         if request.method == "POST":
-            url = request.form.get("url", "").strip().rstrip("/")
-            api_key = request.form.get("api_key", "").strip()
-            store.settings["soulsync"] = {
-                "url": url,
-                "api_key": api_key or current.get("api_key", ""),
-            }
-            store.save_settings()
-            if request.form.get("action") == "test":
+            action = request.form.get("action", "save")
+            if action == "disconnect":
+                # Local half of the unlink: drop the stored SoulSync address
+                # and key. SoulSync's own Disconnect revokes the key on its
+                # side; the flash says so rather than implying a full unlink.
+                store.settings["soulsync"] = {"url": "", "api_key": ""}
+                store.save_settings()
+                flash(
+                    "Disconnected here — MetaSync no longer holds a SoulSync address or key. "
+                    "To unlink fully, also disconnect in SoulSync's MetaSync settings, which revokes the key.",
+                    "ok",
+                )
+            elif action == "test_saved":
                 try:
                     test_result = service.test_soulsync()
                     flash(f"Connected. SoulSync answered with {test_result['watchlist_artists']} watchlist artists.", "ok")
                 except Exception as err:
                     flash(f"Connection test failed: {err}", "error")
             else:
-                flash("SoulSync connection saved.", "ok")
-            current = store.settings["soulsync"]
+                url = request.form.get("url", "").strip().rstrip("/")
+                api_key = request.form.get("api_key", "").strip()
+                store.settings["soulsync"] = {
+                    "url": url,
+                    "api_key": api_key or current.get("api_key", ""),
+                }
+                store.save_settings()
+                if action == "test":
+                    try:
+                        test_result = service.test_soulsync()
+                        flash(f"Connected. SoulSync answered with {test_result['watchlist_artists']} watchlist artists.", "ok")
+                    except Exception as err:
+                        flash(f"Connection test failed: {err}", "error")
+                else:
+                    flash("SoulSync connection saved.", "ok")
+            current = store.settings.get("soulsync") or {}
         return render_template(
             "soulsync.html",
             current=current,
             has_key=bool(current.get("api_key")),
+            connected=bool(current.get("url") and current.get("api_key")),
             status=service.status(),
             local_key_once=session.pop("local_api_key_once", None),
         )

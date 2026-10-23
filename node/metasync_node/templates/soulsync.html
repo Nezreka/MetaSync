@@ -1,18 +1,8 @@
 {% extends "base.html" %}
 {% block title %}MetaSync · SoulSync connection{% endblock %}
-{% block content %}
-<div class="page-head">
-  <p class="eyebrow-chip">Step A · Connect</p>
-  <h1>Connect to your SoulSync</h1>
-  <p class="page-sub">Create an API key in SoulSync under Settings → API keys, then paste it here.
-  Connecting SoulSync alone does <strong>not</strong> join any network — pools are separate, on the Pools page.</p>
-</div>
 
-<form method="post" class="card form">
-  <div class="card-head">
-    <p class="eyebrow">MetaSync → SoulSync</p>
-    <h2>Your SoulSync</h2>
-  </div>
+{% macro soulsync_form(form_class) %}
+<form method="post" class="{{ form_class }}">
   <label>SoulSync URL
     <input type="url" name="url" value="{{ current.url or '' }}" placeholder="http://soulsync:8000" required>
   </label>
@@ -24,6 +14,70 @@
     <button class="primary" type="submit" name="action" value="test">Save &amp; test connection</button>
   </div>
 </form>
+{% endmacro %}
+
+{% block content %}
+<div class="page-head">
+  <p class="eyebrow-chip">Step A · Connect</p>
+  <h1>Connect to your SoulSync</h1>
+  <p class="page-sub">MetaSync reads your watchlist, wishlist and library from SoulSync, using a SoulSync
+  API key stored only on this machine. Connecting SoulSync alone does <strong>not</strong> join any
+  network — pools are separate, on the Pools page.</p>
+</div>
+
+{% if connected %}
+<section class="card">
+  <div class="card-head">
+    <p class="eyebrow">MetaSync → SoulSync</p>
+    <h2>Connected to SoulSync</h2>
+  </div>
+  <p><span class="status-pill connected">Connected</span></p>
+  <dl>
+    <dt>SoulSync URL</dt><dd><code>{{ current.url }}</code></dd>
+    <dt>SoulSync API key</dt><dd>Saved on this machine. It got here one of two ways: pairing (SoulSync
+    created it and handed it over when you approved the code) or you pasted it in the form below.</dd>
+  </dl>
+  <div class="row">
+    <form method="post"><button type="submit" name="action" value="test_saved">Test connection</button></form>
+    <form method="post"><button class="danger" type="submit" name="action" value="disconnect">Disconnect from SoulSync</button></form>
+  </div>
+  <p class="muted">Disconnecting here only clears this machine's copy of the address and key. To unlink
+  fully, also use Disconnect in SoulSync → Settings → Advanced → MetaSync — that side revokes the key.</p>
+</section>
+
+<details class="card">
+  <summary>Change the SoulSync URL or key</summary>
+  {{ soulsync_form("form") }}
+</details>
+{% else %}
+<section class="card">
+  <div class="card-head">
+    <p class="eyebrow">Easiest way in</p>
+    <h2>Pair from SoulSync</h2>
+  </div>
+  <p class="muted">Open SoulSync → Settings → Advanced → MetaSync and click Connect. A code appears,
+  you approve it here, and SoulSync hands MetaSync a key automatically — this page then shows
+  “Connected” and there is nothing to paste. The form below is the manual way, for setups where
+  pairing cannot reach this node.</p>
+</section>
+
+{% if current.url %}
+<section class="card">
+  <p><span class="status-pill pending_approval">URL saved, key missing</span></p>
+  <p class="muted">A SoulSync URL is saved (<code>{{ current.url }}</code>) but there is no API key yet,
+  so MetaSync cannot read SoulSync. Paste a key below, or pair from SoulSync to have one handed over.</p>
+</section>
+{% endif %}
+
+<div class="card">
+  <div class="card-head">
+    <p class="eyebrow">MetaSync → SoulSync · Manual</p>
+    <h2>Your SoulSync</h2>
+  </div>
+  <p class="muted">Create an API key in SoulSync under Settings → API keys, then paste it here.</p>
+  {{ soulsync_form("form") }}
+</div>
+{% endif %}
 
 <section class="card">
   <div class="card-head">
