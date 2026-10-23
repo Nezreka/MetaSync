@@ -14,6 +14,12 @@ portal/.next/
 # Written wherever the node runs from; never source, never commit it.
 node/data/
 node/state/
+# A virtualenv rooted in node/ itself (py -m venv . from inside node/):
+# its Lib/Scripts/Include live next to the app source. Never commit them.
+node/Lib/
+node/Scripts/
+node/Include/
+node/pyvenv.cfg
 data/*
 !data/.gitignore
 .pytest_cache/
