@@ -810,7 +810,7 @@ class TestReadCaps(ServiceCase):
         config = make_config(self.tmp.name)
         # 200 albums per page: 5000 pages is a million albums of headroom.
         self.assertGreaterEqual(config.library_max_pages * 200, 1_000_000)
-        self.assertGreaterEqual(config.release_resolution_cap, 1000)
+        self.assertGreaterEqual(config.release_resolution_cap, 5000)
 
     def test_full_read_is_not_flagged_truncated(self):
         mock = self._big_soulsync()
