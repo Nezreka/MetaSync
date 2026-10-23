@@ -10,6 +10,7 @@ import tempfile
 import time
 import unittest
 from datetime import datetime, timezone
+from unittest.mock import patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -372,6 +373,14 @@ class TestUiFlows(unittest.TestCase):
         self.client.post("/setup", data={"password": "test-password", "confirm": "test-password"})
         self.client.post("/settings/soulsync", data={"url": self.soulsync.url, "api_key": "sk_abc", "action": "save"})
         self.client.post("/pools", data={"name": "SIN", "url": self.pool.url, "api_key": "pool-key", "role": "node"})
+        # The preview is the last completed run's snapshot: run one first.
+        self.client.post("/actions/report")
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            job = self.client.get("/api/report-job").get_json() or {}
+            if job.get("status") not in (None, "running"):
+                break
+            time.sleep(0.05)
         page = self.client.get("/preview")
         self.assertEqual(page.status_code, 200)
         html = page.get_data(as_text=True)
@@ -859,6 +868,22 @@ class TestReportJobUi(unittest.TestCase):
         self.assertIn(b'id="report-job"', page.data)
         # The dry-run switch saves itself: no separate Save click to forget.
         self.assertIn(b'onchange="this.form.submit()"', page.data)
+
+    def test_preview_is_a_snapshot_not_a_recompute(self):
+        self.client.post("/actions/report")
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            payload = self.client.get("/api/report-job").get_json() or {}
+            if payload.get("status") not in (None, "running"):
+                break
+            time.sleep(0.05)
+        # Opening the preview must render the saved payload instantly, even
+        # if computing a fresh one would explode (the old route computed live
+        # and hung the page on a full library read + MusicBrainz lookups).
+        with patch.object(self.service, "compute_report", side_effect=AssertionError("recompute")):
+            page = self.client.get("/preview")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn(b"watchlist_add", page.data)  # the saved payload, rendered
 
 
 if __name__ == "__main__":

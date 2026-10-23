@@ -505,6 +505,8 @@ class NodeService:
         outcome["week"] = report["week"]
         outcome["signal_count"] = len(report["signals"])
         outcome["diagnostics"] = report["diagnostics"]
+        # The preview page renders this snapshot: it never recomputes live.
+        self.store.state["last_diagnostics"] = report["diagnostics"]
         for pool in self.pools():
             pool_name = str(pool.get("name") or pool["id"])
             if self.dry_run:

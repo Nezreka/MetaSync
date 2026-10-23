@@ -9,7 +9,7 @@
   no listening history — just this week's binary signals.
   {% if dry_run %}Dry run is <strong>ON</strong>, so running the report computes this preview and sends nothing.{% endif %}</p>
 </div>
-{% if error %}<div class="flash error">Could not compute a fresh preview: {{ error }} (showing the last saved preview if any)</div>{% endif %}
+{% if report_job and report_job.status == "running" %}<div class="flash">A report is running right now. This preview is from the last completed run and updates when the run finishes.</div>{% endif %}
 {% if diagnostics %}
 <section class="card">
   <div class="card-head">
@@ -33,6 +33,6 @@
   <pre>{{ payload }}</pre>
 </section>
 {% else %}
-<div class="empty-state"><strong>No payload to preview</strong>No pool joined, or SoulSync is not connected yet.</div>
+<div class="empty-state"><strong>No payload to preview</strong>No report has completed yet. Run the weekly report and its payload will appear here.</div>
 {% endfor %}
 {% endblock %}

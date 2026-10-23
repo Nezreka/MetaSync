@@ -370,31 +370,25 @@ def create_app(service: NodeService) -> Flask:
     @app.get("/preview")
     @login_required
     def preview():
+        # A snapshot of the LAST completed run, never a fresh computation:
+        # computing here blocked the page on a full library read plus
+        # MusicBrainz lookups and raced any report job already running.
+        saved = service.store.state.get("previews") or {}
+        by_id = {p["id"]: p for p in service.pools()}
         previews: dict[str, Any] = {}
-        diagnostics = None
-        error = None
-        enabled = service.pools()
-        if enabled and (store.settings.get("soulsync") or {}).get("url"):
-            try:
-                report = service.compute_report()
-                diagnostics = report["diagnostics"]
-                for pool in enabled:
-                    previews[pool["name"]] = service.payload_for_pool(pool, report)
-            except Exception as err:
-                error = str(err)
-                previews = {
-                    (p.get("name") or p["id"]): payload
-                    for p in enabled
-                    for payload in [service.store.state.get("previews", {}).get(p["id"])]
-                    if payload
-                }
-        else:
-            saved = service.store.state.get("previews") or {}
-            previews = {pid: payload for pid, payload in saved.items()}
+        for pid, payload in saved.items():
+            pool = by_id.get(pid) or {}
+            # Bookkeeping keys the run stored beside the payload are not part
+            # of what gets POSTed: the page promises the exact payload.
+            previews[str(pool.get("name") or pid)] = {
+                k: v for k, v in payload.items() if k not in ("computed_at", "sent_at")
+            }
         pretty = {name: json.dumps(payload, indent=2) for name, payload in previews.items()}
         return render_template(
-            "preview.html", previews=pretty, diagnostics=diagnostics,
-            error=error, dry_run=service.dry_run,
+            "preview.html", previews=pretty,
+            diagnostics=service.store.state.get("last_diagnostics"),
+            error=None, dry_run=service.dry_run,
+            report_job=service.report_job(),
         )
 
     return app
