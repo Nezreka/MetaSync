@@ -127,6 +127,22 @@ def compute_signals(
             continue
         add("import_keep", rg)
 
+    # recent_add: albums that landed in the library during the report week.
+    # The mirror image of import_keep's 14-day rule: a kept album is a
+    # staple, a brand-new one is heat, and they chart separately ("Just
+    # Landed"). Same release-group resolution, same binary rule.
+    albums_recent = 0
+    for album in albums:
+        if not _in_week(album.get("created_at"), week):
+            continue
+        albums_recent += 1
+        release_id = album.get("musicbrainz_release_id")
+        if not is_uuid_shape(release_id):
+            continue
+        rg = release_to_group.get(release_id.lower())
+        if rg:
+            add("recent_add", rg)
+
     signals = sorted(found.values(), key=lambda s: (s["type"], s["mbid"]))
     return {
         "week": week,
@@ -135,6 +151,7 @@ def compute_signals(
             "watchlist_seen": len(watchlist),
             "wishlist_seen": len(wishlist),
             "albums_seen": len(albums),
+            "albums_recent": albums_recent,
             "gaps": gaps,
         },
     }

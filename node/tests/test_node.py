@@ -101,7 +101,7 @@ class TestWeekAndIdentity(unittest.TestCase):
 
 
 class TestSignals(unittest.TestCase):
-    def test_all_four_types_binary_rule_and_gaps(self):
+    def test_all_five_types_binary_rule_and_gaps(self):
         result = compute_signals(
             watchlist=WATCHLIST, wishlist=WISHLIST, albums=ALBUMS,
             release_to_group={REL_A: RG_A}, now=NOW,
@@ -109,7 +109,8 @@ class TestSignals(unittest.TestCase):
         self.assertEqual(result["week"], "2026-W43")
         keys = sorted(f"{s['type']}:{s['mbid']}" for s in result["signals"])
         self.assertEqual(keys, sorted([
-            f"hunt_demand:{RG_A}", f"import_keep:{RG_A}", f"watchlist_add:{ART_NEW}",
+            f"hunt_demand:{RG_A}", f"import_keep:{RG_A}", f"recent_add:{RG_A}",
+            f"watchlist_add:{ART_NEW}",
             f"wishlist_add:{RG_A}", f"wishlist_add:{RG_B}",
         ]))
         self.assertEqual(len([s for s in result["signals"] if s["type"] == "watchlist_add"]), 1)
@@ -118,6 +119,19 @@ class TestSignals(unittest.TestCase):
             "watchlist_no_mbid": 1, "wishlist_no_mbid": 1,
             "albums_no_release_mbid": 1, "albums_unresolved_group": 1,
         })
+
+    def test_recent_add_for_albums_landed_this_week(self):
+        fresh = [{"id": 9, "title": "Fresh", "created_at": "2026-10-21T09:00:00+00:00",
+                  "musicbrainz_release_id": REL_A}]
+        result = compute_signals(
+            watchlist=[], wishlist=[], albums=fresh,
+            release_to_group={REL_A: RG_A}, now=NOW,
+        )
+        keys = [f"{s['type']}:{s['mbid']}" for s in result["signals"]]
+        # Landed this week: recent_add fires; import_keep must not (the
+        # 14-day keep rule makes a brand-new album heat, not a staple).
+        self.assertEqual(keys, [f"recent_add:{RG_A}"])
+        self.assertEqual(result["diagnostics"]["albums_recent"], 1)
 
 
 class TestReportFlow(ServiceCase):
