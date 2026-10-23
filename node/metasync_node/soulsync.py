@@ -79,13 +79,16 @@ class SoulSyncClient:
             raise SoulSyncError(f"SoulSync {path} failed: {code}: {message}", code=code, status=res.status_code)
         return body
 
-    def get_all_pages(self, path: str, key: str, max_pages: int = 100) -> list[dict[str, Any]]:
+    def get_all_pages(self, path: str, key: str, max_pages: int = 100, on_page=None) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         page = 1
         while True:
             env = self.get(path, {"page": page, "limit": 200})
             out.extend((env["data"] or {}).get(key) or [])
             pagination = env.get("pagination") or {}
+            if on_page is not None:
+                # Live progress for long reads: (page, items so far, total pages if known).
+                on_page(page, len(out), pagination.get("total_pages"))
             if not pagination.get("has_next") or page >= max_pages:
                 return out
             page += 1
@@ -94,11 +97,11 @@ class SoulSyncClient:
         env = self.get("/watchlist")
         return (env["data"] or {}).get("artists") or []
 
-    def list_wishlist(self, max_pages: int = 100) -> list[dict[str, Any]]:
-        return self.get_all_pages("/wishlist", "tracks", max_pages)
+    def list_wishlist(self, max_pages: int = 100, on_page=None) -> list[dict[str, Any]]:
+        return self.get_all_pages("/wishlist", "tracks", max_pages, on_page=on_page)
 
-    def list_albums(self, max_pages: int = 100) -> list[dict[str, Any]]:
-        return self.get_all_pages("/library/albums", "albums", max_pages)
+    def list_albums(self, max_pages: int = 100, on_page=None) -> list[dict[str, Any]]:
+        return self.get_all_pages("/library/albums", "albums", max_pages, on_page=on_page)
 
     def test_connection(self) -> dict[str, Any]:
         """Cheap read-only probe used by the UI's Test button."""

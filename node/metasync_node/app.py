@@ -104,8 +104,17 @@ def create_app(service: NodeService) -> Flask:
         return render_template(
             "dashboard.html",
             status=service.status(),
+            report_job=service.report_job(),
             local_key_once=session.pop("local_api_key_once", None),
         )
+
+    @app.get("/api/report-job")
+    @login_required
+    def report_job_status():
+        job = service.report_job()
+        if job is None:
+            return {"exists": False, "status": None}
+        return {"exists": True, **job}
 
     @app.get("/api/pairing-status")
     @login_required
@@ -216,13 +225,14 @@ def create_app(service: NodeService) -> Flask:
     @app.post("/actions/report")
     @login_required
     def action_report():
-        outcome = service.run_report()
-        if outcome.get("error"):
-            flash(f"Report failed: {outcome['error']}", "error")
-        elif service.dry_run:
-            flash(f"Preview computed for {outcome['week']} (dry run: nothing was sent).", "ok")
+        # The run happens on a background thread; the dashboard's live
+        # progress card is where its status, steps, and errors show.
+        before = service.report_job()
+        job = service.start_report_job()
+        if before and before.get("status") == "running" and before.get("id") == job.get("id"):
+            flash("A report is already running. Its progress is on the dashboard.", "ok")
         else:
-            flash(f"Report for {outcome['week']} sent to every enabled pool.", "ok")
+            flash("Report started. Its live progress is on the dashboard.", "ok")
         return redirect(url_for("dashboard"))
 
     @app.post("/actions/refresh")

@@ -625,6 +625,20 @@ pre::-webkit-scrollbar-track { background: transparent; }
 .status-pill.auth_failed { border-color: rgba(var(--danger-rgb), 0.45); color: #ffb3b3; background: rgba(var(--danger-rgb), 0.08); }
 .status-pill.ok, .status-pill.success, .status-pill.connected { border-color: rgba(var(--success-rgb), 0.45); color: var(--success); background: rgba(var(--success-rgb), 0.08); }
 .status-pill.error { border-color: rgba(var(--danger-rgb), 0.45); color: #ffb3b3; background: rgba(var(--danger-rgb), 0.08); }
+.status-pill.running { border-color: rgba(var(--accent-rgb), 0.45); color: var(--accent-light); background: rgba(var(--accent-rgb), 0.10); }
+.status-pill.done { border-color: rgba(var(--success-rgb), 0.45); color: var(--success); background: rgba(var(--success-rgb), 0.08); }
+
+/* Live report job card: phase text, determinate page bar when the total is
+   known, an indeterminate sweep while a phase has no measurable total. */
+.job-card .card-head { display: flex; align-items: flex-start; gap: 12px; }
+.job-card .card-head .status-pill { margin-left: auto; }
+.job-bar { height: 8px; border-radius: 999px; background: rgba(255, 255, 255, 0.07); overflow: hidden; margin: 14px 0 10px; }
+.job-bar-fill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--accent), var(--accent-light)); transition: width 0.6s ease; }
+.job-bar-fill.error { background: rgba(var(--danger-rgb), 0.75); }
+.job-bar-fill.indeterminate { width: 35% !important; animation: job-sweep 1.4s ease-in-out infinite alternate; }
+@keyframes job-sweep { from { margin-left: 0; } to { margin-left: 65%; } }
+.job-counts { font-size: 13px; }
+.job-error { color: #ffb3b3; background: rgba(var(--danger-rgb), 0.08); border: 1px solid rgba(var(--danger-rgb), 0.35); border-radius: 10px; padding: 10px 12px; }
 
 /* ── Designed moments: secret + pairing ─────────────────────────────── */
 

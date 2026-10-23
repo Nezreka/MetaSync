@@ -7,6 +7,7 @@ import json
 import re
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -697,6 +698,108 @@ class TestLocalApiAndPairing(ServiceCase):
         self.store.save_state()
         claim_body["pairing_code"] = request_data["pairing_code"]
         self.assertEqual(self.client.post("/local/pair/claim", json=claim_body).status_code, 401)
+
+
+class TestReportJobProgress(ServiceCase):
+    """Live status for the weekly report: progress events + the background job."""
+
+    def _wait_for_job(self, timeout_s: float = 30):
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            job = self.service.report_job()
+            if job and job["status"] != "running":
+                return job
+            time.sleep(0.05)
+        self.fail("report job did not finish in time")
+
+    def test_progress_events_cover_pages_and_counts(self):
+        albums = [{"id": 1000 + i, "title": f"A{i}", "created_at": "2026-01-01T00:00:00",
+                   "musicbrainz_release_id": None} for i in range(450)]
+        self.soulsync.close()
+        self.soulsync = MockSoulSync(albums=albums)
+        self.addCleanup(self.soulsync.close)
+        self.store.settings["soulsync"] = {"url": self.soulsync.url, "api_key": "sk_test"}
+        events: list[dict] = []
+        report = self.service.compute_report(NOW, progress=events.append)
+        album_pages = [e for e in events if e.get("phase") == "albums" and e.get("page")]
+        self.assertEqual([e["page"] for e in album_pages], [1, 2, 3])
+        self.assertEqual(album_pages[-1]["counts"]["albums"], 450)
+        self.assertEqual(album_pages[-1]["pages_total"], 3)
+        phases = {e.get("phase") for e in events if e.get("phase")}
+        self.assertTrue({"watchlist", "wishlist", "albums", "resolving", "signals"} <= phases)
+        self.assertEqual(report["diagnostics"]["albums_seen"], 450)
+
+    def test_job_runs_to_done(self):
+        job = self.service.start_report_job()
+        self.assertEqual(job["status"], "running")
+        final = self._wait_for_job()
+        self.assertEqual(final["status"], "done")
+        self.assertIsNotNone(final["finished_at"])
+        self.assertIsNotNone(final["counts"]["signals"])
+        self.assertEqual(final["pools"]["sin"]["status"], "sent")
+        self.assertEqual(len(self.pool.reports), 1)
+
+    def test_second_start_while_running_returns_same_job(self):
+        self.store.state["report_job"] = {"id": "seeded1", "status": "running"}
+        self.store.save_state()
+        job = self.service.start_report_job()
+        self.assertEqual(job["id"], "seeded1")
+
+    def test_job_records_soulsync_failure(self):
+        self.store.settings["soulsync"] = {"url": "http://127.0.0.1:1", "api_key": "sk_test"}
+        self.store.save_settings()
+        self.service.start_report_job()
+        final = self._wait_for_job()
+        self.assertEqual(final["status"], "error")
+        self.assertIn("unreachable", (final["error"] or "").lower())
+
+    def test_stale_running_job_is_closed_on_startup(self):
+        self.store.state["report_job"] = {"id": "corpse", "status": "running"}
+        self.store.save_state()
+        fresh = NodeService(self.config, store=Store(self.tmp.name))
+        job = fresh.report_job()
+        self.assertEqual(job["status"], "error")
+        self.assertIn("restarted", job["error"])
+
+
+class TestReportJobUi(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.soulsync = MockSoulSync()
+        self.pool = MockPool()
+        self.mb = MockMusicBrainz()
+        self.addCleanup(self.soulsync.close)
+        self.addCleanup(self.pool.close)
+        self.addCleanup(self.mb.close)
+        config = make_config(self.tmp.name, musicbrainz_base_url=self.mb.url)
+        self.store = Store(self.tmp.name)
+        self.store.settings["soulsync"] = {"url": self.soulsync.url, "api_key": "sk_test"}
+        self.store.settings["pools"] = [{
+            "id": "sin", "name": "SIN", "url": self.pool.url,
+            "api_key": "pool-key", "role": "node", "enabled": True,
+        }]
+        self.store.settings["dry_run"] = False
+        self.store.save_settings()
+        self.service = NodeService(config, store=self.store)
+        from metasync_node.app import create_app
+        self.client = create_app(self.service).test_client()
+        self.client.post("/setup", data={"password": "test-password", "confirm": "test-password"})
+
+    def test_start_job_and_poll_status_to_done(self):
+        self.assertEqual(self.client.get("/api/report-job").get_json()["exists"], False)
+        self.assertEqual(self.client.post("/actions/report").status_code, 302)
+        deadline = time.time() + 30
+        payload: dict = {}
+        while time.time() < deadline:
+            payload = self.client.get("/api/report-job").get_json() or {}
+            if payload.get("status") not in (None, "running"):
+                break
+            time.sleep(0.05)
+        self.assertTrue(payload.get("exists"))
+        self.assertEqual(payload.get("status"), "done")
+        page = self.client.get("/")
+        self.assertIn(b'id="report-job"', page.data)
 
 
 if __name__ == "__main__":

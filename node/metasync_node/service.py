@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import secrets
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -71,6 +72,18 @@ class NodeService:
             min_interval_s=config.musicbrainz_min_interval_s,
             cache=self.store.state.setdefault("mb_cache", {}),
         )
+        self._report_lock = threading.Lock()
+        # A job record persisted as "running" across a restart is a corpse:
+        # its thread died with the old process. Close it out honestly.
+        stale_job = self.store.state.get("report_job") or {}
+        if stale_job.get("status") == "running":
+            stale_job["status"] = "error"
+            stale_job["phase"] = "failed"
+            stale_job["error"] = "The node restarted while the report was running. Run it again."
+            stale_job["detail"] = stale_job["error"]
+            stale_job["finished_at"] = _now()
+            self.store.state["report_job"] = stale_job
+            self.store.save_state()
 
     # -- connections --------------------------------------------------------
     @property
@@ -405,23 +418,46 @@ class NodeService:
         }
 
     # -- report leg ---------------------------------------------------------
-    def compute_report(self, now: datetime | None = None) -> dict[str, Any]:
+    def compute_report(self, now: datetime | None = None, progress: Any = None) -> dict[str, Any]:
         now = now or datetime.now(timezone.utc)
+        emit = progress or (lambda event: None)
         client = self.soulsync()
+
+        def page_events(phase: str, label: str, count_key: str):
+            def on_page(page: int, count: int, total_pages: Any) -> None:
+                emit({
+                    "phase": phase,
+                    "detail": f"Reading {label} from SoulSync, page {page}"
+                              + (f" of {total_pages}" if total_pages else ""),
+                    "page": page,
+                    "pages_total": total_pages if isinstance(total_pages, int) else None,
+                    "counts": {count_key: count},
+                })
+            return on_page
+
+        emit({"phase": "watchlist", "detail": "Reading your watchlist from SoulSync", "page": None, "pages_total": None})
         watchlist = client.list_watchlist()
-        wishlist = client.list_wishlist()
-        albums = client.list_albums(self.config.library_max_pages)
-        release_to_group = self._resolve_album_groups(albums)
+        emit({"counts": {"watchlist": len(watchlist)}})
+        emit({"phase": "wishlist", "detail": "Reading your wishlist from SoulSync", "page": None, "pages_total": None})
+        wishlist = client.list_wishlist(on_page=page_events("wishlist", "your wishlist", "wishlist"))
+        emit({"phase": "albums", "detail": "Reading your library albums from SoulSync", "page": None, "pages_total": None})
+        albums = client.list_albums(self.config.library_max_pages, on_page=page_events("albums", "your library albums", "albums"))
+        emit({"phase": "resolving", "detail": "Matching albums to MusicBrainz release groups", "page": None, "pages_total": None})
+        release_to_group = self._resolve_album_groups(albums, progress=emit)
+        emit({"phase": "signals", "detail": "Building this week's signals", "page": None, "pages_total": None})
         result = compute_signals(
             watchlist=watchlist, wishlist=wishlist, albums=albums,
             release_to_group=release_to_group, now=now,
         )
+        emit({"counts": {"signals": len(result["signals"])}})
         self.store.save_state()
         return result
 
-    def _resolve_album_groups(self, albums: list[dict[str, Any]]) -> dict[str, str]:
+    def _resolve_album_groups(self, albums: list[dict[str, Any]], progress: Any = None) -> dict[str, str]:
+        emit = progress or (lambda event: None)
         mapping: dict[str, str] = dict(self.store.state.get("release_to_group") or {})
         budget = self.config.release_resolution_cap
+        checked = 0
         for album in albums:
             release_id = album.get("musicbrainz_release_id")
             if not is_uuid_shape(release_id):
@@ -430,6 +466,7 @@ class NodeService:
             if key in mapping or budget <= 0:
                 continue
             budget -= 1
+            checked += 1
             try:
                 group = self.resolver.release_to_group(key)
             except Exception:
@@ -437,6 +474,8 @@ class NodeService:
             if group:
                 mapping[key] = group.lower()
                 self.store.state.setdefault("release_to_group", {})[key] = group.lower()
+            if checked % 25 == 0:
+                emit({"phase": "resolving", "detail": f"Matching albums to MusicBrainz release groups ({checked} checked)"})
         return mapping
 
     def payload_for_pool(self, pool: dict[str, Any], report: dict[str, Any]) -> dict[str, Any]:
@@ -446,12 +485,13 @@ class NodeService:
             "signals": report["signals"],
         }
 
-    def run_report(self, now: datetime | None = None) -> dict[str, Any]:
+    def run_report(self, now: datetime | None = None, progress: Any = None) -> dict[str, Any]:
         """Pull + compute + (unless dry-run) push the weekly report to every enabled pool."""
+        emit = progress or (lambda event: None)
         now = now or datetime.now(timezone.utc)
         outcome: dict[str, Any] = {"week": iso_week_string(now), "pools": {}, "error": None, "dry_run": self.dry_run}
         try:
-            report = self.compute_report(now)
+            report = self.compute_report(now, progress=emit)
         except Exception as err:  # SoulSync leg failed: record, stay alive.
             self.store.record_error("report:pull", err)
             self.store.save_state()
@@ -461,6 +501,11 @@ class NodeService:
         outcome["signal_count"] = len(report["signals"])
         outcome["diagnostics"] = report["diagnostics"]
         for pool in self.pools():
+            pool_name = str(pool.get("name") or pool["id"])
+            if self.dry_run:
+                emit({"phase": "sending", "detail": f"Dry run: {pool_name} would receive {len(report['signals'])} signals. Nothing is sent.", "page": None, "pages_total": None})
+            else:
+                emit({"phase": "sending", "detail": f"Sending the report to {pool_name} (the first contact exchanges your key for a token)", "page": None, "pages_total": None})
             payload = self.payload_for_pool(pool, report)
             self.store.state.setdefault("previews", {})[pool["id"]] = {
                 **payload, "computed_at": now.isoformat(), "sent_at": None,
@@ -480,6 +525,7 @@ class NodeService:
                     # waiting state, do not count it as a failed push.
                     entry["status"] = "binding_pending"
                     entry["error"] = str(err)
+                    emit({"phase": "sending", "detail": f"{pool_name} is waiting for approval in the portal. Approve this node there, then run the report again."})
                 except Exception as err:
                     self.store.record_error(f"report:push:{pool['id']}", err)
                     entry["status"] = "error"
@@ -487,6 +533,91 @@ class NodeService:
             outcome["pools"][pool["id"]] = entry
         self.store.save_state()
         return outcome
+
+    # -- report job: the same run, in the background, with live status ------
+    def report_job(self) -> dict[str, Any] | None:
+        job = self.store.state.get("report_job")
+        return dict(job) if isinstance(job, dict) else None
+
+    def start_report_job(self) -> dict[str, Any]:
+        """Start the weekly report on a background thread and return its job
+        record immediately. The dashboard polls report_job() for live status;
+        a second start while one is running returns the running job."""
+        with self._report_lock:
+            current = self.store.state.get("report_job") or {}
+            if current.get("status") == "running":
+                return dict(current)
+            job: dict[str, Any] = {
+                "id": secrets.token_hex(4),
+                "kind": "report",
+                "status": "running",
+                "started_at": _now(),
+                "finished_at": None,
+                "phase": "starting",
+                "detail": "Starting the weekly report",
+                "page": None,
+                "pages_total": None,
+                "counts": {"watchlist": None, "wishlist": None, "albums": None, "signals": None},
+                "week": None,
+                "dry_run": self.dry_run,
+                "error": None,
+                "pools": {},
+            }
+            self.store.state["report_job"] = job
+            self.store.save_state()
+        thread = threading.Thread(
+            target=self._run_report_job, args=(job["id"],),
+            daemon=True, name="metasync-report-job",
+        )
+        thread.start()
+        return dict(job)
+
+    def _job_progress(self, job_id: str):
+        def progress(event: dict[str, Any]) -> None:
+            job = self.store.state.get("report_job") or {}
+            if job.get("id") != job_id or job.get("status") != "running":
+                return
+            for key in ("phase", "detail", "page", "pages_total"):
+                if key in event:
+                    job[key] = event[key]
+            counts = event.get("counts")
+            if isinstance(counts, dict):
+                job.setdefault("counts", {}).update(counts)
+            self.store.state["report_job"] = job
+            self.store.save_state()
+        return progress
+
+    def _run_report_job(self, job_id: str) -> None:
+        try:
+            outcome = self.run_report(progress=self._job_progress(job_id))
+        except Exception as err:  # noqa: BLE001 — backstop only: a background job must never die silently; run_report handles its own legs.
+            outcome = {"error": str(err), "pools": {}, "week": None, "dry_run": self.dry_run}
+        job = self.store.state.get("report_job") or {}
+        if job.get("id") != job_id:
+            return
+        failed = bool(outcome.get("error"))
+        job["status"] = "error" if failed else "done"
+        job["phase"] = "failed" if failed else "done"
+        job["detail"] = (
+            str(outcome.get("error"))
+            if failed
+            else "Dry run complete. The payload preview is up to date; nothing was sent."
+            if outcome.get("dry_run")
+            else "Report sent to every enabled pool."
+        )
+        job["error"] = outcome.get("error")
+        job["week"] = outcome.get("week")
+        job["finished_at"] = _now()
+        job["page"] = None
+        job["pages_total"] = None
+        if outcome.get("signal_count") is not None:
+            job.setdefault("counts", {})["signals"] = outcome["signal_count"]
+        job["pools"] = {
+            pid: {"status": entry.get("status"), "error": entry.get("error")}
+            for pid, entry in (outcome.get("pools") or {}).items()
+        }
+        self.store.state["report_job"] = job
+        self.store.save_state()
 
     # -- refresh leg: provide + update --------------------------------------
     def _materialize(self, pool: dict[str, Any], canonical: list[dict[str, Any]], now: datetime) -> list[dict[str, Any]]:

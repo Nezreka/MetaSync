@@ -18,6 +18,29 @@
 </section>
 {% endfor %}
 
+{% if report_job %}
+<section class="card job-card" id="report-job" data-job-status="{{ report_job.status }}">
+  <div class="card-head">
+    <p class="eyebrow">Weekly report{% if report_job.week %} · {{ report_job.week }}{% endif %}{% if report_job.dry_run %} · dry run{% endif %}</p>
+    <h2>Report <span id="job-state-word">{{ "running" if report_job.status == "running" else "complete" if report_job.status == "done" else "failed" }}</span></h2>
+    <span class="status-pill {{ report_job.status }}" id="job-status-pill">{{ report_job.status }}</span>
+  </div>
+  <p id="job-detail">{{ report_job.detail }}</p>
+  <div class="job-bar" aria-hidden="true"><div class="job-bar-fill{{ ' indeterminate' if report_job.status == 'running' and not report_job.pages_total }}{{ ' error' if report_job.status == 'error' }}" id="job-bar-fill" style="width: {{ ((report_job.page or 0) * 100 // report_job.pages_total) if report_job.pages_total else (100 if report_job.status != 'running' else 12) }}%"></div></div>
+  <p class="job-counts muted" id="job-counts">
+    {%- set c = report_job.counts or {} -%}
+    {%- set parts = [] -%}
+    {%- if c.watchlist is not none -%}{%- set _ = parts.append("Watchlist " ~ c.watchlist) -%}{%- endif -%}
+    {%- if c.wishlist is not none -%}{%- set _ = parts.append("Wishlist " ~ c.wishlist) -%}{%- endif -%}
+    {%- if c.albums is not none -%}{%- set _ = parts.append("Albums " ~ c.albums) -%}{%- endif -%}
+    {%- if c.signals is not none -%}{%- set _ = parts.append("Signals " ~ c.signals) -%}{%- endif -%}
+    {{ parts | join(" · ") }}
+  </p>
+  <p class="muted" id="job-meta">Started {{ report_job.started_at }}{% if report_job.finished_at %} · finished {{ report_job.finished_at }}{% endif %}</p>
+  {% if report_job.status == "error" and report_job.error %}<p class="job-error" id="job-error">{{ report_job.error }}</p>{% endif %}
+</section>
+{% endif %}
+
 <div class="grid">
   <section class="card">
     <div class="card-head">
@@ -39,7 +62,7 @@
       <button type="submit">Save</button>
     </form>
     <div class="row actions">
-      <form method="post" action="{{ url_for('action_report') }}"><button class="primary" type="submit">Run weekly report now</button></form>
+      <form method="post" action="{{ url_for('action_report') }}"><button class="primary" type="submit" {% if report_job and report_job.status == "running" %}disabled{% endif %}>{{ "Report running…" if report_job and report_job.status == "running" else "Run weekly report now" }}</button></form>
       <form method="post" action="{{ url_for('action_refresh') }}"><button type="submit">Refresh playlists now</button></form>
     </div>
   </section>
@@ -196,6 +219,61 @@
   }
 
   window.setInterval(checkPairingStatus, 2500);
+})();
+</script>
+<script>
+(() => {
+  const card = document.getElementById("report-job");
+  if (!card || (card.dataset.jobStatus || "") !== "running") return;
+  const shownOnceKeyPresent = Boolean(document.getElementById("local-api-key-once"));
+  const detailEl = document.getElementById("job-detail");
+  const countsEl = document.getElementById("job-counts");
+  const fillEl = document.getElementById("job-bar-fill");
+  const pillEl = document.getElementById("job-status-pill");
+  const wordEl = document.getElementById("job-state-word");
+
+  function countsLine(c) {
+    const parts = [];
+    if (c && c.watchlist != null) parts.push("Watchlist " + c.watchlist);
+    if (c && c.wishlist != null) parts.push("Wishlist " + c.wishlist);
+    if (c && c.albums != null) parts.push("Albums " + c.albums);
+    if (c && c.signals != null) parts.push("Signals " + c.signals);
+    return parts.join(" · ");
+  }
+
+  async function poll() {
+    try {
+      const response = await fetch("{{ url_for('report_job_status') }}", {
+        headers: {"Accept": "application/json"},
+      });
+      if (!response.ok) return;
+      const job = await response.json();
+      if (!job.exists) return;
+      if (detailEl && job.detail) detailEl.textContent = job.detail;
+      if (countsEl) countsEl.textContent = countsLine(job.counts);
+      if (fillEl) {
+        if (job.pages_total && job.page) {
+          fillEl.classList.remove("indeterminate");
+          fillEl.style.width = Math.round((job.page * 100) / job.pages_total) + "%";
+        } else {
+          fillEl.classList.add("indeterminate");
+        }
+      }
+      if (job.status !== "running") {
+        if (pillEl) { pillEl.textContent = job.status; pillEl.className = "status-pill " + job.status; }
+        if (wordEl) wordEl.textContent = job.status === "done" ? "complete" : "failed";
+        window.clearInterval(timer);
+        // One refresh so pool statuses and last-report reflect the finished
+        // run; never while a shown-once local key is on screen.
+        if (!shownOnceKeyPresent) window.setTimeout(() => window.location.reload(), 1500);
+      }
+    } catch (_) {
+      // Transient poll failure; the next tick retries.
+    }
+  }
+
+  const timer = window.setInterval(poll, 2000);
+  poll();
 })();
 </script>
 {% endblock %}
