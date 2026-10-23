@@ -12,11 +12,13 @@
  *       it only marks what is new).
  *
  * Trending's fill is the weekly top; Just Landed's is the weekly top
- * restricted to fresh Albums and EPs. Nothing in either request comes
+ * restricted to fresh Albums and EPs. A third read,
+ *   GET /1/stats/sitewide/recordings?range=week&count=1000,
+ * is the weekly SONG chart behind "Top Tracks · from ListenBrainz". Nothing in either request comes
  * from a SIN user: they are the same public pages anyone can read.
  */
 import { MB_USER_AGENT } from "./mb.ts";
-import { isUuidShape } from "./logic.ts";
+import { isUuidShape, type PublicRecordingRow } from "./logic.ts";
 
 const LB_BASE = "https://api.listenbrainz.org/1";
 
@@ -27,6 +29,8 @@ export const PUBLIC_CANDIDATES_PER_CHART = 40;
 export interface PublicSeeds {
   trending: string[];
   "just-landed": string[];
+  /** ListenBrainz's weekly song chart, ranked (Top Tracks). */
+  recordings: PublicRecordingRow[];
 }
 
 type FetchFn = (url: string, init: { headers: Record<string, string> }) => Promise<{
@@ -71,6 +75,14 @@ export class ListenBrainzCharts {
     return out;
   }
 
+  /** Last week's most-played recordings, ranked. */
+  async weeklyTopRecordings(): Promise<PublicRecordingRow[]> {
+    const body = (await this.getJson("/stats/sitewide/recordings?range=week&count=1000")) as {
+      payload?: { recordings?: PublicRecordingRow[] };
+    };
+    return body.payload?.recordings ?? [];
+  }
+
   /** Album and EP release groups released in the last 30 days. */
   async freshAlbumGroups(): Promise<Set<string>> {
     const body = (await this.getJson(
@@ -98,12 +110,19 @@ export class ListenBrainzCharts {
       } catch {
         // Trending can still fill without the release-date list.
       }
+      let recordings: PublicRecordingRow[] = [];
+      try {
+        recordings = await this.weeklyTopRecordings();
+      } catch {
+        // The album charts still fill without the song chart.
+      }
       return {
         trending: top.slice(0, PUBLIC_CANDIDATES_PER_CHART),
         "just-landed": top.filter((m) => fresh.has(m)).slice(0, PUBLIC_CANDIDATES_PER_CHART),
+        recordings,
       };
     } catch {
-      return { trending: [], "just-landed": [] };
+      return { trending: [], "just-landed": [], recordings: [] };
     }
   }
 }

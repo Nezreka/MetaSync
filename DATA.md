@@ -165,7 +165,10 @@ Cover Art Archive URL is constructed
 with `{recording_mbids: [...]}` — the recording MBIDs of a **charted**
 album's tracklist, taken from MusicBrainz's public catalogue. The answer is
 ListenBrainz's catalogue-wide listen and listener counts per recording,
-used to pick the album's 5 most popular tracks for the playlists (§9).
+used to pick the album's most popular tracks for the playlists (§9).
+A fourth public read, `GET /1/stats/sitewide/recordings?range=week`,
+is ListenBrainz's weekly song chart, behind **Top Tracks · from
+ListenBrainz** (§9).
 Once per album, cached in its `mb_resolutions` bundle (`topTrackIds`). No
 node ever talks to ListenBrainz for this, and nothing in the request came
 from a SIN user: SIN collects no track-level data at all.
@@ -332,7 +335,7 @@ Schema: `src/sin/schema.ts`, migrations `db/migrations/0001`–`0008`.
 | `portal_keys` | `id`, `user_id`, `key_hash`, `key_prefix`, `label`, `last_used_at`, `expires_at`, `created_at`, `updated_at`, `revoked_at`, `bound_node_id`, `bound_node_public_key`, `bound_at`, `pending_node_id`, `pending_node_public_key`, `pending_requested_at` | Pool keys (§10). Only `sha256(API_KEY_PEPPER + raw_key)` is stored; the raw key exists only on the user's machine. `user_id` exists in the table but **SIN function code never selects or returns it** (privacy rule P3); the portal app is the only reader of that column. |
 | `sin_request_nonces` | `node_id`, `nonce_hash`, `expires_at` | Replay defence (§5). Hashes only, no bodies, no report content; rows expire with the ±5-minute window and are deleted opportunistically. |
 | `canonical_playlists` | `week`, `key`, `name`, `tracks` (jsonb), `published_at` (PK = week+key) | The published charts (§9). `tracks` is the Spotify-shaped subset: per track `{id (MusicBrainz recording MBID), name, artists: [{name}], album: {name, images: [{url}]}, duration_ms?, image_url}`. |
-| `mb_resolutions` | `mbid`, `kind`, `bundle` (jsonb), `resolved_at` | Composer's permanent MusicBrainz cache. Release-group bundle: `{mbid, kind, title, artistName, artistMbid?, genre?, year?, tracks, topTrackIds?}` (`topTrackIds`: the 5 most popular recordings, from ListenBrainz); artist bundle: `{mbid, kind, name, genre?, releaseGroupMbids}`. **Public catalogue data only** — nothing in it came from a user. |
+| `mb_resolutions` | `mbid`, `kind`, `bundle` (jsonb), `resolved_at` | Composer's permanent MusicBrainz cache. Release-group bundle: `{mbid, kind, title, artistName, artistMbid?, genre?, year?, tracks, topTrackIds?}` (`topTrackIds`: up to 5 most popular recordings, from ListenBrainz; a playlist uses 2); artist bundle: `{mbid, kind, name, genre?, releaseGroupMbids}`. **Public catalogue data only** — nothing in it came from a user. |
 
 ## 9. Aggregation and composition — how counts become charts
 
@@ -380,10 +383,18 @@ inputs are `aggregates` only — composition never reads raw reports.
   week-over-week growth ≥ 2× (or new), top 25; needs a previous week.
 - **Breakout Artists**: `watchlist_add` artists, current ≥ 20 nodes
   (`BREAKOUT_MIN_NODES`) and ≥ 2× the previous week (or new), top 10.
-- **Editions**: genre and decade editions of Trending and Most
-  Wanted only, built from resolved bundles; an edition needs ≥ 8
-  chart items sharing the tag (`CHART_MIN_EDITION_ITEMS`). Playlists
-  cap at 400 tracks (`CHART_MAX_TRACKS`); flagship album charts at 25.
+- **Editions**: genre and decade editions of Trending, Most Wanted and
+  Just Landed, built from resolved bundles. An edition needs ≥ 8 chart
+  items sharing the tag (`CHART_MIN_EDITION_ITEMS`), and one holding
+  every item of its chart is skipped, since it would be the same chart
+  again (every Just Landed album is from the 2020s). An edition of a
+  public-filled chart carries the same honest name ("Trending: Rock ·
+  from ListenBrainz"). Album charts hold 25 albums; every playlist caps
+  at 50 tracks (`CHART_MAX_TRACKS`).
+- **Top Tracks · from ListenBrainz**: ListenBrainz's public weekly song
+  chart, top 50, at most 2 songs per artist (one fan base can otherwise
+  fill it). Always public: SIN collects no track-level signal, so there
+  is no network version to replace it.
 
 **Cold-start fill** (`fillFromPublic`, `chartDisplayName`): until the
 network can fill them, **Trending** and **Just Landed** take
@@ -392,8 +403,7 @@ in the last 30 days) in the slots the network leaves empty, up to 25.
 Network items always rank first, so the public share falls to zero on
 its own as the network grows. The playlist **name says so**: "Trending
 · from ListenBrainz" (all public), "Trending · SoulSync + ListenBrainz"
-(mixed), plain "Trending in SoulSync" (network only). Genre/decade
-editions are built from network items only. A public album MusicBrainz
+(mixed), plain "Trending in SoulSync" (network only). A public album MusicBrainz
 cannot turn into a tracklist is skipped, not waited for. Network items
 still must all resolve before a chart publishes.
 
@@ -404,9 +414,18 @@ seller ranks below a riser, and Rising and Breakouts compare with the
 previous week. Nothing older than that influences any chart. Private
 below-k counts are dropped after 3 weeks (§8).
 
-**Tracks per album**: each charted album contributes at most **5
-tracks**, its most popular by distinct ListenBrainz listeners (then total
-listens), or its first 5 when ListenBrainz has no data for it.
+**Tracks per album, and order**: each charted album contributes its **2**
+most popular tracks by distinct ListenBrainz listeners (then total
+listens), or its first 2 when ListenBrainz has no data for it, so 25
+albums make a 50-track playlist. The tracks are laid out **round by
+round**: every album's best track first, in chart order, then every
+album's second. The strongest songs lead, one album never plays twice
+in a row, and the order changes only when the chart does. A random
+shuffle would instead rewrite a synced playlist every day.
+
+**Withdrawal**: a chart a compose pass no longer produces for the week
+(an edition whose genre fell under 8 albums, say) is deleted rather than
+served stale. A pass that produces nothing at all withdraws nothing.
 
 A chart spec is published (upserted into `canonical_playlists`)
 **only when every item in it resolved** through MusicBrainz within

@@ -30,7 +30,7 @@ export interface ReleaseGroupBundle {
   year?: number;
   tracks: PlaylistTrack[];
   /** The album's most popular tracks (recording MBIDs, best first), from
-   *  ListenBrainz's public popularity data — at most CHART_TRACKS_PER_ALBUM.
+   *  ListenBrainz's public popularity data — at most POPULAR_TRACKS_CACHED.
    *  Absent = not looked up yet; [] = looked up, no popularity data (the
    *  playlist then takes the album's first tracks). */
   topTrackIds?: string[];
@@ -224,7 +224,13 @@ export class MbResolver {
 /* track-level signals (DESIGN-LISTEN-SIGNALS.md §1, DATA.md §14).       */
 /* ------------------------------------------------------------------ */
 
-export const CHART_TRACKS_PER_ALBUM = 5;
+/** Tracks each charted album contributes to a playlist: its two most
+ *  popular, so 25 albums make a 50-track playlist. */
+export const CHART_TRACKS_PER_ALBUM = 2;
+/** Popular picks kept per album in its cached bundle (topTrackIds) —
+ *  more than a playlist uses, so the per-album count can change later
+ *  without asking ListenBrainz again. */
+export const POPULAR_TRACKS_CACHED = 5;
 const LB_BASE = "https://api.listenbrainz.org/1";
 /** ListenBrainz caps batch popularity requests; stay well under. */
 const LB_BATCH = 100;
@@ -243,7 +249,7 @@ export interface RecordingPopularity {
 export function pickTopTrackIds(
   tracks: PlaylistTrack[],
   popularity: Map<string, RecordingPopularity>,
-  limit: number = CHART_TRACKS_PER_ALBUM,
+  limit: number = POPULAR_TRACKS_CACHED,
 ): string[] {
   const seen = new Set<string>();
   return tracks

@@ -349,6 +349,12 @@ export class FakeSinDb {
             this.rawRows = this.rawRows.filter((r) => !gone.includes(r));
             return gone.map((r) => ({ ...r }));
           }
+          if (table === playlistsTable) {
+            // and(eq(week, w), notInArray(key, keep)): week first, then keys.
+            const [week, ...keep] = sqlParams(cond) as string[];
+            this.playlistRows = this.playlistRows.filter((r) => r.week !== week || keep.includes(r.key));
+            return [];
+          }
           if (table === aggregateCountsTable) {
             const cutoff = param as string;
             this.countRows = this.countRows.filter((r) => !(r.week < cutoff));

@@ -104,6 +104,7 @@ describe("ListenBrainz chart seeds", () => {
     assert.deepEqual(await fakeCharts().seeds(), {
       trending: [RG(1), RG(2), RG(3)],
       "just-landed": [RG(2)],
+      recordings: [],
     });
   });
 
@@ -111,11 +112,16 @@ describe("ListenBrainz chart seeds", () => {
     assert.deepEqual(await fakeCharts({ failFresh: true }).seeds(), {
       trending: [RG(1), RG(2), RG(3)],
       "just-landed": [],
+      recordings: [],
     });
   });
 
   test("ListenBrainz down: no public fill at all, never an error", async () => {
-    assert.deepEqual(await fakeCharts({ failAll: true }).seeds(), { trending: [], "just-landed": [] });
+    assert.deepEqual(await fakeCharts({ failAll: true }).seeds(), {
+      trending: [],
+      "just-landed": [],
+      recordings: [],
+    });
   });
 });
 
@@ -192,10 +198,107 @@ describe("compose on an empty network (end to end, no network calls)", () => {
       const trending = fake.playlistRows.find((p) => p.key === "trending")!;
       assert.equal(trending.name, "Trending · from ListenBrainz");
       // RG(3) has no official release: skipped, not waited for. RG(1) and
-      // RG(2) give 5 tracks each, most popular first.
-      assert.equal(trending.tracks.length, 10);
-      assert.equal((trending.tracks[0] as { id: string }).id, REC(107));
+      // RG(2) give their two most popular tracks each, laid out round by
+      // round: both albums' best first, then both seconds.
+      assert.deepEqual(
+        trending.tracks.map((t) => (t as { id: string }).id),
+        [REC(107), REC(207), REC(106), REC(206)],
+      );
       assert.equal(fake.playlistRows.find((p) => p.key === "just-landed")!.name, "Just Landed · from ListenBrainz");
+    } finally {
+      mod.setComposeSourcesForTests();
+      mod.setDbResolverForTests(null);
+    }
+  });
+});
+
+describe("chart shape", () => {
+  test("interleave: every album's best first, then every second; no repeats", async () => {
+    const { interleaveByRank } = await import("../src/sin/logic.ts");
+    const t = (id: string) => ({ id });
+    assert.deepEqual(
+      interleaveByRank([[t("a1"), t("a2")], [t("b1"), t("b2")], [t("c1")], [t("a1"), t("d2")]]).map((x) => x.id),
+      ["a1", "b1", "c1", "a2", "b2", "d2"],
+    );
+    assert.equal(interleaveByRank([[t("x"), t("y")], [t("z")]], 2).length, 2);
+  });
+
+  test("top tracks: public song chart, two per artist, rows without an id skipped", async () => {
+    const { topTracksFromRecordings } = await import("../src/sin/logic.ts");
+    const row = (n: number, artist: string, mbid: string | null = REC(n)) => ({
+      recording_mbid: mbid,
+      track_name: `Song ${n}`,
+      artist_name: artist,
+      artist_mbids: [`${artist}-id`],
+      release_name: "Album",
+      caa_release_mbid: RG(n),
+    });
+    const tracks = topTracksFromRecordings([
+      row(1, "Band"), row(2, "Band"), row(3, "Band"), row(4, "Solo", null), row(5, "Solo"), row(1, "Band"),
+    ]);
+    assert.deepEqual(tracks.map((t) => t.id), [REC(1), REC(2), REC(5)]);
+    assert.deepEqual(tracks[0]!.album, { name: "Album", images: [{ url: `https://coverartarchive.org/release/${RG(1)}/front-250` }] });
+  });
+
+  test("an edition of a public chart says so in its name", async () => {
+    const { sourcedName } = await import("../src/sin/logic.ts");
+    assert.equal(sourcedName("Trending: Rock", 0, 9), "Trending: Rock · from ListenBrainz");
+    assert.equal(sourcedName("Trending: Rock", 4, 5), "Trending: Rock · SoulSync + ListenBrainz");
+    assert.equal(sourcedName("Most Wanted: Rock", 9, 0), "Most Wanted: Rock");
+  });
+});
+
+describe("compose: top tracks and stale charts (end to end, no network calls)", () => {
+  function chartsWithRecordings() {
+    return new ListenBrainzCharts(async (url) => {
+      if (url.includes("/stats/sitewide/recordings")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            payload: {
+              recordings: [1, 2, 3].map((n) => ({
+                recording_mbid: REC(900 + n),
+                track_name: `Hit ${n}`,
+                artist_name: `Artist ${n}`,
+                release_name: "Single",
+              })),
+            },
+          }),
+        };
+      }
+      return { ok: true, status: 200, json: async () => ({ payload: { release_groups: [], releases: [] } }) };
+    });
+  }
+
+  test("publishes Top Tracks, withdraws a chart the pass no longer makes, keeps all when it makes none", async () => {
+    process.env.SIN_ADMIN_KEY = "test-admin-secret-0123456789";
+    const mod = await import("../src/sin/index.ts");
+    const fake = new FakeSinDb();
+    const week = isoWeekOf(new Date(Date.now() - 7 * 86_400_000));
+    fake.playlistRows.push({ week, key: "trending-rock", name: "Old edition", tracks: [{}], publishedAt: new Date() });
+    mod.setDbResolverForTests(() => fake as unknown as SinDb);
+    mod.resetRateLimiterForTests();
+    const compose = () =>
+      mod.default.request("/v1/compose", {
+        method: "POST",
+        headers: { "x-sin-key": "test-admin-secret-0123456789" },
+        body: "{}",
+      });
+    try {
+      mod.setComposeSourcesForTests({ charts: chartsWithRecordings() });
+      const res = await compose();
+      assert.equal(res.status, 200);
+      assert.deepEqual(((await res.json()) as { published: string[] }).published, ["top-tracks"]);
+      const top = fake.playlistRows.find((p) => p.key === "top-tracks")!;
+      assert.equal(top.name, "Top Tracks · from ListenBrainz");
+      assert.equal(top.tracks.length, 3);
+      assert.ok(!fake.playlistRows.some((p) => p.key === "trending-rock")); // withdrawn
+
+      // ListenBrainz down on an empty network: nothing made, nothing withdrawn
+      mod.setComposeSourcesForTests({ charts: fakeCharts({ failAll: true }) });
+      assert.equal((await compose()).status, 200);
+      assert.ok(fake.playlistRows.some((p) => p.key === "top-tracks"));
     } finally {
       mod.setComposeSourcesForTests();
       mod.setDbResolverForTests(null);

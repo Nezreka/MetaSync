@@ -1276,7 +1276,9 @@ export function verifyAccessToken(
 export const CHART_ALBUM_LIMIT = 25;
 export const CHART_ARTIST_LIMIT = 10;
 export const CHART_MIN_EDITION_ITEMS = 8;
-export const CHART_MAX_TRACKS = 400;
+/** A published playlist holds at most this many tracks: a chart's 25
+ *  albums at 2 tracks each (mb.ts CHART_TRACKS_PER_ALBUM). */
+export const CHART_MAX_TRACKS = 50;
 export const RISING_GROWTH_FACTOR = 2;
 
 export interface ChartItem {
@@ -1485,7 +1487,7 @@ export function buildEditions(
 ): ChartSpec[] {
   const editions: ChartSpec[] = [];
   for (const base of specs) {
-    if (base.key !== "trending" && base.key !== "most-wanted") continue;
+    if (base.key !== "trending" && base.key !== "most-wanted" && base.key !== "just-landed") continue;
     const byGenre = new Map<string, ChartItem[]>();
     const byDecade = new Map<string, ChartItem[]>();
     for (const item of base.items) {
@@ -1504,8 +1506,11 @@ export function buildEditions(
         byDecade.set(label, list);
       }
     }
+    // An edition holding every item of its base is the base again under a
+    // second name (every Just Landed album is from the 2020s): skip it.
+    const distinct = (items: ChartItem[]) => items.length < base.items.length;
     for (const [genre, items] of byGenre) {
-      if (items.length < CHART_MIN_EDITION_ITEMS) continue;
+      if (items.length < CHART_MIN_EDITION_ITEMS || !distinct(items)) continue;
       editions.push({
         key: `${base.key}-${slugifyGenre(genre)}`,
         name: `${base.name.split(" in SoulSync")[0]}: ${genreDisplay(genre)}`,
@@ -1513,7 +1518,7 @@ export function buildEditions(
       });
     }
     for (const [label, items] of byDecade) {
-      if (items.length < CHART_MIN_EDITION_ITEMS) continue;
+      if (items.length < CHART_MIN_EDITION_ITEMS || !distinct(items)) continue;
       editions.push({
         key: `${base.key}-${label}`,
         name: `${base.name.split(" in SoulSync")[0]}: ${label}`,
@@ -1574,14 +1579,100 @@ export function fillFromPublic(
 /**
  * The name a published chart carries, from what actually made it in:
  * pure network → the base name; part public → "· SoulSync + ListenBrainz";
- * all public → "· from ListenBrainz". Nobody should mistake ListenBrainz's
+ * all public → "· from ListenBrainz". Applies to the flagship charts and
+ * to every edition built from them. Nobody should mistake ListenBrainz's
  * listening for SoulSync's.
  */
-export function chartDisplayName(key: PublicFillKey, networkItems: number, publicItems: number): string {
-  const base = PUBLIC_FILL_CHARTS[key];
+export function sourcedName(base: string, networkItems: number, publicItems: number): string {
   if (publicItems === 0) return base;
   const short = base.replace(/ in SoulSync$/, "");
   return networkItems === 0 ? `${short} · from ListenBrainz` : `${short} · SoulSync + ListenBrainz`;
+}
+
+/** sourcedName for a flagship fill chart, by key. */
+export function chartDisplayName(key: PublicFillKey, networkItems: number, publicItems: number): string {
+  return sourcedName(PUBLIC_FILL_CHARTS[key], networkItems, publicItems);
+}
+
+/**
+ * Lay a chart's tracks out round by round: every item's best track first,
+ * in chart order, then every item's second, and so on. The strongest songs
+ * lead, one album never plays twice in a row, and the order moves only
+ * when the chart does — unlike a shuffle, which would rewrite a synced
+ * playlist every day. Duplicate track ids keep their first place.
+ */
+export function interleaveByRank<T extends { id: string }>(perItem: T[][], limit: number = CHART_MAX_TRACKS): T[] {
+  const out: T[] = [];
+  const seen = new Set<string>();
+  const rounds = Math.max(0, ...perItem.map((tracks) => tracks.length));
+  for (let round = 0; round < rounds && out.length < limit; round += 1) {
+    for (const tracks of perItem) {
+      const track = tracks[round];
+      if (!track || seen.has(track.id)) continue;
+      seen.add(track.id);
+      out.push(track);
+      if (out.length >= limit) break;
+    }
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------------ */
+/* Top Tracks · from ListenBrainz                                      */
+/* ------------------------------------------------------------------ */
+
+export const TOP_TRACKS_KEY = "top-tracks";
+export const TOP_TRACKS_NAME = "Top Tracks · from ListenBrainz";
+/** One artist's fan base can fill a raw weekly song chart (half of
+ *  ListenBrainz's top 100 was one band the week this was built), so the
+ *  chart takes at most this many songs per artist. */
+export const TOP_TRACKS_PER_ARTIST = 2;
+
+export interface PublicRecordingRow {
+  recording_mbid?: string | null;
+  track_name?: string | null;
+  artist_name?: string | null;
+  artist_mbids?: string[] | null;
+  release_name?: string | null;
+  caa_release_mbid?: string | null;
+}
+
+/**
+ * ListenBrainz's public weekly song chart as a playlist: ranked rows in,
+ * the top CHART_MAX_TRACKS songs out, at most TOP_TRACKS_PER_ARTIST per
+ * artist, rows without a recording MBID or a name skipped. Public
+ * catalogue data only; SIN collects no track-level signal from anyone.
+ */
+export function topTracksFromRecordings(
+  rows: PublicRecordingRow[],
+  limit: number = CHART_MAX_TRACKS,
+  perArtist: number = TOP_TRACKS_PER_ARTIST,
+): PlaylistTrack[] {
+  const out: PlaylistTrack[] = [];
+  const seen = new Set<string>();
+  const perArtistCount = new Map<string, number>();
+  for (const row of rows) {
+    if (out.length >= limit) break;
+    const id = row.recording_mbid?.toLowerCase();
+    const name = row.track_name?.trim();
+    const artist = row.artist_name?.trim();
+    if (!id || !isUuidShape(id) || !name || !artist || seen.has(id)) continue;
+    const artistKey = (row.artist_mbids?.[0] ?? artist).toLowerCase();
+    const count = perArtistCount.get(artistKey) ?? 0;
+    if (count >= perArtist) continue;
+    perArtistCount.set(artistKey, count + 1);
+    seen.add(id);
+    const cover = row.caa_release_mbid && isUuidShape(row.caa_release_mbid)
+      ? `https://coverartarchive.org/release/${row.caa_release_mbid}/front-250`
+      : undefined;
+    const track: PlaylistTrack = { id, name: name.slice(0, MAX_TRACK_FIELD_CHARS), artists: [{ name: artist.slice(0, MAX_TRACK_FIELD_CHARS) }] };
+    if (row.release_name?.trim()) {
+      track.album = { name: row.release_name.trim().slice(0, MAX_TRACK_FIELD_CHARS), ...(cover ? { images: [{ url: cover }] } : {}) };
+    }
+    if (cover) track.image_url = cover;
+    out.push(track);
+  }
+  return out;
 }
 
 /** Private running counts are kept this long: once a week can no longer
