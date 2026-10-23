@@ -439,7 +439,7 @@ class NodeService:
         watchlist = client.list_watchlist()
         emit({"counts": {"watchlist": len(watchlist)}})
         emit({"phase": "wishlist", "detail": "Reading your wishlist from SoulSync", "page": None, "pages_total": None})
-        wishlist = client.list_wishlist(on_page=page_events("wishlist", "your wishlist", "wishlist"))
+        wishlist = client.list_wishlist(self.config.library_max_pages, on_page=page_events("wishlist", "your wishlist", "wishlist"))
         emit({"phase": "albums", "detail": "Reading your library albums from SoulSync", "page": None, "pages_total": None})
         albums = client.list_albums(self.config.library_max_pages, on_page=page_events("albums", "your library albums", "albums"))
         emit({"phase": "resolving", "detail": "Matching albums to MusicBrainz release groups", "page": None, "pages_total": None})
@@ -449,6 +449,11 @@ class NodeService:
             watchlist=watchlist, wishlist=wishlist, albums=albums,
             release_to_group=release_to_group, now=now,
         )
+        # A read that stopped at the page cap is a partial picture: say so in
+        # the diagnostics every surface shows, never undercount quietly.
+        truncated = getattr(client, "truncated_paths", set())
+        result["diagnostics"]["albums_truncated"] = "/library/albums" in truncated
+        result["diagnostics"]["wishlist_truncated"] = "/wishlist" in truncated
         emit({"counts": {"signals": len(result["signals"])}})
         self.store.save_state()
         return result
@@ -605,6 +610,9 @@ class NodeService:
             if outcome.get("dry_run")
             else "Report sent to every enabled pool."
         )
+        diag = outcome.get("diagnostics") or {}
+        if not failed and (diag.get("albums_truncated") or diag.get("wishlist_truncated")):
+            job["detail"] += " Warning: a SoulSync read hit its page cap, so this report covers part of the library."
         job["error"] = outcome.get("error")
         job["week"] = outcome.get("week")
         job["finished_at"] = _now()

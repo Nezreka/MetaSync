@@ -15,8 +15,8 @@ class Config:
     musicbrainz_min_interval_s: float = 1.1  # MusicBrainz asks for <= 1 req/sec
     playlist_max_items: int = 20
     playlist_tracks_per_item: int = 3
-    library_max_pages: int = 100
-    release_resolution_cap: int = 200
+    library_max_pages: int = 5000
+    release_resolution_cap: int = 1000
     index_stale_days: int = 7
     scheduler_tick_s: int = 60
     refresh_interval_h: int = 24
@@ -42,7 +42,8 @@ def load_config(env: dict[str, str] | None = None) -> Config:
         ),
         playlist_max_items=_int(env, "PLAYLIST_MAX_ITEMS", 20),
         playlist_tracks_per_item=_int(env, "PLAYLIST_TRACKS_PER_ITEM", 3),
-        library_max_pages=_int(env, "LIBRARY_MAX_PAGES", 100),
+        library_max_pages=_int(env, "LIBRARY_MAX_PAGES", 5000),
+        release_resolution_cap=_int(env, "RELEASE_RESOLUTION_CAP", 1000),
         index_stale_days=_int(env, "INDEX_STALE_DAYS", 7),
         http_timeout_s=_int(env, "HTTP_TIMEOUT_MS", 15_000) // 1000 or 15,
     )

@@ -57,6 +57,10 @@ class SoulSyncClient:
         self.api_key = api_key
         self.timeout_s = timeout_s
         self.session = session or requests.Session()
+        # Paths whose latest paged read stopped at the page cap while the
+        # server still had more: callers must surface this, never undercount
+        # silently.
+        self.truncated_paths: set[str] = set()
 
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.api_key}", "Accept": "application/json"}
@@ -79,7 +83,8 @@ class SoulSyncClient:
             raise SoulSyncError(f"SoulSync {path} failed: {code}: {message}", code=code, status=res.status_code)
         return body
 
-    def get_all_pages(self, path: str, key: str, max_pages: int = 100, on_page=None) -> list[dict[str, Any]]:
+    def get_all_pages(self, path: str, key: str, max_pages: int = 5000, on_page=None) -> list[dict[str, Any]]:
+        self.truncated_paths.discard(path)
         out: list[dict[str, Any]] = []
         page = 1
         while True:
@@ -89,7 +94,10 @@ class SoulSyncClient:
             if on_page is not None:
                 # Live progress for long reads: (page, items so far, total pages if known).
                 on_page(page, len(out), pagination.get("total_pages"))
-            if not pagination.get("has_next") or page >= max_pages:
+            if not pagination.get("has_next"):
+                return out
+            if page >= max_pages:
+                self.truncated_paths.add(path)
                 return out
             page += 1
 
@@ -97,10 +105,10 @@ class SoulSyncClient:
         env = self.get("/watchlist")
         return (env["data"] or {}).get("artists") or []
 
-    def list_wishlist(self, max_pages: int = 100, on_page=None) -> list[dict[str, Any]]:
+    def list_wishlist(self, max_pages: int = 5000, on_page=None) -> list[dict[str, Any]]:
         return self.get_all_pages("/wishlist", "tracks", max_pages, on_page=on_page)
 
-    def list_albums(self, max_pages: int = 100, on_page=None) -> list[dict[str, Any]]:
+    def list_albums(self, max_pages: int = 5000, on_page=None) -> list[dict[str, Any]]:
         return self.get_all_pages("/library/albums", "albums", max_pages, on_page=on_page)
 
     def test_connection(self) -> dict[str, Any]:

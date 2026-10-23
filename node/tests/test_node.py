@@ -762,6 +762,63 @@ class TestReportJobProgress(ServiceCase):
         self.assertIn("restarted", job["error"])
 
 
+class TestReadCaps(ServiceCase):
+    """A 71k-album library must be read whole, and a capped read must say so."""
+
+    def _big_soulsync(self, albums: int = 450) -> MockSoulSync:
+        many = [{"id": 2000 + i, "title": f"B{i}", "created_at": "2026-01-01T00:00:00",
+                 "musicbrainz_release_id": None} for i in range(albums)]
+        mock = MockSoulSync(albums=many)
+        self.addCleanup(mock.close)
+        return mock
+
+    def _service_with_caps(self, mock: MockSoulSync, **config_overrides) -> NodeService:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        config = make_config(tmp.name, musicbrainz_base_url=self.mb.url, **config_overrides)
+        store = Store(tmp.name)
+        store.settings["soulsync"] = {"url": mock.url, "api_key": "sk_test"}
+        store.settings["pools"] = []
+        store.settings["dry_run"] = True
+        store.save_settings()
+        return NodeService(config, store=store)
+
+    def test_default_caps_cover_a_71k_library(self):
+        config = make_config(self.tmp.name)
+        # 200 albums per page: 5000 pages is a million albums of headroom.
+        self.assertGreaterEqual(config.library_max_pages * 200, 1_000_000)
+        self.assertGreaterEqual(config.release_resolution_cap, 1000)
+
+    def test_full_read_is_not_flagged_truncated(self):
+        mock = self._big_soulsync()
+        service = self._service_with_caps(mock)
+        report = service.compute_report(NOW)
+        self.assertEqual(report["diagnostics"]["albums_seen"], 450)
+        self.assertFalse(report["diagnostics"]["albums_truncated"])
+        self.assertFalse(report["diagnostics"]["wishlist_truncated"])
+
+    def test_capped_read_is_flagged_not_silent(self):
+        mock = self._big_soulsync()
+        service = self._service_with_caps(mock, library_max_pages=2)
+        report = service.compute_report(NOW)
+        self.assertEqual(report["diagnostics"]["albums_seen"], 400)
+        self.assertTrue(report["diagnostics"]["albums_truncated"])
+
+    def test_job_detail_warns_when_a_read_was_capped(self):
+        mock = self._big_soulsync()
+        service = self._service_with_caps(mock, library_max_pages=2)
+        service.start_report_job()
+        deadline = time.time() + 30
+        job = {}
+        while time.time() < deadline:
+            job = service.report_job() or {}
+            if job.get("status") != "running":
+                break
+            time.sleep(0.05)
+        self.assertEqual(job.get("status"), "done")
+        self.assertIn("page cap", job.get("detail", ""))
+
+
 class TestReportJobUi(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
