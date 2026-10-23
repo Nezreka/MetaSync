@@ -314,13 +314,18 @@ class InsertQuery {
       return [{ nodeId: v.nodeId }];
     }
     if (this.table === aggregatesTable) {
-      const v = this.vals as Record<string, unknown>;
-      const k = `${v.week}|${v.signal}|${v.mbid}`;
-      const existing = fake.aggregateRows.find(
-        (r) => `${r.week}|${r.signal}|${r.mbid}` === k,
-      );
-      if (existing && this.updateSet) Object.assign(existing, this.updateSet);
-      else if (!existing) fake.aggregateRows.push({ ...v });
+      // Production inserts chunked arrays with excluded.* conflict updates.
+      const rows = (Array.isArray(this.vals) ? this.vals : [this.vals]) as Record<string, unknown>[];
+      for (const v of rows) {
+        const k = `${v.week}|${v.signal}|${v.mbid}`;
+        const existing = fake.aggregateRows.find(
+          (r) => `${r.week}|${r.signal}|${r.mbid}` === k,
+        );
+        if (existing) {
+          existing.nodeCount = v.nodeCount;
+          existing.computedAt = v.computedAt;
+        } else fake.aggregateRows.push({ ...v });
+      }
       return [];
     }
     if (this.table === playlistsTable) {

@@ -25,6 +25,7 @@ import {
   varchar,
 } from "drizzle-orm/pg-core";
 import type { PlaylistTrack } from "./logic.ts";
+import type { MbBundle } from "./mb.ts";
 
 export const rawReports = pgTable(
   "raw_reports",
@@ -182,3 +183,18 @@ export const canonicalPlaylists = pgTable(
   },
   (t) => [primaryKey({ columns: [t.week, t.key] })],
 );
+
+/**
+ * Composer resolution cache (migration 0006): MusicBrainz facts about
+ * charted MBIDs, fetched once by the composer and kept. Public catalogue
+ * data only (titles, track lists, genre, year) — never user data.
+ */
+export const mbResolutions = pgTable("mb_resolutions", {
+  mbid: text("mbid").primaryKey(),
+  /** "release-group" | "artist". */
+  kind: text("kind").notNull(),
+  bundle: jsonb("bundle").$type<MbBundle>().notNull(),
+  resolvedAt: timestamp("resolved_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+});

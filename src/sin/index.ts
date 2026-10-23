@@ -40,7 +40,7 @@
  * Signals are keyed by MusicBrainz IDs only. SoulID is NOT used by SIN.
  */
 import { timingSafeEqual } from "node:crypto";
-import { and, desc, eq, inArray, isNull, lt, max, or } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, lt, max, or, sql } from "drizzle-orm";
 import { Hono } from "hono";
 import { getDb, type SinDb } from "./db.ts";
 import {
@@ -82,10 +82,20 @@ import {
   aggregates,
   canonicalPlaylists,
   indexPublications,
+  mbResolutions,
   portalKeys,
   rawReports,
   sinRequestNonces,
 } from "./schema.ts";
+import {
+  buildEditions,
+  CHART_MAX_TRACKS,
+  selectChartSpecs,
+  type ChartSpec,
+  type PlaylistTrack,
+  type ResolvedMeta,
+} from "./logic.ts";
+import { MbResolver, type MbBundle } from "./mb.ts";
 
 /** Timing-safe compare of the provided header value against one expected key. */
 function matchesKey(provided: string | null, expected: string | undefined): boolean {
@@ -686,7 +696,7 @@ async function touchAuth(auth: KeyAuth, db: SinDb): Promise<void> {
 }
 
 app.get("/health", (c) =>
-  c.json({ ok: true, service: "sin", version: "0.1.0", build: "chunked-insert-1" }),
+  c.json({ ok: true, service: "sin", version: "0.1.0", build: "composer-1" }),
 );
 
 app.get("/v1/auth/public-key", (c) => {
@@ -997,19 +1007,27 @@ export async function aggregateOnce(
     })),
   );
 
-  for (const a of computed) {
+  // Chunked multi-row upserts: one statement per row does not survive a
+  // large library's aggregate set (tens of thousands of rows).
+  const AGG_CHUNK = 500;
+  for (let i = 0; i < computed.length; i += AGG_CHUNK) {
     await db
       .insert(aggregates)
-      .values({
-        week: a.week,
-        signal: a.signal,
-        mbid: a.mbid,
-        nodeCount: a.nodeCount,
-        computedAt: now,
-      })
+      .values(
+        computed.slice(i, i + AGG_CHUNK).map((a) => ({
+          week: a.week,
+          signal: a.signal,
+          mbid: a.mbid,
+          nodeCount: a.nodeCount,
+          computedAt: now,
+        })),
+      )
       .onConflictDoUpdate({
         target: [aggregates.week, aggregates.signal, aggregates.mbid],
-        set: { nodeCount: a.nodeCount, computedAt: now },
+        set: {
+          nodeCount: sql`excluded.node_count`,
+          computedAt: sql`excluded.computed_at`,
+        },
       });
   }
 
@@ -1064,6 +1082,170 @@ app.post("/v1/aggregate", async (c) => {
 
   const result = await aggregateOnce(found.db, { week, trigger: "manual" });
   return c.json({ ok: true, ...result });
+});
+
+/* ------------------------------------------------------------------ */
+/* Composer: weekly auto-publish (see logic.ts selectChartSpecs).      */
+/* One pass: aggregate fresh, select chart specs, resolve up to        */
+/* `budget` missing MBIDs through MusicBrainz (cached in               */
+/* mb_resolutions), publish every spec whose items all resolved.       */
+/* Resumable by construction: call again to continue where it left.    */
+/* ------------------------------------------------------------------ */
+
+const mbResolver = new MbResolver();
+const COMPOSE_DEFAULT_BUDGET = 40;
+const COMPOSE_MAX_BUDGET = 200;
+
+/** The release groups a breakout artist contributes: ones the network
+ *  itself charted this week first, then the artist's best-known. */
+function artistGroupPicks(
+  bundle: Extract<MbBundle, { kind: "artist" }>,
+  chartedMbids: Set<string>,
+): string[] {
+  const charted = bundle.releaseGroupMbids.filter((g) => chartedMbids.has(g));
+  const rest = bundle.releaseGroupMbids.filter((g) => !chartedMbids.has(g));
+  return [...charted, ...rest].slice(0, 2);
+}
+
+app.post("/v1/compose", async (c) => {
+  // Admin only, same trust as aggregation (aggregate:write scope).
+  const bodyText = await c.req.text();
+  const gate = await authorizeAdminRequest(c.req.raw, bodyText, "aggregate:write", dbResolver);
+  if ("response" in gate) return gate.response;
+  const found = requireDb();
+  if ("response" in found) return found.response;
+  const { db } = found;
+
+  let budget = COMPOSE_DEFAULT_BUDGET;
+  let weekArg: string | undefined;
+  if (bodyText.trim().length > 0) {
+    try {
+      const body = JSON.parse(bodyText) as { week?: unknown; budget?: unknown };
+      if (body.week !== undefined) {
+        if (!isIsoWeekString(body.week)) {
+          return c.json({ error: "week must be an ISO week string" }, 400);
+        }
+        weekArg = body.week;
+      }
+      if (typeof body.budget === "number" && Number.isFinite(body.budget)) {
+        budget = Math.max(0, Math.min(COMPOSE_MAX_BUDGET, Math.floor(body.budget)));
+      }
+    } catch {
+      return c.json({ error: "invalid_json" }, 400);
+    }
+  }
+
+  await aggregateOnce(db, { trigger: "compose" });
+  const week = weekArg ?? (await resolveWeek(db, undefined));
+  if (!week) return c.json({ week: null, published: [], pending: {}, resolved: 0 });
+
+  const priors = await priorWeeksOf(db, week);
+  const previousWeek = priors[priors.length - 1] ?? null;
+  const rows = await loadAggregates(db, [week, ...priors]);
+  const specs = selectChartSpecs(rows, week, priors, previousWeek);
+  const chartedMbids = new Set(rows.filter((r) => r.week === week).map((r) => r.mbid));
+
+  // Everything this week's specs reference, first-order.
+  const needed = new Map<string, "release-group" | "artist">();
+  for (const spec of specs) {
+    for (const item of spec.items) needed.set(item.mbid, item.kind);
+  }
+
+  const bundles = new Map<string, MbBundle>();
+  if (needed.size > 0) {
+    const cached = await db
+      .select()
+      .from(mbResolutions)
+      .where(inArray(mbResolutions.mbid, [...needed.keys()]));
+    for (const row of cached) bundles.set(row.mbid, row.bundle);
+  }
+
+  let fetched = 0;
+  const fetchOne = async (mbid: string, kind: "release-group" | "artist") => {
+    if (bundles.has(mbid) || fetched >= budget) return;
+    fetched += 1;
+    try {
+      const bundle =
+        kind === "artist" ? await mbResolver.artist(mbid) : await mbResolver.releaseGroup(mbid);
+      if (bundle) {
+        bundles.set(mbid, bundle);
+        await db
+          .insert(mbResolutions)
+          .values({ mbid, kind, bundle })
+          .onConflictDoNothing();
+      }
+    } catch {
+      // A failed lookup is retried on the next pass; never cached, never fatal.
+    }
+  };
+  for (const [mbid, kind] of needed) await fetchOne(mbid, kind);
+  // Second order: breakout artists' chosen release groups.
+  for (const spec of specs) {
+    for (const item of spec.items) {
+      if (item.kind !== "artist") continue;
+      const artist = bundles.get(item.mbid);
+      if (!artist || artist.kind !== "artist") continue;
+      for (const g of artistGroupPicks(artist, chartedMbids)) {
+        await fetchOne(g, "release-group");
+      }
+    }
+  }
+
+  const meta = new Map<string, ResolvedMeta>();
+  for (const [mbid, bundle] of bundles) {
+    if (bundle.kind === "release-group") {
+      meta.set(mbid, { genre: bundle.genre, year: bundle.year });
+    }
+  }
+  const allSpecs: ChartSpec[] = [...specs, ...buildEditions(specs, meta)];
+
+  const published: string[] = [];
+  const pending: Record<string, number> = {};
+  const now = new Date();
+  for (const spec of allSpecs) {
+    const tracks: PlaylistTrack[] = [];
+    const seen = new Set<string>();
+    let missing = 0;
+    for (const item of spec.items) {
+      const bundle = bundles.get(item.mbid);
+      if (!bundle) {
+        missing += 1;
+        continue;
+      }
+      const groups =
+        bundle.kind === "release-group"
+          ? [bundle]
+          : artistGroupPicks(bundle, chartedMbids)
+              .map((g) => bundles.get(g))
+              .filter((b): b is Extract<MbBundle, { kind: "release-group" }> => b?.kind === "release-group");
+      if (bundle.kind === "artist" && groups.length === 0) {
+        missing += 1;
+        continue;
+      }
+      for (const g of groups) {
+        for (const t of g.tracks) {
+          if (seen.has(t.id)) continue;
+          seen.add(t.id);
+          tracks.push(t);
+        }
+      }
+    }
+    if (missing > 0 || tracks.length === 0) {
+      pending[spec.key] = missing;
+      continue;
+    }
+    const capped = tracks.slice(0, CHART_MAX_TRACKS);
+    await db
+      .insert(canonicalPlaylists)
+      .values({ week, key: spec.key, name: spec.name, tracks: capped, publishedAt: now })
+      .onConflictDoUpdate({
+        target: [canonicalPlaylists.week, canonicalPlaylists.key],
+        set: { name: spec.name, tracks: capped, publishedAt: now },
+      });
+    published.push(spec.key);
+  }
+
+  return c.json({ week, published, pending, resolved: bundles.size, fetched });
 });
 
 async function loadAggregates(
@@ -1159,10 +1341,16 @@ export interface PublishedPlaylists {
   playlists: CanonicalPlaylist[];
 }
 
-/** Canonical key order for serving a week's playlists. */
+/** Canonical key order for serving a week's playlists: flagship keys in
+ *  PLAYLIST_KEYS order first, then composer edition keys alphabetically. */
 function sortPlaylists(playlists: CanonicalPlaylist[]): CanonicalPlaylist[] {
-  const order = (key: PlaylistKey) => PLAYLIST_KEYS.indexOf(key);
-  return [...playlists].sort((a, b) => order(a.key) - order(b.key));
+  const order = (key: string) => {
+    const i = (PLAYLIST_KEYS as readonly string[]).indexOf(key);
+    return i === -1 ? PLAYLIST_KEYS.length : i;
+  };
+  return [...playlists].sort(
+    (a, b) => order(a.key) - order(b.key) || a.key.localeCompare(b.key),
+  );
 }
 
 /**

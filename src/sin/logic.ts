@@ -609,7 +609,11 @@ export interface PlaylistTrack {
 }
 
 export interface CanonicalPlaylist {
-  key: PlaylistKey;
+  /** A flagship key (PLAYLIST_KEYS) or a composer edition key
+   *  (e.g. "trending-rock", "most-wanted-1990s"). The manual publish
+   *  endpoint still accepts only PLAYLIST_KEYS; the composer writes the
+   *  wider catalog directly. */
+  key: string;
   name: string;
   tracks: PlaylistTrack[];
 }
@@ -1184,4 +1188,222 @@ export function verifyAccessToken(
   }
   if (claims.exp <= Math.floor(now.getTime() / 1000)) return null;
   return claims as AccessTokenClaims;
+}
+
+/* ------------------------------------------------------------------ */
+/* Composer: weekly chart selection (auto-publish)                     */
+/*                                                                     */
+/* The composer turns one week's k-filtered aggregates into chart      */
+/* specs: ranked MBID lists, nothing more. Turning MBIDs into track    */
+/* lists is the resolver's job (mb.ts); a spec only publishes once     */
+/* every item on it has resolved. Work that is identical for every     */
+/* user happens once, here in the middle.                              */
+/* ------------------------------------------------------------------ */
+
+export const CHART_ALBUM_LIMIT = 25;
+export const CHART_ARTIST_LIMIT = 10;
+export const CHART_MIN_EDITION_ITEMS = 8;
+export const CHART_MAX_TRACKS = 400;
+export const RISING_GROWTH_FACTOR = 2;
+
+export interface ChartItem {
+  mbid: string;
+  kind: "release-group" | "artist";
+  score: number;
+}
+
+export interface ChartSpec {
+  key: string;
+  name: string;
+  items: ChartItem[];
+}
+
+function sumsFor(
+  aggregates: AggregateRow[],
+  week: string,
+  signals: readonly SignalType[],
+): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const a of aggregates) {
+    if (a.week !== week || !signals.includes(a.signal)) continue;
+    out.set(a.mbid, (out.get(a.mbid) ?? 0) + a.nodeCount);
+  }
+  return out;
+}
+
+function topItems(
+  sums: Map<string, number>,
+  kind: ChartItem["kind"],
+  limit: number,
+): ChartItem[] {
+  return [...sums.entries()]
+    .map(([mbid, score]) => ({ mbid, kind, score }))
+    .sort((a, b) => b.score - a.score || a.mbid.localeCompare(b.mbid))
+    .slice(0, limit);
+}
+
+/**
+ * Build the week's flagship chart specs from k-filtered aggregates.
+ * Trending here ranks release groups by wishlist adds scored against
+ * prior weeks (artists chart separately as Breakouts); the public index
+ * blends kinds for display, a playlist cannot.
+ */
+export function selectChartSpecs(
+  aggregates: AggregateRow[],
+  week: string,
+  priorWeeks: string[],
+  previousWeek: string | null,
+): ChartSpec[] {
+  const specs: ChartSpec[] = [];
+  const push = (key: string, name: string, items: ChartItem[]) => {
+    if (items.length > 0) specs.push({ key, name, items });
+  };
+
+  push(
+    "most-wanted",
+    "Most Wanted",
+    computeMostWanted(aggregates, week)
+      .slice(0, CHART_ALBUM_LIMIT)
+      .map((i) => ({ mbid: i.mbid, kind: "release-group" as const, score: i.nodeCount })),
+  );
+
+  push(
+    "loved-and-kept",
+    "Loved & Kept",
+    topItems(sumsFor(aggregates, week, ["import_keep"]), "release-group", CHART_ALBUM_LIMIT),
+  );
+
+  push(
+    "just-landed",
+    "Just Landed",
+    topItems(sumsFor(aggregates, week, ["recent_add"]), "release-group", CHART_ALBUM_LIMIT),
+  );
+
+  // Trending: this week's wishlist adds per release group, scored against
+  // the same group's adds in each prior week (trendingScore).
+  const adds = sumsFor(aggregates, week, ["wishlist_add"]);
+  const priorByMbid = new Map<string, Map<string, number>>();
+  for (const a of aggregates) {
+    if (a.signal !== "wishlist_add" || !priorWeeks.includes(a.week)) continue;
+    let byWeek = priorByMbid.get(a.mbid);
+    if (!byWeek) {
+      byWeek = new Map<string, number>();
+      priorByMbid.set(a.mbid, byWeek);
+    }
+    byWeek.set(a.week, (byWeek.get(a.week) ?? 0) + a.nodeCount);
+  }
+  const trending = [...adds.entries()]
+    .map(([mbid, count]) => ({
+      mbid,
+      kind: "release-group" as const,
+      score: trendingScore(count, priorWeeks.map((w) => priorByMbid.get(mbid)?.get(w) ?? 0)),
+      adds: count,
+    }))
+    .sort((a, b) => b.score - a.score || b.adds - a.adds || a.mbid.localeCompare(b.mbid))
+    .slice(0, CHART_ALBUM_LIMIT)
+    .map(({ mbid, kind, score }) => ({ mbid, kind, score }));
+  push("trending", "Trending in SoulSync", trending);
+
+  if (previousWeek) {
+    const demandSignals: readonly SignalType[] = ["wishlist_add", "hunt_demand", "recent_add"];
+    const cur = sumsFor(aggregates, week, demandSignals);
+    const prev = sumsFor(aggregates, previousWeek, demandSignals);
+    const rising = [...cur.entries()]
+      .map(([mbid, count]) => {
+        const before = prev.get(mbid) ?? 0;
+        return { mbid, count, growth: before === 0 ? Infinity : count / before };
+      })
+      .filter((r) => r.growth === Infinity || r.growth >= RISING_GROWTH_FACTOR)
+      .sort((a, b) => b.growth - a.growth || b.count - a.count || a.mbid.localeCompare(b.mbid))
+      .slice(0, CHART_ALBUM_LIMIT)
+      .map((r) => ({ mbid: r.mbid, kind: "release-group" as const, score: r.count }));
+    push("rising", "Rising Fast", rising);
+
+    push(
+      "breakouts",
+      "Breakout Artists",
+      computeBreakouts(aggregates, week, previousWeek)
+        .slice(0, CHART_ARTIST_LIMIT)
+        .map((i) => ({ mbid: i.mbid, kind: "artist" as const, score: i.nodeCount })),
+    );
+  }
+
+  return specs;
+}
+
+/** Resolved public facts about one charted MBID (from MusicBrainz). */
+export interface ResolvedMeta {
+  genre?: string;
+  year?: number;
+}
+
+export function slugifyGenre(genre: string): string {
+  return genre
+    .toLowerCase()
+    .replace(/&/g, " and ")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+const GENRE_DISPLAY: Record<string, string> = { "r&b": "R&B" };
+
+export function genreDisplay(genre: string): string {
+  const lower = genre.toLowerCase();
+  if (GENRE_DISPLAY[lower]) return GENRE_DISPLAY[lower];
+  return lower.replace(/(^|[\s-])([a-z])/g, (_m, p1: string, p2: string) => p1 + p2.toUpperCase());
+}
+
+export function decadeLabel(year: number): string {
+  return `${Math.floor(year / 10) * 10}s`;
+}
+
+/**
+ * Genre and decade editions of the two flagship demand charts, built once
+ * items have resolved metadata. An edition exists only when enough charted
+ * items share the tag (CHART_MIN_EDITION_ITEMS): thin editions are noise,
+ * and every item on them already cleared the k threshold individually.
+ */
+export function buildEditions(
+  specs: ChartSpec[],
+  meta: Map<string, ResolvedMeta>,
+): ChartSpec[] {
+  const editions: ChartSpec[] = [];
+  for (const base of specs) {
+    if (base.key !== "trending" && base.key !== "most-wanted") continue;
+    const byGenre = new Map<string, ChartItem[]>();
+    const byDecade = new Map<string, ChartItem[]>();
+    for (const item of base.items) {
+      if (item.kind !== "release-group") continue;
+      const m = meta.get(item.mbid);
+      if (!m) continue;
+      if (m.genre) {
+        const list = byGenre.get(m.genre) ?? [];
+        list.push(item);
+        byGenre.set(m.genre, list);
+      }
+      if (m.year !== undefined) {
+        const label = decadeLabel(m.year);
+        const list = byDecade.get(label) ?? [];
+        list.push(item);
+        byDecade.set(label, list);
+      }
+    }
+    for (const [genre, items] of byGenre) {
+      if (items.length < CHART_MIN_EDITION_ITEMS) continue;
+      editions.push({
+        key: `${base.key}-${slugifyGenre(genre)}`,
+        name: `${base.name.split(" in SoulSync")[0]}: ${genreDisplay(genre)}`,
+        items,
+      });
+    }
+    for (const [label, items] of byDecade) {
+      if (items.length < CHART_MIN_EDITION_ITEMS) continue;
+      editions.push({
+        key: `${base.key}-${label}`,
+        name: `${base.name.split(" in SoulSync")[0]}: ${label}`,
+        items,
+      });
+    }
+  }
+  return editions;
 }
