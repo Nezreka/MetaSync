@@ -53,7 +53,7 @@
     </div>
     <dl>
       <dt>Node ID</dt><dd><code class="break plain">{{ status.node_id }}</code></dd>
-      <dt>Current week</dt><dd>{{ status.current_week }}</dd>
+      <dt>Current week</dt><dd>{{ status.current_week }} <span class="muted">· the next report covers {{ status.report_week }}, the last full week</span></dd>
       <dt>Dry run</dt><dd>{{ "ON — nothing is sent or synced" if status.dry_run else "OFF — live" }}</dd>
       <dt>Last refresh</dt><dd>{{ status.last_refresh_at or "never" }}</dd>
     </dl>
@@ -64,6 +64,10 @@
       <label class="switch"><input type="checkbox" name="share_churn" onchange="this.form.submit()" {% if status.share_churn %}checked{% endif %}> Share drop signals (optional)</label>
     </form>
     <p class="muted">Drop signals say "I removed music I had downloaded" — they help the charts tell a fad from a keeper. Off by default; the exact signals are always visible on the Payload preview page before anything is sent.</p>
+    <form method="post" action="{{ url_for('action_share_listening') }}" class="inline">
+      <label class="switch"><input type="checkbox" name="share_listening" onchange="this.form.submit()" {% if status.share_listening %}checked{% endif %}> Share listening signals (optional)</label>
+    </form>
+    <p class="muted">Listening signals say "I played at least 3 different tracks from this album last week", for at most your 50 most-played albums — no play counts, times, or track names, and nothing from a SoulSync profile that keeps its own listening history. They power the On Repeat chart. Off by default; with it off, MetaSync does not even read your listening history.</p>
     <div class="row actions">
       <form method="post" action="{{ url_for('action_report') }}"><button class="primary" type="submit" {% if report_job and report_job.status == "running" %}disabled{% endif %}>{{ "Report running…" if report_job and report_job.status == "running" else "Run weekly report now" }}</button></form>
       <form method="post" action="{{ url_for('action_refresh') }}"><button type="submit">Refresh playlists now</button></form>
@@ -147,7 +151,8 @@
     <p class="eyebrow">One-click pairing request</p>
     <h3>Compare this code with the code shown in SoulSync</h3>
     <div class="pairing-code">{{ status.pending_pairing.pairing_code }}</div>
-    <p class="muted pairing-meta">Status: {{ status.pending_pairing.status }} · expires {{ status.pending_pairing.expires_at }}</p>
+    <p class="muted pairing-meta">Requested from {{ status.pending_pairing.requested_from or "unknown" }} · status: {{ status.pending_pairing.status }} · expires {{ status.pending_pairing.expires_at }}</p>
+    <p class="muted">Approve only if you just clicked Connect in your own SoulSync and the address above is your SoulSync's.</p>
     {% if status.pending_pairing.status == "pending" %}
     <form method="post" action="{{ url_for('pair_confirm') }}" class="row">
       <input type="hidden" name="session_id" value="{{ status.pending_pairing.session_id }}">

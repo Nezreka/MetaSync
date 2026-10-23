@@ -29,5 +29,13 @@ def parse_iso(value: str | None) -> datetime | None:
 
 
 def week_start_utc(when: datetime) -> datetime:
+    if when.tzinfo is not None:
+        when = when.astimezone(timezone.utc)
     monday = when.date() - timedelta(days=when.weekday())
     return datetime(monday.year, monday.month, monday.day, tzinfo=timezone.utc)
+
+
+def closed_week_start(when: datetime) -> datetime:
+    """Monday 00:00 UTC of the ISO week BEFORE the one containing ``when``:
+    the week a report sent now describes (DESIGN-NODE.md §12)."""
+    return week_start_utc(when) - timedelta(days=7)

@@ -17,17 +17,38 @@ import secrets
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
+from urllib.parse import urlparse
 
 from .config import Config
 from .identity import NodeIdentity, load_or_create_identity, token_for_week
 from .musicbrainz import MusicBrainzResolver
 from .playlists import build_canonical_playlists, content_hash, local_playlist_id
-from .pool import PoolBindingPending, PoolClient, PoolError, PoolNotAvailable
+from .pool import PoolBindingPending, PoolClient, PoolError, PoolNotAvailable, is_loopback_url
 from .signals import compute_signals, is_uuid_shape
 from .soulsync import SoulSyncClient, SoulSyncError
 from .store import Store, default_pool_from_env
-from .weekutil import iso_week_string, week_start_utc
+from .weekutil import closed_week_start, iso_week_string
+
+# How many complete weekly library snapshots the churn rule keeps.
+_SNAPSHOT_WEEKS = 3
+
+
+def _env_flag(raw: str) -> bool:
+    return raw.lower() not in ("0", "false", "no", "off", "")
+
+
+def check_pool_url(url: str, *, allow_insecure: bool = False) -> None:
+    """A pool key is presented to this URL, so it must be HTTPS. Plain HTTP
+    is allowed only on loopback (a development pool on this machine) or
+    when the operator set METASYNC_ALLOW_INSECURE_POOLS. Raises ValueError."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("pool_url must be an http(s) URL")
+    if parsed.scheme == "http" and not allow_insecure and not is_loopback_url(url):
+        raise ValueError(
+            "pool_url must use HTTPS: the pool key would otherwise cross the network in the clear"
+        )
 
 
 class PairingError(Exception):
@@ -65,17 +86,36 @@ class NodeService:
                 settings["dry_run"] = raw.lower() not in ("0", "false", "no", "off")
                 changed = True
             if "METASYNC_SHARE_CHURN" in env:
-                settings["share_churn"] = env["METASYNC_SHARE_CHURN"].lower() not in ("0", "false", "no", "off")
+                settings["share_churn"] = _env_flag(env["METASYNC_SHARE_CHURN"])
+                changed = True
+            if "METASYNC_SHARE_LISTENING" in env:
+                settings["share_listening"] = _env_flag(env["METASYNC_SHARE_LISTENING"])
                 changed = True
         if changed:
             self.store.save_settings()
+        self.allow_insecure_pools = bool(env and _env_flag(env.get("METASYNC_ALLOW_INSECURE_POOLS", "")))
+        # The release -> group lookups used to cache their whole MusicBrainz
+        # response here as well as the answer in release_to_group: for a
+        # large library that was hundreds of MB rewritten on every state
+        # save. Only the answer is kept now; drop the old raw copies.
+        mb_cache = self.store.state.setdefault("mb_cache", {})
+        stale = [k for k in mb_cache if k.startswith("/release/") and "inc=release-groups" in k]
+        for key in stale:
+            del mb_cache[key]
+        if stale:
+            self.store.save_state()
         self.resolver = resolver or MusicBrainzResolver(
             config.musicbrainz_base_url,
             config.musicbrainz_user_agent,
             min_interval_s=config.musicbrainz_min_interval_s,
-            cache=self.store.state.setdefault("mb_cache", {}),
+            cache=mb_cache,
         )
+        # The clock the background job and the scheduler read; tests pin it.
+        self.clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
         self._report_lock = threading.Lock()
+        # One report run at a time, whoever starts it (UI job or scheduler):
+        # two concurrent runs would race the churn snapshots and state.
+        self._run_lock = threading.Lock()
         # A job record persisted as "running" across a restart is a corpse:
         # its thread died with the old process. Close it out honestly.
         stale_job = self.store.state.get("report_job") or {}
@@ -115,6 +155,7 @@ class NodeService:
             identity=self.identity,
             auth_state=auth_state,
             persist=self.store.save_state,
+            allow_legacy=self.allow_insecure_pools,
         )
 
     def test_soulsync(self) -> dict[str, Any]:
@@ -190,6 +231,7 @@ class NodeService:
         clean_key = str(pool_api_key or "").strip()
         if not clean_url or not clean_key:
             raise ValueError("pool_url and pool_api_key are required")
+        check_pool_url(clean_url, allow_insecure=self.allow_insecure_pools)
 
         pool = self._find_pool(pool_id=pool_id, pool_url=clean_url)
         if pool is None:
@@ -286,7 +328,11 @@ class NodeService:
         return hmac.compare_digest(self._local_key_hash(raw_key), str(stored))
 
     # -- one-click local pairing ---------------------------------------------
-    def request_pairing(self) -> dict[str, Any]:
+    def request_pairing(self, requested_from: str | None = None) -> dict[str, Any]:
+        """Open a pairing session. ``requested_from`` (the caller's address)
+        is shown beside the approval buttons: the request endpoint is
+        unauthenticated by design, so the person approving must be able to
+        see whether it came from their SoulSync or from somewhere else."""
         now_ts = time.time()
         attempts = [
             float(ts) for ts in (self.store.state.get("pairing_attempts") or [])
@@ -314,6 +360,7 @@ class NodeService:
             "status": "pending",
             "created_at": created.isoformat(),
             "expires_at": expires.isoformat(),
+            "requested_from": str(requested_from or "unknown"),
         }
         self.store.state["pairing_session"] = session
         self.store.save_state()
@@ -422,7 +469,13 @@ class NodeService:
 
     # -- report leg ---------------------------------------------------------
     def compute_report(self, now: datetime | None = None, progress: Any = None) -> dict[str, Any]:
-        now = now or datetime.now(timezone.utc)
+        """Compute the report for the ISO week that closed before ``now``
+        (DESIGN-NODE.md §12): events inside [week_start, week_end), ages
+        measured at week_end, library state as read now."""
+        now = now or self.clock()
+        week_start = closed_week_start(now)
+        week_end = week_start + timedelta(days=7)
+        report_week = iso_week_string(week_start)
         emit = progress or (lambda event: None)
         client = self.soulsync()
 
@@ -449,18 +502,29 @@ class NodeService:
         downloads: list[dict[str, Any]] | None = None
         downloads_error: str | None = None
         try:
-            downloads = client.download_activity(week_start_utc(now).isoformat())
+            downloads = client.download_activity(week_start.isoformat(), week_end.isoformat())
         except Exception as err:  # noqa: BLE001 — an older SoulSync 404s this endpoint; download signals are an addition, never a reason to fail the whole report.
             downloads_error = str(err)
+        # Listening is read ONLY when the user turned it on: with the switch
+        # off the node does not even ask SoulSync (DESIGN-LISTEN-SIGNALS.md).
+        share_listening = bool(self.store.settings.get("share_listening", False))
+        listening: list[dict[str, Any]] | None = None
+        listening_error: str | None = None
+        if share_listening:
+            emit({"phase": "listening", "detail": "Reading last week's listening counts from SoulSync", "page": None, "pages_total": None})
+            try:
+                listening = client.listening_activity(week_start.isoformat(), week_end.isoformat())
+            except Exception as err:  # noqa: BLE001 — same rule as downloads: an older SoulSync without the endpoint just sends no listening signals.
+                listening_error = str(err)
         emit({"phase": "resolving", "detail": "Matching albums to MusicBrainz release groups", "page": None, "pages_total": None})
-        download_release_ids = [
-            str(row.get("musicbrainz_release_id")) for row in (downloads or [])
+        priority_release_ids = [
+            str(row.get("musicbrainz_release_id")) for row in [*(downloads or []), *(listening or [])]
             if is_uuid_shape(row.get("musicbrainz_release_id"))
         ]
         release_to_group = self._resolve_album_groups(
-            albums, progress=emit, priority_release_ids=download_release_ids,
+            albums, progress=emit, priority_release_ids=priority_release_ids,
         )
-        emit({"phase": "signals", "detail": "Building this week's signals", "page": None, "pages_total": None})
+        emit({"phase": "signals", "detail": "Building last week's signals", "page": None, "pages_total": None})
         # Download history the node keeps for itself: release group ->
         # first/last completed download. SoulSync only reports albums
         # still in the library, so this record (built while albums live)
@@ -482,33 +546,41 @@ class NodeService:
                 if isinstance(last, str) and (not entry.get("last_downloaded_at") or last > entry["last_downloaded_at"]):
                     entry["last_downloaded_at"] = last
             self.store.state["downloaded_groups"] = downloaded_groups
-        snapshots = self.store.state.get("library_group_snapshots") or []
-        prev_groups = set(snapshots[0]) if len(snapshots) > 0 else set()
-        prev2_groups = set(snapshots[1]) if len(snapshots) > 1 else set()
+        # Churn snapshots are per WEEK, not per run: "absent from two
+        # consecutive reads" must mean two weeks, however often the report
+        # is re-run. prev = the newest snapshot from an earlier week, prev2
+        # the one before it; this week's own snapshot is replaced in place.
+        snapshots = _weekly_snapshots(self.store.state.get("library_group_snapshots"))
+        earlier = [snap for snap in snapshots if snap["week"] < report_week]
+        prev_groups = set(earlier[0]["groups"]) if len(earlier) > 0 else set()
+        prev2_groups = set(earlier[1]["groups"]) if len(earlier) > 1 else set()
         # A read that stopped at the page cap is a partial picture: say so in
         # the diagnostics every surface shows, never undercount quietly.
         truncated = getattr(client, "truncated_paths", set())
         albums_truncated = "/library/albums" in truncated
         result = compute_signals(
             watchlist=watchlist, wishlist=wishlist, albums=albums,
-            release_to_group=release_to_group, now=now,
+            release_to_group=release_to_group, week_start=week_start,
             downloads=downloads, downloaded_groups=downloaded_groups,
             library_groups_prev=prev_groups, library_groups_prev2=prev2_groups,
             share_churn=bool(self.store.settings.get("share_churn", False)),
             library_complete=not albums_truncated,
+            listening=listening,
         )
         result["diagnostics"]["albums_truncated"] = albums_truncated
         result["diagnostics"]["wishlist_truncated"] = "/wishlist" in truncated
         result["diagnostics"]["downloads_available"] = downloads is not None
         if downloads_error:
             result["diagnostics"]["downloads_error"] = downloads_error
-        # Rotate the library snapshots only on a complete read: a partial
-        # picture must never become the "proof" that an album is gone.
+        if listening_error:
+            result["diagnostics"]["listening_error"] = listening_error
+        # Record the snapshot only on a complete read: a partial picture
+        # must never become the "proof" that an album is gone.
         if not albums_truncated:
-            history = [result["library_groups"]]
-            if snapshots:
-                history.append(list(snapshots[0]))
-            self.store.state["library_group_snapshots"] = history
+            self.store.state["library_group_snapshots"] = [
+                {"week": report_week, "groups": result["library_groups"]},
+                *earlier,
+            ][:_SNAPSHOT_WEEKS]
         emit({"counts": {"signals": len(result["signals"])}})
         self.store.save_state()
         return result
@@ -553,11 +625,62 @@ class NodeService:
             "signals": report["signals"],
         }
 
+    def report_slot(self) -> timedelta:
+        """This node's fixed offset into Monday (0-6h UTC) before the
+        scheduler sends. Spreads load, and keeps every node's report from
+        arriving in the same minute (arrival time is the one thing the
+        pool sees that the payload does not carry). Derived from the
+        node's secret, so it is stable and says nothing about the node."""
+        digest = hashlib.sha256(f"{self.identity.key}:report-slot".encode()).digest()
+        return timedelta(seconds=int.from_bytes(digest[:4], "big") % (6 * 3600))
+
+    def report_due(self, now: datetime) -> bool:
+        """Whether the scheduler should run the weekly report now.
+
+        Due once per closed week per pool, after this node's slot, with a
+        back-off between failed attempts — never every scheduler tick. A
+        dry-run node previews each closed week once. A pool whose last
+        report is for this week or LATER is done: that also covers the
+        upgrade from the old start-of-week reporting, whose last_report
+        names the following week, so a node never re-reports (and
+        double-counts) the week it already sent."""
+        pools = self.pools()
+        if not pools:
+            return False
+        week = iso_week_string(closed_week_start(now))
+        if now < closed_week_start(now) + timedelta(days=7) + self.report_slot():
+            return False
+        last = self.store.state.get("last_report") or {}
+        if all(str((last.get(p["id"]) or {}).get("week") or "") >= week for p in pools):
+            return False
+        if self.dry_run:
+            previews = self.store.state.get("previews") or {}
+            if all((previews.get(p["id"]) or {}).get("week") == week for p in pools):
+                return False
+        attempt = self.store.state.get("last_report_attempt") or {}
+        tried = _parse_time(attempt.get("at"))
+        retry = timedelta(hours=self.config.report_retry_interval_h)
+        if attempt.get("week") == week and tried is not None and now - tried < retry:
+            return False
+        return True
+
     def run_report(self, now: datetime | None = None, progress: Any = None) -> dict[str, Any]:
-        """Pull + compute + (unless dry-run) push the weekly report to every enabled pool."""
+        """Pull + compute + (unless dry-run) push last week's report to every enabled pool."""
         emit = progress or (lambda event: None)
-        now = now or datetime.now(timezone.utc)
-        outcome: dict[str, Any] = {"week": iso_week_string(now), "pools": {}, "error": None, "dry_run": self.dry_run}
+        now = now or self.clock()
+        outcome: dict[str, Any] = {
+            "week": iso_week_string(closed_week_start(now)), "pools": {}, "error": None, "dry_run": self.dry_run,
+        }
+        if not self._run_lock.acquire(blocking=False):
+            outcome["error"] = "A report is already running."
+            return outcome
+        try:
+            self.store.state["last_report_attempt"] = {"week": outcome["week"], "at": now.isoformat()}
+            return self._run_report_locked(now, emit, outcome)
+        finally:
+            self._run_lock.release()
+
+    def _run_report_locked(self, now: datetime, emit: Any, outcome: dict[str, Any]) -> dict[str, Any]:
         try:
             report = self.compute_report(now, progress=emit)
         except Exception as err:  # SoulSync leg failed: record, stay alive.
@@ -572,20 +695,30 @@ class NodeService:
         self.store.state["last_diagnostics"] = report["diagnostics"]
         for pool in self.pools():
             pool_name = str(pool.get("name") or pool["id"])
-            if self.dry_run:
-                emit({"phase": "sending", "detail": f"Dry run: {pool_name} would receive {len(report['signals'])} signals. Nothing is sent.", "page": None, "pages_total": None})
-            else:
-                emit({"phase": "sending", "detail": f"Sending the report to {pool_name} (the first contact exchanges your key for a token)", "page": None, "pages_total": None})
             payload = self.payload_for_pool(pool, report)
             self.store.state.setdefault("previews", {})[pool["id"]] = {
                 **payload, "computed_at": now.isoformat(), "sent_at": None,
             }
             entry: dict[str, Any] = {"sent": False, "status": "dry_run" if self.dry_run else "pending", "response": None, "error": None, "payload": payload}
-            if not self.dry_run:
+            if self.dry_run:
+                emit({"phase": "sending", "detail": f"Dry run: {pool_name} would receive {len(report['signals'])} signals. Nothing is sent.", "page": None, "pages_total": None})
+            elif not report["signals"]:
+                # A quiet week: nothing to say, and a pool refuses an empty
+                # report anyway. The week still counts as done.
+                entry["status"] = "empty"
+                self.store.state.setdefault("last_report", {})[pool["id"]] = {
+                    "week": report["week"], "at": now.isoformat(), "signal_count": 0,
+                }
+                emit({"phase": "sending", "detail": f"Nothing happened in {report['week']} worth reporting; {pool_name} gets no report this week."})
+            else:
+                emit({"phase": "sending", "detail": f"Sending the report to {pool_name} (the first contact exchanges your key for a token)", "page": None, "pages_total": None})
                 try:
-                    entry["response"] = self.pool_client(pool).post_report(payload)
+                    response = self.pool_client(pool).post_report(payload)
+                    entry["response"] = response
                     entry["sent"] = True
-                    entry["status"] = "sent"
+                    # A pool counts one report per node per week; a repeat
+                    # is acknowledged, not counted again.
+                    entry["status"] = "already_sent" if response.get("duplicate") else "sent"
                     self.store.state.setdefault("last_report", {})[pool["id"]] = {
                         "week": report["week"], "at": now.isoformat(), "signal_count": len(report["signals"]),
                     }
@@ -643,6 +776,13 @@ class NodeService:
         return dict(job)
 
     def _job_progress(self, job_id: str):
+        # The dashboard polls the in-memory job record, so progress needs no
+        # disk write to show up. state.json is still written now and then
+        # (a phase change, or every couple of seconds) so a restart mid-run
+        # finds a recent record — but never once per page: on a large
+        # library that was hundreds of full state rewrites per run.
+        last_saved = {"at": 0.0, "phase": None}
+
         def progress(event: dict[str, Any]) -> None:
             job = self.store.state.get("report_job") or {}
             if job.get("id") != job_id or job.get("status") != "running":
@@ -654,12 +794,15 @@ class NodeService:
             if isinstance(counts, dict):
                 job.setdefault("counts", {}).update(counts)
             self.store.state["report_job"] = job
-            self.store.save_state()
+            if job.get("phase") != last_saved["phase"] or time.monotonic() - last_saved["at"] >= 2.0:
+                last_saved["at"] = time.monotonic()
+                last_saved["phase"] = job.get("phase")
+                self.store.save_state()
         return progress
 
     def _run_report_job(self, job_id: str) -> None:
         try:
-            outcome = self.run_report(progress=self._job_progress(job_id))
+            outcome = self.run_report(self.clock(), progress=self._job_progress(job_id))
         except Exception as err:  # noqa: BLE001 — backstop only: a background job must never die silently; run_report handles its own legs.
             outcome = {"error": str(err), "pools": {}, "week": None, "dry_run": self.dry_run}
         job = self.store.state.get("report_job") or {}
@@ -673,7 +816,7 @@ class NodeService:
             if failed
             else "Dry run complete. The payload preview is up to date; nothing was sent."
             if outcome.get("dry_run")
-            else "Report sent to every enabled pool."
+            else f"Report for {outcome.get('week')} sent to every enabled pool."
         )
         diag = outcome.get("diagnostics") or {}
         if not failed and (diag.get("albums_truncated") or diag.get("wishlist_truncated")):
@@ -808,7 +951,9 @@ class NodeService:
             "node_public_key": self.identity.public_key_b64url,
             "dry_run": self.dry_run,
             "share_churn": bool(settings.get("share_churn", False)),
+            "share_listening": bool(settings.get("share_listening", False)),
             "current_week": iso_week_string(datetime.now(timezone.utc)),
+            "report_week": iso_week_string(closed_week_start(datetime.now(timezone.utc))),
             "soulsync_connected": bool((settings.get("soulsync") or {}).get("url")),
             "soulsync_url": (settings.get("soulsync") or {}).get("url") or "",
             "local_api_key": self.local_api_key_status(),
@@ -835,3 +980,18 @@ def _parse_time(value: Any) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed
+
+
+def _weekly_snapshots(raw: Any) -> list[dict[str, Any]]:
+    """Library snapshots as [{week, groups}], newest week first. The
+    pre-weekly format (a bare list of group lists, rotated per RUN) cannot
+    be dated, so it is dropped: churn restarts its two-week window rather
+    than trust snapshots that may be minutes apart."""
+    if not isinstance(raw, list):
+        return []
+    out = [
+        {"week": str(snap["week"]), "groups": list(snap.get("groups") or [])}
+        for snap in raw
+        if isinstance(snap, dict) and isinstance(snap.get("week"), str)
+    ]
+    return sorted(out, key=lambda snap: snap["week"], reverse=True)

@@ -24,10 +24,20 @@
   {% if diagnostics.downloads_seen is defined %}
   <div class="stat-row" style="margin-top:12px">
     <div class="stat"><span class="stat-num">{{ diagnostics.downloads_seen }}</span><span class="stat-label">Albums with downloads</span></div>
-    <div class="stat"><span class="stat-num">{{ diagnostics.download_grabs }}</span><span class="stat-label">Download grabs this week</span></div>
-    <div class="stat"><span class="stat-num">{{ diagnostics.churn_fired }}</span><span class="stat-label">Drop signals this week</span></div>
+    <div class="stat"><span class="stat-num">{{ diagnostics.download_grabs }}</span><span class="stat-label">Download grabs that week</span></div>
+    <div class="stat"><span class="stat-num">{{ diagnostics.churn_fired }}</span><span class="stat-label">Drop signals that week</span></div>
   </div>
   {% if not diagnostics.downloads_available %}<p class="muted" style="margin-top:12px">Download data was not available this run (this SoulSync build has no download-activity endpoint yet), so no grab or drop signals were computed.</p>{% endif %}
+  {% endif %}
+  {% if diagnostics.listening_shared %}
+  <div class="stat-row" style="margin-top:12px">
+    <div class="stat"><span class="stat-num">{{ diagnostics.listen_candidates }}</span><span class="stat-label">Albums played 3+ tracks deep</span></div>
+    <div class="stat"><span class="stat-num">{{ diagnostics.listen_sent }}</span><span class="stat-label">Listening signals sent (max 50)</span></div>
+  </div>
+  {% if diagnostics.listening_error %}<p class="muted" style="margin-top:12px">Listening data was not available this run (this SoulSync build has no listening-activity endpoint yet), so no listening signals were computed.</p>{% endif %}
+  {% endif %}
+  {% if diagnostics.bulk_suppressed %}
+  <p class="muted" style="margin-top:12px">Held back as bulk operations, not taste (an import, a migration, a drive remounting): {% for t, n in diagnostics.bulk_suppressed.items() %}{{ t }} ({{ n }}){% if not loop.last %}, {% endif %}{% endfor %}. A week with more than 500 of one kind is not reported; a big wishlist's standing demand is sampled to 500.</p>
   {% endif %}
   <p class="muted" style="margin-top:16px">Skipped honestly (see DESIGN-NODE.md gaps): {{ diagnostics.gaps }}</p>
 </section>

@@ -50,15 +50,25 @@ signature (derived from its persistent root identity). Routine report,
 index, playlist and whoami calls use the short-lived returned token plus
 a fresh node signature. If the pool answers the exchange with **202**,
 the node is waiting for binding approval in the portal and sends no
-report. A pool that 404s the exchange is used only in a clearly labelled
-legacy direct-key development fallback.
+report. A pool URL must be HTTPS unless it is on this machine. Only a
+pool on this machine that 404s the exchange is used in the clearly
+labelled legacy direct-key development fallback; any other pool that
+404s the exchange is an error, and the raw key is never sent to it.
 
 ## Defaults that matter
 
 - **Dry run is ON** until you turn it off: the node computes the exact
   weekly report, shows it on the Payload preview page, and sends/syncs
   nothing.
-- Weekly report, daily playlist refresh.
+- **The weekly report covers the last full ISO week** (Monday–Sunday,
+  UTC) and goes out once, early on Monday at a per-node time within the
+  first 6 hours, with a 6-hour back-off after a failed send. A report
+  lists that week's events — never your library — and a week with more
+  than 500 of one kind (a bulk import) is held back, not reported.
+- **Drop signals and listening signals are OFF** until you turn them on
+  (dashboard, or `METASYNC_SHARE_CHURN` / `METASYNC_SHARE_LISTENING`).
+  With listening off, the node never reads your listening history.
+- Daily playlist refresh.
 - User nodes only push their report and pull pool data; publishing the
   shared playlist data is reserved for the official MetaSync
   (see DESIGN-NODE.md §2 and §9).

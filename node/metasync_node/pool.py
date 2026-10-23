@@ -18,16 +18,19 @@ Pool authentication follows PORTAL-DESIGN §3A.4: the long-lived pool key
 is presented only to ``POST /v1/auth/exchange``, together with this
 node's Ed25519 request signature. The pool returns a short-lived access
 token; routine calls then use ``Authorization: Bearer <token>`` plus a
-fresh node signature and never carry the raw pool key again. A pool that
-answers the exchange with 404 is used in a clearly labelled legacy
-direct-key development fallback.
+fresh node signature and never carry the raw pool key again. A pool on
+loopback that answers the exchange with 404 is used in a clearly
+labelled legacy direct-key development fallback; any other pool that
+404s the exchange is an error, and the raw key is never sent to it.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 import requests
 
@@ -63,6 +66,16 @@ class _ExchangeUnsupported(Exception):
     pass
 
 
+def is_loopback_url(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def _iso_from_epoch(value: float) -> str:
     return datetime.fromtimestamp(value, tz=timezone.utc).isoformat()
 
@@ -95,6 +108,7 @@ class PoolClient:
         identity: NodeIdentity | None = None,
         auth_state: dict[str, Any] | None = None,
         persist: Callable[[], None] | None = None,
+        allow_legacy: bool = False,
     ):
         self.pool_id = str(pool.get("id") or "pool")
         self.name = str(pool.get("name") or self.pool_id)
@@ -106,6 +120,9 @@ class PoolClient:
         self.identity = identity
         self.auth_state = auth_state if auth_state is not None else {}
         self._persist_callback = persist
+        # The direct-key fallback is for a development pool on this
+        # machine only (or an operator who explicitly allowed it).
+        self.legacy_allowed = allow_legacy or is_loopback_url(self.base)
 
     # -- role gate ---------------------------------------------------------
     def _require(self, operation: str) -> None:
@@ -241,6 +258,20 @@ class PoolClient:
         status, body = self._send("POST", "/v1/auth/exchange", raw_body, headers)
         if not isinstance(body, dict):
             body = {}
+
+        if status == 404 and not self.legacy_allowed:
+            # A production pool always has the exchange. A 404 here is a
+            # wrong URL, a proxy, or someone in the path — never a reason to
+            # start sending the raw pool key on every request.
+            self._update_auth(
+                last_exchange_at=now_iso,
+                last_exchange_error="exchange HTTP 404",
+                status_note="This pool has no key exchange (404). Check the pool URL; the key is not sent without it.",
+            )
+            raise PoolError(
+                f"pool {self.name} has no key exchange at {self.base} (HTTP 404); refusing to send the pool key directly",
+                status=404,
+            )
 
         if status == 404:
             self._update_auth(

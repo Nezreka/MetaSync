@@ -111,16 +111,32 @@ class SoulSyncClient:
     def list_albums(self, max_pages: int = 5000, on_page=None) -> list[dict[str, Any]]:
         return self.get_all_pages("/library/albums", "albums", max_pages, on_page=on_page)
 
-    def download_activity(self, since: str) -> list[dict[str, Any]]:
+    def download_activity(self, since: str, until: str) -> list[dict[str, Any]]:
         """Per-album completed-download aggregates for the download signals.
 
         One row per library album keyed by MusicBrainz RELEASE id:
         {musicbrainz_release_id, completed_downloads, completed_since,
-        first_downloaded_at, last_downloaded_at}. Older SoulSync builds
-        404 here; the caller treats any failure as "no download data this
-        run", never as a failed report.
+        first_downloaded_at, last_downloaded_at}, with completed_since
+        counted over [since, until). Older SoulSync builds 404 here; the
+        caller treats any failure as "no download data this run", never
+        as a failed report. (A build from before ``until`` ignores it and
+        counts from ``since`` to now — a few extra hours, not a failure.)
         """
-        env = self.get("/library/download-activity", {"since": since})
+        env = self.get("/library/download-activity", {"since": since, "until": until})
+        return (env["data"] or {}).get("albums") or []
+
+    def listening_activity(self, since: str, until: str) -> list[dict[str, Any]]:
+        """Per-album listening aggregates for the opt-in listen_album signal.
+
+        One row per library album played in [since, until), keyed by
+        MusicBrainz RELEASE id: {musicbrainz_release_id, plays,
+        distinct_tracks, distinct_days}. SoulSync counts only its SHARED
+        listening pile — a profile with its own listening account is never
+        included (DESIGN-LISTEN-SIGNALS.md §3). Only called when the user
+        turned listening on; older builds 404 and the caller sends no
+        listening signals that run.
+        """
+        env = self.get("/library/listening-activity", {"since": since, "until": until})
         return (env["data"] or {}).get("albums") or []
 
     def test_connection(self) -> dict[str, Any]:

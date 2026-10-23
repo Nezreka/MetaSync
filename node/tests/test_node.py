@@ -31,7 +31,10 @@ from tests.mocks import (  # noqa: E402
     RG_A, RG_B, REL_A, WATCHLIST, WISHLIST,
 )
 
-NOW = datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc)  # Thursday of 2026-W43
+# The node reports the week that just CLOSED (DESIGN-NODE.md §12): a run on
+# Monday of 2026-W44 reports 2026-W43, the week the fixtures live in.
+NOW = datetime(2026, 10, 26, 12, 0, tzinfo=timezone.utc)  # Monday of 2026-W44
+W43_START = datetime(2026, 10, 19, tzinfo=timezone.utc)
 
 
 def make_config(state_dir: str, **overrides) -> Config:
@@ -81,6 +84,7 @@ class ServiceCase(unittest.TestCase):
         self.store.settings["dry_run"] = self.dry_run
         self.store.save_settings()
         self.service = NodeService(self.config, store=self.store)
+        self.service.clock = lambda: NOW
 
     def pool_dict(self):
         return self.store.settings["pools"][0]
@@ -109,7 +113,7 @@ class TestSignals(unittest.TestCase):
     def test_all_five_types_binary_rule_and_gaps(self):
         result = compute_signals(
             watchlist=WATCHLIST, wishlist=WISHLIST, albums=ALBUMS,
-            release_to_group={REL_A: RG_A}, now=NOW,
+            release_to_group={REL_A: RG_A}, week_start=W43_START,
         )
         self.assertEqual(result["week"], "2026-W43")
         keys = sorted(f"{s['type']}:{s['mbid']}" for s in result["signals"])
@@ -130,7 +134,7 @@ class TestSignals(unittest.TestCase):
                   "musicbrainz_release_id": REL_A}]
         result = compute_signals(
             watchlist=[], wishlist=[], albums=fresh,
-            release_to_group={REL_A: RG_A}, now=NOW,
+            release_to_group={REL_A: RG_A}, week_start=W43_START,
         )
         keys = [f"{s['type']}:{s['mbid']}" for s in result["signals"]]
         # Landed this week: recent_add fires; import_keep must not (the
@@ -153,7 +157,7 @@ class TestDownloadSignals(unittest.TestCase):
     def test_grab_fires_for_regrab_of_an_owned_album(self):
         result = compute_signals(
             watchlist=[], wishlist=[], albums=OLD_ALBUM,
-            release_to_group={REL_A: RG_A}, now=NOW, downloads=[DL_ROW],
+            release_to_group={REL_A: RG_A}, week_start=W43_START, downloads=[DL_ROW],
         )
         keys = self._keys(result)
         self.assertIn(f"download_grab:{RG_A}", keys)
@@ -165,7 +169,7 @@ class TestDownloadSignals(unittest.TestCase):
                   "musicbrainz_release_id": REL_A}]
         result = compute_signals(
             watchlist=[], wishlist=[], albums=fresh,
-            release_to_group={REL_A: RG_A}, now=NOW, downloads=[DL_ROW],
+            release_to_group={REL_A: RG_A}, week_start=W43_START, downloads=[DL_ROW],
         )
         keys = self._keys(result)
         self.assertIn(f"recent_add:{RG_A}", keys)
@@ -175,14 +179,14 @@ class TestDownloadSignals(unittest.TestCase):
         row = {**DL_ROW, "completed_since": 0}
         result = compute_signals(
             watchlist=[], wishlist=[], albums=OLD_ALBUM,
-            release_to_group={REL_A: RG_A}, now=NOW, downloads=[row],
+            release_to_group={REL_A: RG_A}, week_start=W43_START, downloads=[row],
         )
         self.assertNotIn(f"download_grab:{RG_A}", self._keys(result))
 
     def _churn(self, **overrides):
         kwargs = {
             "watchlist": [], "wishlist": [], "albums": [],
-            "release_to_group": {REL_A: RG_A}, "now": NOW,
+            "release_to_group": {REL_A: RG_A}, "week_start": W43_START,
             "downloaded_groups": {RG_A: {"first_downloaded_at": "2026-09-01 10:00:00",
                                           "last_downloaded_at": "2026-09-01 10:00:00"}},
             "library_groups_prev": set(), "library_groups_prev2": {RG_A},
@@ -229,7 +233,8 @@ class TestDownloadFlow(ServiceCase):
         self.assertEqual(report["diagnostics"]["downloads_available"], True)
         history = self.store.state["downloaded_groups"]
         self.assertEqual(history[RG_A]["first_downloaded_at"], "2026-09-01 10:00:00")
-        self.assertIn(RG_A, self.store.state["library_group_snapshots"][0])
+        self.assertEqual(self.store.state["library_group_snapshots"][0]["week"], "2026-W43")
+        self.assertIn(RG_A, self.store.state["library_group_snapshots"][0]["groups"])
 
 
 class TestChurnFlow(ServiceCase):
@@ -242,7 +247,10 @@ class TestChurnFlow(ServiceCase):
             RG_A: {"first_downloaded_at": "2026-09-01 10:00:00",
                    "last_downloaded_at": "2026-09-01 10:00:00"},
         }
-        self.store.state["library_group_snapshots"] = [[], [RG_A]]
+        self.store.state["library_group_snapshots"] = [
+            {"week": "2026-W42", "groups": []},
+            {"week": "2026-W41", "groups": [RG_A]},
+        ]
         self.store.save_state()
         # The service was built in setUp from the same store; state is
         # shared, so the seeded history is what compute_report reads.
@@ -431,6 +439,7 @@ class TestUiFlows(unittest.TestCase):
         config = make_config(self.tmp.name, musicbrainz_base_url="http://127.0.0.1:1/ws/2")
         self.store = Store(self.tmp.name)
         self.service = NodeService(config, store=self.store)
+        self.service.clock = lambda: NOW
         from metasync_node.app import create_app
         self.client = create_app(self.service).test_client()
 
@@ -579,7 +588,7 @@ class TestExchangeFlow(ServiceCase):
 
     def test_exchange_then_token_report_whoami_and_index(self):
         client = self.service.pool_client(self.pool_dict())
-        response = client.post_report({"week": "2026-W43", "token": "t", "signals": []})
+        response = client.post_report({"week": "2026-W43", "token": "t", "signals": [{"type": "recent_add", "mbid": RG_A}]})
         self.assertEqual(response["accepted"], 1)
         self.assertEqual(self.pool.exchange_calls, 1)
         self.assertEqual(len(self.pool.reports), 1)
@@ -615,9 +624,9 @@ class TestExchangeFlow(ServiceCase):
 
     def test_token_401_clears_and_reexchanges_once(self):
         client = self.service.pool_client(self.pool_dict())
-        client.post_report({"week": "2026-W43", "token": "t", "signals": []})
+        client.post_report({"week": "2026-W43", "token": "t1", "signals": []})
         self.pool.expire_tokens()
-        client.post_report({"week": "2026-W43", "token": "t", "signals": []})
+        client.post_report({"week": "2026-W43", "token": "t2", "signals": []})
         self.assertEqual(self.pool.exchange_calls, 2)
         self.assertEqual(len(self.pool.reports), 2)
 
@@ -991,6 +1000,7 @@ class TestReportJobUi(unittest.TestCase):
         self.store.settings["dry_run"] = False
         self.store.save_settings()
         self.service = NodeService(config, store=self.store)
+        self.service.clock = lambda: NOW
         from metasync_node.app import create_app
         self.client = create_app(self.service).test_client()
         self.client.post("/setup", data={"password": "test-password", "confirm": "test-password"})
