@@ -48,22 +48,26 @@ a fifth only when the user has turned listening signals on:
 
 Notes that matter for review:
 
-- The wishlist read is the weak one **by SoulSync's current API
-  shape**: wishlist rows carry no top-level MusicBrainz field, so an
-  item whose `track_data` has no release-group MBID under one of the
-  three keys above is **skipped and counted in diagnostics**
-  (`node/metasync_node/signals.py`, GAP-1). Spotify-shaped wishlist
-  data has none today, so in practice most wishlist items contribute
-  nothing until SoulSync exposes the ID.
+- Wishlist rows carry a release-group MBID in
+  `musicbrainz_release_group_id` once SoulSync's MusicBrainz worker has
+  matched the row's album in the background (SoulSync branch
+  `metasync/release-group-enrichment`). Until then, or on an older
+  SoulSync, an item contributes only if its `track_data` has a
+  release-group MBID under one of the three keys above. Anything else is
+  **skipped and counted in diagnostics** (`node/metasync_node/signals.py`,
+  GAP-1).
+- Library albums likewise carry `musicbrainz_release_group_id` from the
+  same worker. The node uses it as-is and asks MusicBrainz (§4) only
+  about releases SoulSync has no group for yet.
 - `download-activity` is computed **inside SoulSync** (it joins its
   `track_downloads` ledger to library albums by track file path) and
   returns IDs + counts only — SoulSync PR #1848. A SoulSync build
   without it answers 404; the node then computes **no** download
   signals that run and flags `downloads_available: false` in
   diagnostics. The report itself never fails over this endpoint.
-- SoulSync album rows carry a MusicBrainz **release** ID, never a
-  release-**group** ID. Bridging release → group is the node's job
-  (§4). SoulSync is never asked to do it.
+- SoulSync album rows carry a MusicBrainz **release** ID and, once
+  enriched, its release-**group** ID. The node bridges release → group
+  itself (§4) only where SoulSync has no group yet.
 - Page caps: reads stop at `library_max_pages` (default 5000 pages);
   a capped read is flagged (`albums_truncated` / `wishlist_truncated`)
   in diagnostics, and a truncated library read disables churn for
