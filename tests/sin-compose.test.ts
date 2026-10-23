@@ -67,6 +67,43 @@ describe("selectChartSpecs", () => {
   });
 });
 
+describe("download signals in scoring", () => {
+  function downloadRows(): AggregateRow[] {
+    const out: AggregateRow[] = [];
+    const add = (signal: AggregateRow["signal"], mbid: string, nodeCount: number) =>
+      out.push({ week: W, signal, mbid, nodeCount });
+    // Trending: RG(10) wishlist 20 + grab 18 must count 20 (max, not 38);
+    // RG(11) grab-only 22 must beat it.
+    add("wishlist_add", RG(10), 20);
+    add("download_grab", RG(10), 18);
+    add("download_grab", RG(11), 22);
+    // Loved & Kept: net of churn; churn >= keeps drops out entirely.
+    add("import_keep", RG(12), 30);
+    add("download_churn", RG(12), 12);
+    add("import_keep", RG(13), 20);
+    add("download_churn", RG(13), 20);
+    add("import_keep", RG(14), 25);
+    return out;
+  }
+
+  test("trending heat is max(wishlist, grab), never the sum", () => {
+    const specs = selectChartSpecs(downloadRows(), W, [], null);
+    const trending = specs.find((s) => s.key === "trending")!;
+    assert.equal(trending.items[0]!.mbid, RG(11));
+    assert.equal(trending.items[0]!.score, 22);
+    assert.equal(trending.items.find((i) => i.mbid === RG(10))!.score, 20);
+  });
+
+  test("loved-and-kept ranks by keeps net of churn and drops net-negative albums", () => {
+    const specs = selectChartSpecs(downloadRows(), W, [], null);
+    const loved = specs.find((s) => s.key === "loved-and-kept")!;
+    assert.equal(loved.items[0]!.mbid, RG(14)); // 25 keeps, no churn
+    assert.equal(loved.items[0]!.score, 25);
+    assert.equal(loved.items.find((i) => i.mbid === RG(12))!.score, 18); // 30 - 12
+    assert.ok(!loved.items.some((i) => i.mbid === RG(13))); // 20 - 20 drops out
+  });
+});
+
 describe("buildEditions", () => {
   const base: ChartSpec = {
     key: "trending",

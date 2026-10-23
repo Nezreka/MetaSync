@@ -7,7 +7,7 @@
  * Privacy invariants baked in here (see README / SIDECAR-ARCHITECTURE-SKETCH.md §2):
  * - Signals are keyed ONLY by MusicBrainz IDs. SoulID is NOT used by SIN —
  *   SoulID belongs exclusively to the metadata MetaSync service.
- * - Exactly five signal types exist. Anything else is rejected.
+ * - Exactly seven signal types exist. Anything else is rejected.
  * - Contributions are binary: one node can contribute at most 1 per
  *   (week, signal, MBID), enforced by dedupe on the rotating weekly token.
  * - Nothing is published below the k-anonymity threshold.
@@ -36,13 +36,15 @@ export const MAX_REPORT_BODY_BYTES = 16 * 1024 * 1024;
  *  largest real libraries, not the average one. */
 export const MAX_SIGNALS_PER_REPORT = 100_000;
 
-/** The only five signal types SIN accepts. */
+/** The only seven signal types SIN accepts (see DESIGN-DOWNLOAD-SIGNALS.md). */
 export const SIGNAL_TYPES = [
   "watchlist_add",
   "wishlist_add",
   "import_keep",
   "hunt_demand",
   "recent_add",
+  "download_grab",
+  "download_churn",
 ] as const;
 
 export type SignalType = (typeof SIGNAL_TYPES)[number];
@@ -54,6 +56,8 @@ export const SIGNAL_MBID_KIND: Record<SignalType, "artist" | "release-group"> = 
   import_keep: "release-group",
   hunt_demand: "release-group",
   recent_add: "release-group",
+  download_grab: "release-group",
+  download_churn: "release-group",
 };
 
 export interface SignalInput {
@@ -302,40 +306,72 @@ export interface TrendingItem {
   reason: string;
 }
 
-const ADD_SIGNALS: readonly SignalType[] = ["watchlist_add", "wishlist_add"];
+const HEAT_SIGNALS: readonly SignalType[] = [
+  "watchlist_add",
+  "wishlist_add",
+  "download_grab",
+];
 
 /**
- * Trending rail: per-MBID "adds" (watchlist_add + wishlist_add counts) for
- * `week`, scored against the same MBID's adds in the prior weeks present in
- * `aggregates` (callers should pass the prior 3 weeks; if `priorWeeks` is
- * given, only those weeks count as baseline). Aggregates are already
- * k-filtered, so everything here is publishable.
+ * One week's heat for one MBID: watchlist adds plus the LARGER of wishlist
+ * adds and download grabs (DESIGN-DOWNLOAD-SIGNALS.md §6). A node that
+ * wanted an album and then grabbed it is one node's heat, not two; grabs
+ * from non-wishlisters still count in full.
+ */
+function heatComponents(
+  aggregates: AggregateRow[],
+): Map<string, Map<string, { watch: number; wish: number; grab: number }>> {
+  const out = new Map<
+    string,
+    Map<string, { watch: number; wish: number; grab: number }>
+  >();
+  for (const a of aggregates) {
+    if (!HEAT_SIGNALS.includes(a.signal)) continue;
+    let byWeek = out.get(a.mbid);
+    if (!byWeek) {
+      byWeek = new Map();
+      out.set(a.mbid, byWeek);
+    }
+    const c = byWeek.get(a.week) ?? { watch: 0, wish: 0, grab: 0 };
+    if (a.signal === "watchlist_add") c.watch += a.nodeCount;
+    else if (a.signal === "wishlist_add") c.wish += a.nodeCount;
+    else c.grab += a.nodeCount;
+    byWeek.set(a.week, c);
+  }
+  return out;
+}
+
+function heatOf(
+  components: Map<string, Map<string, { watch: number; wish: number; grab: number }>>,
+  mbid: string,
+  week: string,
+): number {
+  const c = components.get(mbid)?.get(week);
+  return c ? c.watch + Math.max(c.wish, c.grab) : 0;
+}
+
+/**
+ * Trending rail: per-MBID heat (see heatOf) for `week`, scored against the
+ * same MBID's heat in the prior weeks present in `aggregates` (callers
+ * should pass the prior 3 weeks; if `priorWeeks` is given, only those
+ * weeks count as baseline). Aggregates are already k-filtered, so
+ * everything here is publishable.
  */
 export function computeTrending(
   aggregates: AggregateRow[],
   week: string,
   priorWeeks?: string[],
 ): TrendingItem[] {
-  const current = new Map<string, number>();
-  const prior = new Map<string, Map<string, number>>(); // mbid -> week -> adds
-  for (const a of aggregates) {
-    if (!ADD_SIGNALS.includes(a.signal)) continue;
-    if (a.week === week) {
-      current.set(a.mbid, (current.get(a.mbid) ?? 0) + a.nodeCount);
-    } else if (!priorWeeks || priorWeeks.includes(a.week)) {
-      let byWeek = prior.get(a.mbid);
-      if (!byWeek) {
-        byWeek = new Map<string, number>();
-        prior.set(a.mbid, byWeek);
-      }
-      byWeek.set(a.week, (byWeek.get(a.week) ?? 0) + a.nodeCount);
-    }
-  }
+  const components = heatComponents(aggregates);
   const items: TrendingItem[] = [];
-  for (const [mbid, adds] of current) {
+  for (const [mbid, byWeek] of components) {
+    const adds = heatOf(components, mbid, week);
+    if (adds <= 0) continue;
     const priorCounts = priorWeeks
-      ? priorWeeks.map((w) => prior.get(mbid)?.get(w) ?? 0)
-      : [...(prior.get(mbid)?.values() ?? [])];
+      ? priorWeeks.map((w) => heatOf(components, mbid, w))
+      : [...byWeek.keys()]
+          .filter((w) => w !== week)
+          .map((w) => heatOf(components, mbid, w));
     items.push({
       mbid,
       addsThisWeek: adds,
@@ -1231,6 +1267,20 @@ function sumsFor(
   return out;
 }
 
+/**
+ * Per-MBID heat for one week without the watchlist component (release-group
+ * charts): max(wishlist_add, download_grab). See heatOf for the rationale.
+ */
+function grabHeatSums(aggregates: AggregateRow[], week: string): Map<string, number> {
+  const wish = sumsFor(aggregates, week, ["wishlist_add"]);
+  const grab = sumsFor(aggregates, week, ["download_grab"]);
+  const out = new Map<string, number>();
+  for (const mbid of new Set([...wish.keys(), ...grab.keys()])) {
+    out.set(mbid, Math.max(wish.get(mbid) ?? 0, grab.get(mbid) ?? 0));
+  }
+  return out;
+}
+
 function topItems(
   sums: Map<string, number>,
   kind: ChartItem["kind"],
@@ -1244,7 +1294,8 @@ function topItems(
 
 /**
  * Build the week's flagship chart specs from k-filtered aggregates.
- * Trending here ranks release groups by wishlist adds scored against
+ * Trending here ranks release groups by heat (max of wishlist adds and
+ * download grabs) scored against
  * prior weeks (artists chart separately as Breakouts); the public index
  * blends kinds for display, a playlist cannot.
  */
@@ -1267,10 +1318,22 @@ export function selectChartSpecs(
       .map((i) => ({ mbid: i.mbid, kind: "release-group" as const, score: i.nodeCount })),
   );
 
+  // Loved & Kept: keeps net of churn. download_churn aggregates only
+  // exist for albums at/above k within the toggle-on population, so
+  // subtracting them never mixes populations; where no churn aggregate
+  // exists there is no dampening. Albums whose churn meets or beats
+  // their keeps drop out. Churn is a ranking input only — never shown.
+  const keeps = sumsFor(aggregates, week, ["import_keep"]);
+  const churn = sumsFor(aggregates, week, ["download_churn"]);
+  const netKeeps = new Map<string, number>();
+  for (const [mbid, keep] of keeps) {
+    const net = keep - (churn.get(mbid) ?? 0);
+    if (net > 0) netKeeps.set(mbid, net);
+  }
   push(
     "loved-and-kept",
     "Loved & Kept",
-    topItems(sumsFor(aggregates, week, ["import_keep"]), "release-group", CHART_ALBUM_LIMIT),
+    topItems(netKeeps, "release-group", CHART_ALBUM_LIMIT),
   );
 
   push(
@@ -1279,18 +1342,20 @@ export function selectChartSpecs(
     topItems(sumsFor(aggregates, week, ["recent_add"]), "release-group", CHART_ALBUM_LIMIT),
   );
 
-  // Trending: this week's wishlist adds per release group, scored against
-  // the same group's adds in each prior week (trendingScore).
-  const adds = sumsFor(aggregates, week, ["wishlist_add"]);
+  // Trending: this week's heat per release group (max of wishlist adds
+  // and download grabs — see grabHeatSums), scored against the same
+  // group's heat in each prior week (trendingScore).
+  const adds = grabHeatSums(aggregates, week);
   const priorByMbid = new Map<string, Map<string, number>>();
-  for (const a of aggregates) {
-    if (a.signal !== "wishlist_add" || !priorWeeks.includes(a.week)) continue;
-    let byWeek = priorByMbid.get(a.mbid);
-    if (!byWeek) {
-      byWeek = new Map<string, number>();
-      priorByMbid.set(a.mbid, byWeek);
+  for (const w of priorWeeks) {
+    for (const [mbid, count] of grabHeatSums(aggregates, w)) {
+      let byWeek = priorByMbid.get(mbid);
+      if (!byWeek) {
+        byWeek = new Map<string, number>();
+        priorByMbid.set(mbid, byWeek);
+      }
+      byWeek.set(w, count);
     }
-    byWeek.set(a.week, (byWeek.get(a.week) ?? 0) + a.nodeCount);
   }
   const trending = [...adds.entries()]
     .map(([mbid, count]) => ({

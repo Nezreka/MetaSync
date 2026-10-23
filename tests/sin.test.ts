@@ -125,6 +125,17 @@ describe("validation", () => {
     );
   });
 
+  test("accepts download_grab and download_churn signals", () => {
+    for (const type of ["download_grab", "download_churn"] as const) {
+      const res = validateReport({
+        week: WEEK,
+        token: TOKEN_1,
+        signals: [{ type, mbid: MBID_A }],
+      });
+      assert.equal(res.ok, true, `${type} should validate`);
+    }
+  });
+
   test("rejects empty and oversized signal arrays", () => {
     assert.equal(
       validateReport({ week: WEEK, token: TOKEN_1, signals: [] }).ok,
