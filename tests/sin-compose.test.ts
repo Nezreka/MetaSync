@@ -126,7 +126,7 @@ describe("buildEditions", () => {
   const base: ChartSpec = {
     key: "trending",
     name: "Trending in SoulSync",
-    items: Array.from({ length: 9 }, (_, i) => ({
+    items: Array.from({ length: 10 }, (_, i) => ({
       mbid: RG(i + 1),
       kind: "release-group" as const,
       score: 100 - i,
@@ -134,14 +134,31 @@ describe("buildEditions", () => {
   };
 
   test("genre and decade editions need 8+ items sharing the tag", () => {
+    // nine of the ten share both tags; the tenth is jazz from 2001
     const meta = new Map(
-      base.items.map((i) => [i.mbid, { genre: "rock", year: 1994 }]),
+      base.items.map((i, idx) => [i.mbid, idx < 9 ? { genre: "rock", year: 1994 } : { genre: "jazz", year: 2001 }]),
     );
     const editions = buildEditions([base], meta);
     const keys = editions.map((e) => e.key).sort();
     assert.deepEqual(keys, ["trending-1990s", "trending-rock"]);
     assert.equal(editions.find((e) => e.key === "trending-rock")!.name, "Trending: Rock");
     assert.equal(editions.find((e) => e.key === "trending-1990s")!.items.length, 9);
+  });
+
+  test("an edition that would be its whole chart again is skipped", () => {
+    // every Just Landed album is from the 2020s: "Just Landed: 2020s" is noise
+    const landed: ChartSpec = { ...base, key: "just-landed", name: "Just Landed" };
+    const meta = new Map(base.items.map((i) => [i.mbid, { genre: "pop", year: 2026 }]));
+    assert.deepEqual(buildEditions([landed], meta), []);
+  });
+
+  test("just-landed gets editions too", () => {
+    const landed: ChartSpec = { ...base, key: "just-landed", name: "Just Landed" };
+    const meta = new Map(
+      base.items.map((i, idx) => [i.mbid, { genre: idx < 8 ? "k-pop" : "metal", year: 2026 }]),
+    );
+    const editions = buildEditions([landed], meta);
+    assert.deepEqual(editions.map((e) => [e.key, e.name]), [["just-landed-k-pop", "Just Landed: K-Pop"]]);
   });
 
   test("thin editions are not built", () => {
@@ -247,15 +264,16 @@ describe("popular tracks per album", () => {
       [rec(6), { listens: 30, users: 20 }],
       [rec(7), { listens: 0, users: 0 }], // no data: never picked
     ]);
+    // five picks are cached per album; a playlist uses the top two
     assert.deepEqual(pickTopTrackIds(album(8).tracks, pop), [rec(3), rec(2), rec(4), rec(5), rec(6)]);
-    assert.equal(CHART_TRACKS_PER_ALBUM, 5);
+    assert.equal(CHART_TRACKS_PER_ALBUM, 2);
   });
 
-  test("no popularity data: the album's first five tracks, in order", () => {
+  test("no popularity data: the album's first two tracks, in order", () => {
     assert.deepEqual(pickTopTrackIds(album(8).tracks, new Map()), []);
-    assert.deepEqual(chartTracksFor(album(8, [])).map((t) => t.id), [1, 2, 3, 4, 5].map(rec));
-    assert.deepEqual(chartTracksFor(album(8)).map((t) => t.id), [1, 2, 3, 4, 5].map(rec));
-    assert.equal(chartTracksFor(album(3)).length, 3); // a short album gives what it has
+    assert.deepEqual(chartTracksFor(album(8, [])).map((t) => t.id), [1, 2].map(rec));
+    assert.deepEqual(chartTracksFor(album(8)).map((t) => t.id), [1, 2].map(rec));
+    assert.equal(chartTracksFor(album(1)).length, 1); // a one-track release gives what it has
   });
 
   test("picked tracks come out in popularity order", () => {

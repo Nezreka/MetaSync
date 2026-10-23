@@ -43,7 +43,7 @@
  * Signals are keyed by MusicBrainz IDs only. SoulID is NOT used by SIN.
  */
 import { timingSafeEqual } from "node:crypto";
-import { and, desc, eq, gte, inArray, isNotNull, isNull, lt, max, or, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNotNull, isNull, lt, max, notInArray, or, sql } from "drizzle-orm";
 import { Hono } from "hono";
 import { getDb, type SinDb } from "./db.ts";
 import {
@@ -100,8 +100,12 @@ import {
 import {
   buildEditions,
   CHART_MAX_TRACKS,
-  chartDisplayName,
   COUNT_RETENTION_WEEKS,
+  interleaveByRank,
+  sourcedName,
+  TOP_TRACKS_KEY,
+  TOP_TRACKS_NAME,
+  topTracksFromRecordings,
   fillFromPublic,
   PUBLIC_FILL_CHARTS,
   type PublicFillKey,
@@ -1280,16 +1284,17 @@ app.post("/v1/compose", async (c) => {
       meta.set(mbid, { genre: bundle.genre, year: bundle.year });
     }
   }
-  // Genre/decade editions come from network items only: an edition is a
-  // statement about SoulSync's collectors.
-  const allSpecs: ChartSpec[] = [...specs, ...buildEditions(networkSpecs, meta)];
+  // Genre/decade editions of Trending, Most Wanted and Just Landed. An
+  // edition built from public fill items carries the same honest name as
+  // its base ("Trending: Rock · from ListenBrainz").
+  const allSpecs: ChartSpec[] = [...specs, ...buildEditions(specs, meta)];
 
   const published: string[] = [];
   const pending: Record<string, number> = {};
   const now = new Date();
   for (const spec of allSpecs) {
-    const tracks: PlaylistTrack[] = [];
-    const seen = new Set<string>();
+    // Each item's tracks, best first; laid out round by round below.
+    const perItem: PlaylistTrack[][] = [];
     let missing = 0;
     let networkIncluded = 0;
     let publicIncluded = 0;
@@ -1312,25 +1317,21 @@ app.post("/v1/compose", async (c) => {
         missing += 1;
         continue;
       }
-      for (const g of groups) {
-        for (const t of chartTracksFor(g)) {
-          if (seen.has(t.id)) continue;
-          seen.add(t.id);
-          tracks.push(t);
-        }
-      }
+      // An artist item (Breakouts) interleaves its albums' picks too.
+      perItem.push(interleaveByRank(groups.map((g) => chartTracksFor(g))));
       if (item.source === "public") publicIncluded += 1;
       else networkIncluded += 1;
     }
-    if (missing > 0 || tracks.length === 0) {
+    const capped = interleaveByRank(perItem, CHART_MAX_TRACKS);
+    if (missing > 0 || capped.length === 0) {
       pending[spec.key] = missing;
       continue;
     }
-    const capped = tracks.slice(0, CHART_MAX_TRACKS);
-    const name =
-      spec.key in PUBLIC_FILL_CHARTS
-        ? chartDisplayName(spec.key as PublicFillKey, networkIncluded, publicIncluded)
-        : spec.name;
+    const name = sourcedName(
+      spec.key in PUBLIC_FILL_CHARTS ? PUBLIC_FILL_CHARTS[spec.key as PublicFillKey] : spec.name,
+      networkIncluded,
+      publicIncluded,
+    );
     await db
       .insert(canonicalPlaylists)
       .values({ week, key: spec.key, name, tracks: capped, publishedAt: now })
@@ -1339,6 +1340,32 @@ app.post("/v1/compose", async (c) => {
         set: { name, tracks: capped, publishedAt: now },
       });
     published.push(spec.key);
+  }
+
+  // Top Tracks · from ListenBrainz: the public weekly song chart, no
+  // lookups needed (the rows carry titles, artists and covers).
+  const topTracks = topTracksFromRecordings(seeds.recordings);
+  if (topTracks.length > 0) {
+    await db
+      .insert(canonicalPlaylists)
+      .values({ week, key: TOP_TRACKS_KEY, name: TOP_TRACKS_NAME, tracks: topTracks, publishedAt: now })
+      .onConflictDoUpdate({
+        target: [canonicalPlaylists.week, canonicalPlaylists.key],
+        set: { name: TOP_TRACKS_NAME, tracks: topTracks, publishedAt: now },
+      });
+    published.push(TOP_TRACKS_KEY);
+  }
+
+  // A chart this week's pass no longer produces (an edition whose genre
+  // fell under 8 albums, say) is withdrawn rather than served stale.
+  // Pending charts keep their last good version until they resolve, and a
+  // pass that produced nothing at all (ListenBrainz down on an empty
+  // network) withdraws nothing: it says nothing about what is stale.
+  const keep = [...published, ...Object.keys(pending)];
+  if (keep.length > 0) {
+    await db
+      .delete(canonicalPlaylists)
+      .where(and(eq(canonicalPlaylists.week, week), notInArray(canonicalPlaylists.key, keep)));
   }
 
   return c.json({ week, published, pending, resolved: bundles.size, fetched });

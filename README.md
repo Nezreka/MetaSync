@@ -133,12 +133,15 @@ SoulSync**, **Most Wanted**, **Breakout Artists**, **Loved & Kept**,
 signal), plus genre and decade editions when enough
 charted albums share a tag. The shared work happens once, on the server:
 only charted albums get looked up on MusicBrainz (track lists, genre,
-year), and each contributes its 5 most popular tracks by ListenBrainz's
+year), and each contributes its 2 most popular tracks by ListenBrainz's
 public listening statistics — SIN itself never collects track data.
 Everything is cached for everyone. While the network is young, Trending
 and Just Landed fill their empty slots from ListenBrainz's public weekly
 charts. The playlist name says so ("Trending · from ListenBrainz"), and
-network data replaces public data automatically as installs report.
+network data replaces public data automatically as installs report. Playlists are 50 tracks, led by every album's best song, and come in
+genre and decade editions when enough charted albums share a tag. There
+is also **Top Tracks · from ListenBrainz**, ListenBrainz's public weekly
+song chart with at most 2 songs per artist.
 
 Your node pulls the finished charts, and SoulSync fetches them from your
 node once a day, matches every track in the background, and shows the
