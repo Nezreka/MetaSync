@@ -18,7 +18,7 @@ from metasync_node.signals import (  # noqa: E402
     BULK_EVENT_LIMIT, HUNT_DEMAND_LIMIT, LISTEN_LIMIT, compute_signals,
 )
 from metasync_node.store import Store  # noqa: E402
-from tests.mocks import ALBUMS, RG_A, RG_B, REL_A, REL_B, MockMusicBrainz, MockPool, MockSoulSync  # noqa: E402
+from tests.mocks import browser_client, ALBUMS, RG_A, RG_B, REL_A, REL_B, MockMusicBrainz, MockPool, MockSoulSync  # noqa: E402
 
 NOW = datetime(2026, 10, 26, 12, 0, tzinfo=timezone.utc)  # Monday of 2026-W44
 W43_START = datetime(2026, 10, 19, tzinfo=timezone.utc)
@@ -279,12 +279,78 @@ class TestLoginThrottle(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         service = NodeService(Config(state_dir=tmp.name), store=Store(tmp.name))
         from metasync_node.app import create_app
-        client = create_app(service).test_client()
+        client = browser_client(create_app(service))
         client.post("/setup", data={"password": "right-password", "confirm": "right-password"})
         client.get("/logout")
         for _ in range(5):
             self.assertEqual(client.post("/login", data={"password": "wrong"}).status_code, 200)
         self.assertEqual(client.post("/login", data={"password": "right-password"}).status_code, 429)
+
+
+class TestCsrf(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.service = NodeService(Config(state_dir=tmp.name), store=Store(tmp.name))
+        from metasync_node.app import create_app
+        self.app = create_app(self.service)
+        self.browser = browser_client(self.app)
+        self.browser.post("/setup", data={"password": "right-password", "confirm": "right-password"})
+
+    def _plain_client(self):
+        from flask.testing import FlaskClient
+
+        return FlaskClient(self.app, self.app.response_class, use_cookies=True)
+
+    def test_a_form_post_without_the_pages_token_is_refused(self):
+        # Same browser, logged in, but the POST did not come from a page
+        # this UI rendered (no token, or someone else's token).
+        with self.browser.session_transaction() as sess:
+            token = sess["csrf_token"]
+        raw = self._plain_client()
+        with raw.session_transaction() as sess:
+            sess["ui_admin"] = True
+            sess["csrf_token"] = token
+        self.assertEqual(raw.post("/actions/dry-run", data={"dry_run": ""}).status_code, 400)
+        self.assertEqual(raw.post("/actions/dry-run", data={"csrf_token": "forged"}).status_code, 400)
+        self.assertTrue(self.service.dry_run)  # unchanged
+        self.assertEqual(raw.post("/actions/dry-run", data={"csrf_token": token}).status_code, 302)
+        self.assertFalse(self.service.dry_run)
+
+    def test_every_rendered_form_carries_the_token(self):
+        for page in ("/", "/pools", "/settings/soulsync"):
+            html = self.browser.get(page).data.decode()
+            self.assertEqual(html.count("<form"), html.count('name="csrf_token"'), page)
+
+    def test_machine_routes_need_no_token(self):
+        res = self._plain_client().post("/local/pair/request")
+        self.assertEqual(res.status_code, 200)
+        # ...but the dashboard's approve button does.
+        res = self._plain_client().post("/local/pair/confirm", data={"session_id": "x"})
+        self.assertEqual(res.status_code, 400)
+
+
+class TestServedReleaseGroups(unittest.TestCase):
+    def test_soulsync_served_groups_skip_musicbrainz(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        albums = [{"id": 1, "created_at": "2026-10-21T09:00:00",
+                   "musicbrainz_release_id": REL_B, "musicbrainz_release_group_id": RG_B}]
+        wishlist = [{"id": 1, "track_data": {"name": "x"}, "date_added": "2026-10-20T09:00:00",
+                     "musicbrainz_release_group_id": RG_A}]
+        soulsync = MockSoulSync(albums=albums, wishlist=wishlist, watchlist=[])
+        mb = MockMusicBrainz()
+        self.addCleanup(soulsync.close)
+        self.addCleanup(mb.close)
+        store = Store(tmp.name)
+        store.settings["soulsync"] = {"url": soulsync.url, "api_key": "sk_test"}
+        service = NodeService(Config(state_dir=tmp.name, musicbrainz_min_interval_s=0.0,
+                                     musicbrainz_base_url=mb.url), store=store)
+        report = service.compute_report(NOW)
+        keys = _types(report)
+        self.assertIn(f"recent_add:{RG_B}", keys)
+        self.assertIn(f"wishlist_add:{RG_A}", keys)
+        self.assertEqual(mb.hits, [])  # nothing asked of MusicBrainz
 
 
 if __name__ == "__main__":

@@ -8,16 +8,23 @@ Docker healthchecks work.
 """
 from __future__ import annotations
 
+import hmac
 import json
 import secrets
 import time
 from functools import wraps
 from typing import Any
 
-from flask import Flask, flash, redirect, render_template, request, session, url_for
+from flask import Flask, abort, flash, redirect, render_template, request, session, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from .service import NodeService, PairingError, PairingRateLimited, check_pool_url
+
+# POST routes SoulSync calls (no browser session, no form): CSRF-exempt.
+MACHINE_POST_PATHS = frozenset({
+    "/local/pair/request", "/local/pair/claim",
+    "/local/handoff/pool-key", "/local/disconnect",
+})
 
 LOGIN_MAX_FAILURES = 5
 LOGIN_WINDOW_S = 300
@@ -30,6 +37,34 @@ def create_app(service: NodeService) -> Flask:
     app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
     store = service.store
+
+    # CSRF: every browser form POST carries the session's token. The
+    # session cookie alone is not enough — SameSite=Lax still sends it on
+    # requests from any page on the same site, and SoulSync (port 8000) is
+    # the same site as this UI (port 8790): a page there, or any other app
+    # on this host, could otherwise post to /pools or /actions/dry-run as
+    # the logged-in admin. The machine-to-machine routes SoulSync calls are
+    # exempt: they authenticate with the local API key (or a pairing
+    # code), never with the cookie. /local/pair/confirm is NOT one of them:
+    # it is the dashboard's approve button.
+    def csrf_token() -> str:
+        token = session.get("csrf_token")
+        if not token:
+            token = secrets.token_urlsafe(32)
+            session["csrf_token"] = token
+        return token
+
+    app.jinja_env.globals["csrf_token"] = csrf_token
+
+    @app.before_request
+    def check_csrf():
+        if request.method != "POST" or request.path in MACHINE_POST_PATHS:
+            return None
+        sent = request.form.get("csrf_token") or request.headers.get("X-CSRF-Token") or ""
+        expected = session.get("csrf_token") or ""
+        if not expected or not hmac.compare_digest(str(sent), str(expected)):
+            abort(400, description="This form expired or did not come from this page. Reload and try again.")
+        return None
 
     def password_set() -> bool:
         return bool(store.settings.get("ui_password_hash"))

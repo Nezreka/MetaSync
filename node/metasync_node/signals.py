@@ -5,18 +5,18 @@ Inputs are the REAL v1 response shapes verified on SoulSync dev bd840487
 item is skipped and counted in diagnostics["gaps"] — never invented. The
 gaps (also in DESIGN-NODE.md):
 
-GAP-1 (wishlist MBID): serialize_wishlist_track has NO MusicBrainz field.
-  A wishlist item only contributes wishlist_add / hunt_demand when its raw
-  track_data carries an explicit release-group MBID under one of
-  WISHLIST_RG_MBID_KEYS. Spotify-shaped track_data (the common case) has
-  none, so most wishlist items are skipped until SoulSync core exposes a
-  release-group MBID on wishlist rows.
+GAP-1 (wishlist MBID): closed by SoulSync's metasync/release-group-enrichment
+  branch — its MusicBrainz worker matches each wishlist row's album in the
+  background and serves ``musicbrainz_release_group_id`` on the row. Until
+  that runs (or on an older SoulSync) a row only contributes when its raw
+  track_data carries a release-group MBID under one of
+  WISHLIST_RG_MBID_KEYS; others are skipped and counted.
 
-GAP-2 (album release-group): library albums expose musicbrainz_release_id
-  (a RELEASE mbid), while SIN keys album signals by RELEASE-GROUP mbid.
-  The caller resolves release -> release-group through MusicBrainz
-  (deterministic lookup) and passes the map in; albums whose release id is
-  missing or unresolved are skipped.
+GAP-2 (album release-group): SIN keys album signals by RELEASE-GROUP mbid.
+  SoulSync now serves ``musicbrainz_release_group_id`` on library albums
+  (same branch as GAP-1); the caller takes those as-is and only asks
+  MusicBrainz for releases SoulSync has no group for yet. Albums whose
+  release id is missing or unresolved are skipped.
 
 GAP-3 (import date): an album's created_at is when its row entered the
   library DB (the recently-added endpoint orders by it), so it is the
@@ -88,6 +88,12 @@ def is_uuid_shape(value: Any) -> bool:
 
 
 def wishlist_release_group_mbid(track: dict[str, Any]) -> str | None:
+    # SoulSync's MusicBrainz worker matches wishlist rows in the background
+    # and serves the result on the row itself; raw track_data keys are the
+    # fallback for builds without that worker (GAP-1).
+    served = track.get("musicbrainz_release_group_id")
+    if is_uuid_shape(served):
+        return served.lower()
     track_data = track.get("track_data")
     if not isinstance(track_data, dict):
         return None

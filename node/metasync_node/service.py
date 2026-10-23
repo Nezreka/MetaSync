@@ -589,6 +589,14 @@ class NodeService:
                               priority_release_ids: list[str] | None = None) -> dict[str, str]:
         emit = progress or (lambda event: None)
         mapping: dict[str, str] = dict(self.store.state.get("release_to_group") or {})
+        # SoulSync's own enrichment serves the group on each album: those
+        # need no MusicBrainz call at all, and override an older cached
+        # answer (SoulSync re-resolves when an album's release id changes).
+        for album in albums:
+            release_id = album.get("musicbrainz_release_id")
+            group = album.get("musicbrainz_release_group_id")
+            if is_uuid_shape(release_id) and is_uuid_shape(group):
+                mapping[release_id.lower()] = group.lower()
         budget = self.config.release_resolution_cap
         checked = 0
         # Download rows resolve first: there are few of them and they carry

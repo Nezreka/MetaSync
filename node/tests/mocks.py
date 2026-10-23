@@ -371,3 +371,26 @@ class MockMusicBrainz:
 
     def close(self):
         self.server.shutdown()
+
+
+def browser_client(app):
+    """A Flask test client that behaves like the browser rendering the UI:
+    every form POST carries the session's CSRF token, as the hidden field
+    in each template does. Machine routes (SoulSync's /local/* calls) are
+    posted as-is."""
+    from flask.testing import FlaskClient
+
+    from metasync_node.app import MACHINE_POST_PATHS
+
+    class BrowserClient(FlaskClient):
+        def post(self, path, *args, **kwargs):
+            if path not in MACHINE_POST_PATHS and "json" not in kwargs:
+                with self.session_transaction() as sess:
+                    token = sess.setdefault("csrf_token", secrets.token_urlsafe(16))
+                data = dict(kwargs.pop("data", None) or {})
+                data.setdefault("csrf_token", token)
+                kwargs["data"] = data
+            return super().post(path, *args, **kwargs)
+
+    app.test_client_class = BrowserClient
+    return app.test_client()

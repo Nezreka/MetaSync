@@ -57,20 +57,20 @@
       <dt>Dry run</dt><dd>{{ "ON — nothing is sent or synced" if status.dry_run else "OFF — live" }}</dd>
       <dt>Last refresh</dt><dd>{{ status.last_refresh_at or "never" }}</dd>
     </dl>
-    <form method="post" action="{{ url_for('action_dry_run') }}" class="inline">
+    <form method="post" action="{{ url_for('action_dry_run') }}" class="inline"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <label class="switch"><input type="checkbox" name="dry_run" onchange="this.form.submit()" {% if status.dry_run %}checked{% endif %}> Dry run</label>
     </form>
-    <form method="post" action="{{ url_for('action_share_churn') }}" class="inline">
+    <form method="post" action="{{ url_for('action_share_churn') }}" class="inline"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <label class="switch"><input type="checkbox" name="share_churn" onchange="this.form.submit()" {% if status.share_churn %}checked{% endif %}> Share drop signals (optional)</label>
     </form>
     <p class="muted">Drop signals say "I removed music I had downloaded" — they help the charts tell a fad from a keeper. Off by default; the exact signals are always visible on the Payload preview page before anything is sent.</p>
-    <form method="post" action="{{ url_for('action_share_listening') }}" class="inline">
+    <form method="post" action="{{ url_for('action_share_listening') }}" class="inline"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <label class="switch"><input type="checkbox" name="share_listening" onchange="this.form.submit()" {% if status.share_listening %}checked{% endif %}> Share listening signals (optional)</label>
     </form>
     <p class="muted">Listening signals say "I played at least 3 different tracks from this album last week", for at most your 50 most-played albums — no play counts, times, or track names, and nothing from a SoulSync profile that keeps its own listening history. They power the On Repeat chart. Off by default; with it off, MetaSync does not even read your listening history.</p>
     <div class="row actions">
-      <form method="post" action="{{ url_for('action_report') }}"><button class="primary" type="submit" {% if report_job and report_job.status == "running" %}disabled{% endif %}>{{ "Report running…" if report_job and report_job.status == "running" else "Run weekly report now" }}</button></form>
-      <form method="post" action="{{ url_for('action_refresh') }}"><button type="submit">Refresh playlists now</button></form>
+      <form method="post" action="{{ url_for('action_report') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="primary" type="submit" {% if report_job and report_job.status == "running" %}disabled{% endif %}>{{ "Report running…" if report_job and report_job.status == "running" else "Run weekly report now" }}</button></form>
+      <form method="post" action="{{ url_for('action_refresh') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button type="submit">Refresh playlists now</button></form>
     </div>
   </section>
 
@@ -135,11 +135,11 @@
   {% endif %}
 
   <div class="row">
-    <form method="post" action="{{ url_for('local_key_regenerate') }}">
+    <form method="post" action="{{ url_for('local_key_regenerate') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <button type="submit">{{ "Regenerate local key" if status.local_api_key.configured else "Generate local key" }}</button>
     </form>
     {% if status.local_api_key.configured %}
-    <form method="post" action="{{ url_for('local_key_revoke') }}">
+    <form method="post" action="{{ url_for('local_key_revoke') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <button class="danger" type="submit">Revoke local key</button>
     </form>
     {% endif %}
@@ -154,7 +154,7 @@
     <p class="muted pairing-meta">Requested from {{ status.pending_pairing.requested_from or "unknown" }} · status: {{ status.pending_pairing.status }} · expires {{ status.pending_pairing.expires_at }}</p>
     <p class="muted">Approve only if you just clicked Connect in your own SoulSync and the address above is your SoulSync's.</p>
     {% if status.pending_pairing.status == "pending" %}
-    <form method="post" action="{{ url_for('pair_confirm') }}" class="row">
+    <form method="post" action="{{ url_for('pair_confirm') }}" class="row"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <input type="hidden" name="session_id" value="{{ status.pending_pairing.session_id }}">
       <button class="primary" type="submit" name="decision" value="approve">Approve pairing</button>
       <button class="danger" type="submit" name="decision" value="reject">Reject</button>

@@ -27,6 +27,7 @@ from metasync_node.soulsync import SoulSyncClient  # noqa: E402
 from metasync_node.store import Store  # noqa: E402
 from metasync_node.weekutil import iso_week_string  # noqa: E402
 from tests.mocks import (  # noqa: E402
+    browser_client,
     ALBUMS, ART_NEW, CANONICAL_PLAYLISTS, MockMusicBrainz, MockPool, MockSoulSync,
     RG_A, RG_B, REL_A, WATCHLIST, WISHLIST,
 )
@@ -441,7 +442,7 @@ class TestUiFlows(unittest.TestCase):
         self.service = NodeService(config, store=self.store)
         self.service.clock = lambda: NOW
         from metasync_node.app import create_app
-        self.client = create_app(self.service).test_client()
+        self.client = browser_client(create_app(self.service))
 
     def test_setup_login_and_pages(self):
         self.assertEqual(self.client.get("/health").status_code, 200)
@@ -661,7 +662,7 @@ class TestBindingPending(ServiceCase):
         self.assertEqual(pool_status["binding_status"], "pending_approval")
         self.assertEqual(pool_status["pending_node_fingerprint"], self.service.identity.fingerprint)
 
-        client = create_app(self.service).test_client()
+        client = browser_client(create_app(self.service))
         client.post("/setup", data={"password": "test-password", "confirm": "test-password"})
         dashboard = client.get("/")
         self.assertEqual(dashboard.status_code, 200)
@@ -682,7 +683,7 @@ class TestLocalApiAndPairing(ServiceCase):
     def setUp(self):
         super().setUp()
         from metasync_node.app import create_app
-        self.client = create_app(self.service).test_client()
+        self.client = browser_client(create_app(self.service))
         self.client.post("/setup", data={"password": "test-password", "confirm": "test-password"})
 
     @staticmethod
@@ -758,7 +759,7 @@ class TestLocalApiAndPairing(ServiceCase):
     def test_pairing_status_endpoint_and_dashboard_watcher(self):
         from metasync_node.app import create_app
 
-        anonymous = create_app(self.service).test_client()
+        anonymous = browser_client(create_app(self.service))
         unauthenticated = anonymous.get("/api/pairing-status")
         self.assertEqual(unauthenticated.status_code, 302)
         self.assertIn("/login", unauthenticated.location)
@@ -1002,7 +1003,7 @@ class TestReportJobUi(unittest.TestCase):
         self.service = NodeService(config, store=self.store)
         self.service.clock = lambda: NOW
         from metasync_node.app import create_app
-        self.client = create_app(self.service).test_client()
+        self.client = browser_client(create_app(self.service))
         self.client.post("/setup", data={"password": "test-password", "confirm": "test-password"})
 
     def test_start_job_and_poll_status_to_done(self):
