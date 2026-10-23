@@ -16,9 +16,14 @@ import {
 } from "../src/sin/logic.ts";
 import {
   artistBundle,
+  CHART_TRACKS_PER_ALBUM,
+  chartTracksFor,
   coverArtUrl,
+  ListenBrainzPopularity,
   pickReleaseId,
+  pickTopTrackIds,
   releaseGroupBundle,
+  type ReleaseGroupBundle,
 } from "../src/sin/mb.ts";
 
 const W = "2026-W43";
@@ -214,5 +219,71 @@ describe("musicbrainz mapping", () => {
     });
     assert.deepEqual(bundle.releaseGroupMbids, [RG(1), RG(3)]);
     assert.equal(bundle.genre, "rock");
+  });
+});
+
+describe("popular tracks per album", () => {
+  const rec = (n: number) => `bbbbbbbb-bbbb-4bbb-8bbb-${String(n).padStart(12, "0")}`;
+  const album = (count: number, topTrackIds?: string[]): ReleaseGroupBundle => ({
+    mbid: RG(1),
+    kind: "release-group",
+    title: "Album",
+    artistName: "Artist",
+    tracks: Array.from({ length: count }, (_, i) => ({
+      id: rec(i + 1),
+      name: `Track ${i + 1}`,
+      artists: [{ name: "Artist" }],
+    })),
+    ...(topTrackIds ? { topTrackIds } : {}),
+  });
+
+  test("ranks by distinct listeners, then listens, and caps at five", () => {
+    const pop = new Map([
+      [rec(1), { listens: 900, users: 10 }], // one fan on repeat
+      [rec(2), { listens: 300, users: 200 }],
+      [rec(3), { listens: 500, users: 200 }],
+      [rec(4), { listens: 50, users: 40 }],
+      [rec(5), { listens: 40, users: 30 }],
+      [rec(6), { listens: 30, users: 20 }],
+      [rec(7), { listens: 0, users: 0 }], // no data: never picked
+    ]);
+    assert.deepEqual(pickTopTrackIds(album(8).tracks, pop), [rec(3), rec(2), rec(4), rec(5), rec(6)]);
+    assert.equal(CHART_TRACKS_PER_ALBUM, 5);
+  });
+
+  test("no popularity data: the album's first five tracks, in order", () => {
+    assert.deepEqual(pickTopTrackIds(album(8).tracks, new Map()), []);
+    assert.deepEqual(chartTracksFor(album(8, [])).map((t) => t.id), [1, 2, 3, 4, 5].map(rec));
+    assert.deepEqual(chartTracksFor(album(8)).map((t) => t.id), [1, 2, 3, 4, 5].map(rec));
+    assert.equal(chartTracksFor(album(3)).length, 3); // a short album gives what it has
+  });
+
+  test("picked tracks come out in popularity order", () => {
+    assert.deepEqual(chartTracksFor(album(8, [rec(6), rec(2)])).map((t) => t.id), [rec(6), rec(2)]);
+  });
+
+  test("the ListenBrainz call sends only recording MBIDs, batched", async () => {
+    const bodies: string[] = [];
+    const lb = new ListenBrainzPopularity(async (url, init) => {
+      assert.match(url, /\/1\/popularity\/recording$/);
+      bodies.push(init.body);
+      const ids = (JSON.parse(init.body) as { recording_mbids: string[] }).recording_mbids;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ids.map((id, i) => ({ recording_mbid: id, total_listen_count: i, total_user_count: i === 0 ? null : 1 })),
+      };
+    });
+    const ids = Array.from({ length: 150 }, (_, i) => rec(i).toUpperCase());
+    const pop = await lb.recordings(ids);
+    assert.equal(bodies.length, 2);
+    assert.deepEqual(Object.keys(JSON.parse(bodies[0]!)), ["recording_mbids"]);
+    assert.equal(pop.size, 150);
+    assert.deepEqual(pop.get(rec(0)), { listens: 0, users: 0 });
+  });
+
+  test("a failed ListenBrainz call throws so the album is retried, not cached empty", async () => {
+    const lb = new ListenBrainzPopularity(async () => ({ ok: false, status: 503, json: async () => ({}) }));
+    await assert.rejects(lb.recordings([rec(1)]));
   });
 });

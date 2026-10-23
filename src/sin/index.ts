@@ -105,7 +105,13 @@ import {
   type PlaylistTrack,
   type ResolvedMeta,
 } from "./logic.ts";
-import { MbResolver, type MbBundle } from "./mb.ts";
+import {
+  chartTracksFor,
+  ListenBrainzPopularity,
+  MbResolver,
+  pickTopTrackIds,
+  type MbBundle,
+} from "./mb.ts";
 
 /** Timing-safe compare of the provided header value against one expected key. */
 function matchesKey(provided: string | null, expected: string | undefined): boolean {
@@ -1093,6 +1099,7 @@ app.post("/v1/aggregate", async (c) => {
 /* ------------------------------------------------------------------ */
 
 const mbResolver = new MbResolver();
+const lbPopularity = new ListenBrainzPopularity();
 const COMPOSE_DEFAULT_BUDGET = 40;
 const COMPOSE_MAX_BUDGET = 200;
 
@@ -1191,6 +1198,29 @@ app.post("/v1/compose", async (c) => {
     }
   }
 
+  // Each charted album contributes its most popular tracks (up to
+  // CHART_TRACKS_PER_ALBUM), ranked by ListenBrainz's public listen data.
+  // Looked up once per album and kept in its cached bundle; same pass
+  // budget as MusicBrainz. A failed lookup leaves the album on its first
+  // tracks for now and is retried on the next pass.
+  let popularityFetched = 0;
+  for (const [mbid, bundle] of bundles) {
+    if (bundle.kind !== "release-group" || bundle.topTrackIds !== undefined) continue;
+    if (popularityFetched >= budget) break;
+    popularityFetched += 1;
+    try {
+      const popularity = await lbPopularity.recordings(bundle.tracks.map((t) => t.id));
+      const updated = { ...bundle, topTrackIds: pickTopTrackIds(bundle.tracks, popularity) };
+      bundles.set(mbid, updated);
+      await db
+        .insert(mbResolutions)
+        .values({ mbid, kind: "release-group", bundle: updated })
+        .onConflictDoUpdate({ target: mbResolutions.mbid, set: { bundle: updated } });
+    } catch {
+      // Not cached: the next pass asks again.
+    }
+  }
+
   const meta = new Map<string, ResolvedMeta>();
   for (const [mbid, bundle] of bundles) {
     if (bundle.kind === "release-group") {
@@ -1223,7 +1253,7 @@ app.post("/v1/compose", async (c) => {
         continue;
       }
       for (const g of groups) {
-        for (const t of g.tracks) {
+        for (const t of chartTracksFor(g)) {
           if (seen.has(t.id)) continue;
           seen.add(t.id);
           tracks.push(t);
