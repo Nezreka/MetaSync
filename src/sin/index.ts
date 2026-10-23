@@ -100,6 +100,11 @@ import {
 import {
   buildEditions,
   CHART_MAX_TRACKS,
+  chartDisplayName,
+  COUNT_RETENTION_WEEKS,
+  fillFromPublic,
+  PUBLIC_FILL_CHARTS,
+  type PublicFillKey,
   selectChartSpecs,
   type ChartSpec,
   type PlaylistTrack,
@@ -112,6 +117,7 @@ import {
   pickTopTrackIds,
   type MbBundle,
 } from "./mb.ts";
+import { ListenBrainzCharts } from "./public-charts.ts";
 
 /** Timing-safe compare of the provided header value against one expected key. */
 function matchesKey(provided: string | null, expected: string | undefined): boolean {
@@ -669,8 +675,24 @@ export function resetRateLimiterForTests(): void {
 
 const app = new Hono();
 
+/**
+ * The deployed build, set at deploy time by neon.ts from git: the exact
+ * commit of the public repository this server runs, and whether the
+ * working tree had uncommitted changes. Anyone can compare it with
+ * github.com/Nezreka/MetaSync — "trust us" becomes "check us".
+ */
+export function buildInfo(env: Record<string, string | undefined> = process.env) {
+  const commit = /^[0-9a-f]{40}$/.test(env.SIN_BUILD_COMMIT ?? "") ? env.SIN_BUILD_COMMIT! : null;
+  return {
+    commit,
+    dirty: commit ? env.SIN_BUILD_DIRTY === "true" : null,
+    source: commit ? `https://github.com/Nezreka/MetaSync/tree/${commit}` : null,
+    deployedAt: env.SIN_BUILD_TIME || null,
+  };
+}
+
 app.get("/health", (c) =>
-  c.json({ ok: true, service: "sin", version: "0.1.0", build: "composer-1" }),
+  c.json({ ok: true, service: "sin", version: "0.1.0", build: buildInfo() }),
 );
 
 app.get("/v1/auth/public-key", (c) => {
@@ -1039,6 +1061,13 @@ export async function aggregateOnce(
     new Date(now.getTime() - REPORT_TOKEN_RETENTION_WEEKS * 7 * 86_400_000),
   );
   await db.delete(reportTokens).where(lt(reportTokens.week, oldestKeptWeek));
+  // Below-k counts for weeks that can no longer change are useless and
+  // are the only per-item data that is not public: drop them. Everything
+  // at or above k was copied to `aggregates` above, in this same pass.
+  const oldestCountWeek = isoWeekOf(
+    new Date(now.getTime() - COUNT_RETENTION_WEEKS * 7 * 86_400_000),
+  );
+  await db.delete(aggregateCounts).where(lt(aggregateCounts.week, oldestCountWeek));
 
   const week =
     opts.week ??
@@ -1098,8 +1127,21 @@ app.post("/v1/aggregate", async (c) => {
 /* Resumable by construction: call again to continue where it left.    */
 /* ------------------------------------------------------------------ */
 
-const mbResolver = new MbResolver();
-const lbPopularity = new ListenBrainzPopularity();
+let mbResolver = new MbResolver();
+let lbPopularity = new ListenBrainzPopularity();
+let lbCharts = new ListenBrainzCharts();
+
+/** Test hook: swap the composer's outside sources (pass nothing to
+ *  restore the real ones), so compose runs end-to-end with no network. */
+export function setComposeSourcesForTests(sources: {
+  mb?: MbResolver;
+  popularity?: ListenBrainzPopularity;
+  charts?: ListenBrainzCharts;
+} = {}): void {
+  mbResolver = sources.mb ?? new MbResolver();
+  lbPopularity = sources.popularity ?? new ListenBrainzPopularity();
+  lbCharts = sources.charts ?? new ListenBrainzCharts();
+}
 const COMPOSE_DEFAULT_BUDGET = 40;
 const COMPOSE_MAX_BUDGET = 200;
 
@@ -1143,14 +1185,25 @@ app.post("/v1/compose", async (c) => {
   }
 
   await aggregateOnce(db, { trigger: "compose" });
-  const week = weekArg ?? (await resolveWeek(db, undefined));
-  if (!week) return c.json({ week: null, published: [], pending: {}, resolved: 0 });
+  // The latest counted week; on an empty network, the week that just
+  // closed — the public fill below still gives it charts.
+  const week = weekArg ?? (await resolveWeek(db, undefined)) ?? openReportWeeks()[0]!;
 
   const priors = await priorWeeksOf(db, week);
   const previousWeek = priors[priors.length - 1] ?? null;
   const rows = await loadAggregates(db, [week, ...priors]);
-  const specs = selectChartSpecs(rows, week, priors, previousWeek);
+  const networkSpecs = selectChartSpecs(rows, week, priors, previousWeek);
   const chartedMbids = new Set(rows.filter((r) => r.week === week).map((r) => r.mbid));
+
+  // Cold start (logic.ts fillFromPublic): Trending and Just Landed take
+  // public ListenBrainz items in the slots the network cannot fill yet.
+  // Network items always rank first; a failed public read fills nothing.
+  const seeds = await lbCharts.seeds();
+  const specs: ChartSpec[] = networkSpecs.filter((s) => !(s.key in PUBLIC_FILL_CHARTS));
+  for (const key of Object.keys(PUBLIC_FILL_CHARTS) as PublicFillKey[]) {
+    const filled = fillFromPublic(key, networkSpecs.find((s) => s.key === key), seeds[key]);
+    if (filled) specs.push(filled);
+  }
 
   // Everything this week's specs reference, first-order.
   const needed = new Map<string, "release-group" | "artist">();
@@ -1227,7 +1280,9 @@ app.post("/v1/compose", async (c) => {
       meta.set(mbid, { genre: bundle.genre, year: bundle.year });
     }
   }
-  const allSpecs: ChartSpec[] = [...specs, ...buildEditions(specs, meta)];
+  // Genre/decade editions come from network items only: an edition is a
+  // statement about SoulSync's collectors.
+  const allSpecs: ChartSpec[] = [...specs, ...buildEditions(networkSpecs, meta)];
 
   const published: string[] = [];
   const pending: Record<string, number> = {};
@@ -1236,10 +1291,15 @@ app.post("/v1/compose", async (c) => {
     const tracks: PlaylistTrack[] = [];
     const seen = new Set<string>();
     let missing = 0;
+    let networkIncluded = 0;
+    let publicIncluded = 0;
     for (const item of spec.items) {
       const bundle = bundles.get(item.mbid);
       if (!bundle) {
-        missing += 1;
+        // A public fill item MusicBrainz has not resolved (yet, or ever:
+        // no official release) is skipped, not waited for — the network's
+        // own items are the ones a chart must never publish without.
+        if (item.source !== "public") missing += 1;
         continue;
       }
       const groups =
@@ -1259,18 +1319,24 @@ app.post("/v1/compose", async (c) => {
           tracks.push(t);
         }
       }
+      if (item.source === "public") publicIncluded += 1;
+      else networkIncluded += 1;
     }
     if (missing > 0 || tracks.length === 0) {
       pending[spec.key] = missing;
       continue;
     }
     const capped = tracks.slice(0, CHART_MAX_TRACKS);
+    const name =
+      spec.key in PUBLIC_FILL_CHARTS
+        ? chartDisplayName(spec.key as PublicFillKey, networkIncluded, publicIncluded)
+        : spec.name;
     await db
       .insert(canonicalPlaylists)
-      .values({ week, key: spec.key, name: spec.name, tracks: capped, publishedAt: now })
+      .values({ week, key: spec.key, name, tracks: capped, publishedAt: now })
       .onConflictDoUpdate({
         target: [canonicalPlaylists.week, canonicalPlaylists.key],
-        set: { name: spec.name, tracks: capped, publishedAt: now },
+        set: { name, tracks: capped, publishedAt: now },
       });
     published.push(spec.key);
   }

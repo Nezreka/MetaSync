@@ -135,7 +135,10 @@ charted albums share a tag. The shared work happens once, on the server:
 only charted albums get looked up on MusicBrainz (track lists, genre,
 year), and each contributes its 5 most popular tracks by ListenBrainz's
 public listening statistics — SIN itself never collects track data.
-Everything is cached for everyone.
+Everything is cached for everyone. While the network is young, Trending
+and Just Landed fill their empty slots from ListenBrainz's public weekly
+charts. The playlist name says so ("Trending · from ListenBrainz"), and
+network data replaces public data automatically as installs report.
 
 Your node pulls the finished track lists and creates/updates them as
 playlists in your SoulSync. Matching those tracks to your music source —
@@ -163,7 +166,7 @@ Pool URL is shown on your portal dashboard after sign-in.
 
 | Route | Auth | Notes |
 |---|---|---|
-| `GET /health` | public | `{ ok, service: "sin", version }` |
+| `GET /health` | public | `{ ok, service: "sin", version, build: { commit, dirty, source, deployedAt } }`: the exact public commit the live server runs, set from git at deploy |
 | `GET /v1/auth/public-key` | public | The pool's token-signing public key, so a node can verify its access token |
 | `POST /v1/auth/exchange` | pool key + node signature | Trades key + signature for a 24h token; unbound keys get `202 binding_pending` and no token |
 | `POST /v1/report` | token + signature (or the operator's env key) | One weekly report: `{ week, token, signals: [{ type, mbid }] }` for the closed or current week, once per token — max 5,000 signals (1,000 per type, 100 `listen_album`) / 1 MB, strict validation, unknown fields rejected |

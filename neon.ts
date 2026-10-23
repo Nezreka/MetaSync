@@ -1,4 +1,25 @@
+import { execSync } from "node:child_process";
 import { defineConfig } from "@neon/config/v1";
+
+// The build SIN reports on GET /health (src/sin/index.ts buildInfo): the
+// exact git commit being deployed and whether the working tree had
+// uncommitted changes, read from git at deploy time. Anyone can then
+// compare the live server with that commit in the public repository.
+// A deploy from outside a git checkout reports commit null rather than
+// guessing.
+function git(args: string): string {
+  try {
+    return execSync(`git ${args}`, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+  } catch {
+    return "";
+  }
+}
+// Never empty: defineConfig rejects missing values, and "unknown" is what
+// /health then reports (as commit null).
+const BUILD_COMMIT = git("rev-parse HEAD") || "unknown";
+const BUILD_DIRTY =
+  BUILD_COMMIT === "unknown" ? "unknown" : String(git("status --porcelain --untracked-files=no") !== "");
+const BUILD_TIME = new Date().toISOString();
 
 export default defineConfig({
   // Declare your Neon services here
@@ -35,6 +56,10 @@ export default defineConfig({
         SIN_ADMIN_KEY: process.env.SIN_ADMIN_KEY!,
         API_KEY_PEPPER: process.env.API_KEY_PEPPER!,
         SIN_TOKEN_PRIVATE_KEY: process.env.SIN_TOKEN_PRIVATE_KEY!,
+        // Not secrets: set from git above, served on /health.
+        SIN_BUILD_COMMIT: BUILD_COMMIT,
+        SIN_BUILD_DIRTY: BUILD_DIRTY,
+        SIN_BUILD_TIME: BUILD_TIME,
       },
     },
     // MetaSync metadata service — SCAFFOLD ONLY (src/metasync/index.ts).
