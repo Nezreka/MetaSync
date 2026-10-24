@@ -120,6 +120,12 @@ class FakeQuery {
         )
         .map((r) => ({ ...r }));
     }
+    if (this.table === reportTokensTable) {
+      // where(inArray(week, [...])): one row per claimed token.
+      return [...this.fake.reportTokens]
+        .map((k) => ({ week: k.split("|")[0] }))
+        .filter((r) => params.length === 0 || params.includes(r.week));
+    }
     if (this.table === populationsTable) {
       // where(eq(week, w)) or where(inArray(week, [...])).
       return this.fake.populationRows

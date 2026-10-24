@@ -123,7 +123,11 @@ describe("report populations, compose week and admin status (no live database)",
     const fake = new FakeSinDb();
     const now = new Date();
     const [closed, current] = openReportWeeks(now) as [string, string];
-    fake.populationRows.push({ week: closed, reports: 7, churnOptin: 2 }, { week: current, reports: 1, churnOptin: 0 });
+    // Reports count from the tokens (which predate report_populations);
+    // the populations row only supplies the opted-in share.
+    for (let i = 0; i < 7; i += 1) fake.reportTokens.add(`${closed}|token-${i}`);
+    fake.reportTokens.add(`${current}|token-x`);
+    fake.populationRows.push({ week: closed, reports: 3, churnOptin: 2 });
     fake.playlistRows.push(
       { week: closed, key: "trending", name: "T", tracks: [], publishedAt: now },
       { week: closed, key: "top-tracks", name: "Top", tracks: [], publishedAt: now },
