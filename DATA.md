@@ -385,9 +385,12 @@ inputs are `aggregates` only — composition never reads raw reports.
   (`BREAKOUT_MIN_NODES`) and ≥ 2× the previous week (or new), top 10.
 - **Editions**: genre and decade editions of Trending, Most Wanted and
   Just Landed, built from resolved bundles. An edition needs ≥ 8 chart
-  items sharing the tag (`CHART_MIN_EDITION_ITEMS`), and one holding
-  every item of its chart is skipped, since it would be the same chart
-  again (every Just Landed album is from the 2020s). An edition of a
+  items sharing the tag (`CHART_MIN_EDITION_ITEMS`). Just Landed gets
+  genre editions only (everything new is from this decade). An edition
+  holding every item of its chart is skipped, and so is one whose
+  published tracks are ≥ 80% its chart's own (`EDITION_MAX_OVERLAP`,
+  checked after both are built); a skipped edition is withdrawn like any
+  chart the pass no longer makes. An edition of a
   public-filled chart carries the same honest name ("Trending: Rock ·
   from ListenBrainz"). Album charts hold 25 albums; every playlist caps
   at 50 tracks (`CHART_MAX_TRACKS`).

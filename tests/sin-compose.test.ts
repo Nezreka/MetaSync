@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
   buildEditions,
+  editionRepeatsBase,
   decadeLabel,
   genreDisplay,
   selectChartSpecs,
@@ -150,6 +151,32 @@ describe("buildEditions", () => {
     const landed: ChartSpec = { ...base, key: "just-landed", name: "Just Landed" };
     const meta = new Map(base.items.map((i) => [i.mbid, { genre: "pop", year: 2026 }]));
     assert.deepEqual(buildEditions([landed], meta), []);
+  });
+
+  test("just-landed never gets a decade edition, even with years missing", () => {
+    // two albums lack a release year, so "2020s" holds 8 of 10 on paper;
+    // published, it would still be Just Landed again (it was, 42 of 42)
+    const landed: ChartSpec = { ...base, key: "just-landed", name: "Just Landed" };
+    const meta = new Map(
+      base.items.map((i, idx) => [i.mbid, idx < 8 ? { genre: `g${idx}`, year: 2026 } : { genre: `g${idx}` }]),
+    );
+    assert.deepEqual(buildEditions([landed], meta), []);
+  });
+
+  test("editions remember their base chart", () => {
+    const meta = new Map(
+      base.items.map((i, idx) => [i.mbid, idx < 9 ? { genre: "rock", year: 1994 } : { genre: "jazz", year: 2001 }]),
+    );
+    assert.ok(buildEditions([base], meta).every((e) => e.base === "trending"));
+  });
+
+  test("an edition that publishes mostly its base's tracks repeats it", () => {
+    const ids = (from: number, to: number) => Array.from({ length: to - from }, (_, i) => `t${from + i}`);
+    assert.equal(editionRepeatsBase(ids(0, 42), ids(0, 42)), true); // identical
+    assert.equal(editionRepeatsBase(ids(0, 40), ids(0, 46)), true); // 40/46 = 87%
+    assert.equal(editionRepeatsBase(ids(0, 34), ids(0, 46)), false); // 34/46 = 74%
+    assert.equal(editionRepeatsBase([...ids(0, 20), ...ids(100, 130)], ids(0, 46)), false);
+    assert.equal(editionRepeatsBase(ids(0, 10), []), false); // base not published
   });
 
   test("just-landed gets editions too", () => {
