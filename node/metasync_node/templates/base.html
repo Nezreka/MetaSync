@@ -3,42 +3,53 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
   <title>{% block title %}MetaSync{% endblock %}</title>
   <link rel="icon" type="image/png" href="{{ url_for('static', filename='favicon.png') }}">
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body class="{% block body_class %}{% endblock %}">
-  <header class="topbar">
-    <div class="topbar-inner">
-      <a class="brand" href="{{ url_for('dashboard') }}">
-        <img class="brand-logo" src="{{ url_for('static', filename='logo.png') }}" alt="SoulSync">
+{% macro icon(name) -%}
+<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+{%- if name == "dashboard" -%}<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/>
+{%- elif name == "soulsync" -%}<path d="M10 14a4.5 4.5 0 0 0 6.4 0l3-3a4.5 4.5 0 0 0-6.4-6.4l-1 1"/><path d="M14 10a4.5 4.5 0 0 0-6.4 0l-3 3a4.5 4.5 0 0 0 6.4 6.4l1-1"/>
+{%- elif name == "pools" -%}<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/>
+{%- elif name == "preview" -%}<path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6M9 14l-2 2 2 2M15 14l2 2-2 2"/>
+{%- elif name == "signout" -%}<path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3M10 16l-4-4 4-4M6 12h10"/>
+{%- endif -%}
+</svg>
+{%- endmacro %}
+{% set signed_in = session.get('ui_admin') %}
+<div class="shell{{ '' if signed_in else ' shell-auth' }}">
+  {% if signed_in %}
+  <aside class="sidebar">
+    <a class="brand" href="{{ url_for('dashboard') }}">
+      <img class="brand-logo" src="{{ url_for('static', filename='logo.png') }}" alt="">
+      <span class="brand-text">
         <span class="brand-name">MetaSync</span>
-        <span class="tag">node</span>
-      </a>
-      {% if session.get('ui_admin') %}
-      <nav>
-        <a href="{{ url_for('dashboard') }}"{% if request.endpoint == 'dashboard' %} class="active"{% endif %}>Dashboard</a>
-        <a href="{{ url_for('soulsync_settings') }}"{% if request.endpoint == 'soulsync_settings' %} class="active"{% endif %}>SoulSync</a>
-        <a href="{{ url_for('pools') }}"{% if request.endpoint == 'pools' %} class="active"{% endif %}>Pools</a>
-        <a href="{{ url_for('preview') }}"{% if request.endpoint == 'preview' %} class="active"{% endif %}>Payload preview</a>
-        <a class="nav-signout" href="{{ url_for('logout') }}">Sign out</a>
-      </nav>
-      {% endif %}
-    </div>
-  </header>
-  <main class="{% block main_class %}{% endblock %}">
+        <span class="brand-sub">Network node</span>
+      </span>
+    </a>
+    <nav class="side-nav" aria-label="Main">
+      <p class="nav-label">Node</p>
+      <a href="{{ url_for('dashboard') }}"{% if request.endpoint == 'dashboard' %} class="active" aria-current="page"{% endif %}><span class="nav-icon">{{ icon("dashboard") }}</span>Dashboard</a>
+      <a href="{{ url_for('preview') }}"{% if request.endpoint == 'preview' %} class="active" aria-current="page"{% endif %}><span class="nav-icon">{{ icon("preview") }}</span>Payload preview</a>
+      <p class="nav-label">Connect</p>
+      <a href="{{ url_for('soulsync_settings') }}"{% if request.endpoint == 'soulsync_settings' %} class="active" aria-current="page"{% endif %}><span class="nav-icon">{{ icon("soulsync") }}</span>SoulSync</a>
+      <a href="{{ url_for('pools') }}"{% if request.endpoint == 'pools' %} class="active" aria-current="page"{% endif %}><span class="nav-icon">{{ icon("pools") }}</span>Pools</a>
+    </nav>
+    <a class="nav-signout" href="{{ url_for('logout') }}"><span class="nav-icon">{{ icon("signout") }}</span>Sign out</a>
+  </aside>
+  {% endif %}
+  <main class="content {% block main_class %}{% endblock %}">
     {% with messages = get_flashed_messages(with_categories=true) %}
       {% for category, message in messages %}
         <div class="flash {{ category }}">{{ message }}</div>
       {% endfor %}
     {% endwith %}
     {% block content %}{% endblock %}
+    <footer class="app-footer">MetaSync node · the local companion for SoulSync</footer>
   </main>
-  <footer class="app-footer">
-    <img src="{{ url_for('static', filename='logo.png') }}" alt="">
-    <span>MetaSync node</span>
-    <span class="sep">·</span>
-    <span>the local companion for SoulSync</span>
-  </footer>
+</div>
 </body>
 </html>

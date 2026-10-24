@@ -155,11 +155,28 @@ def create_app(service: NodeService) -> Flask:
     @app.get("/")
     @login_required
     def dashboard():
+        offered = service.local_charts()
+        charts = []
+        for chart in offered["playlists"]:
+            artists: list[str] = []
+            for track in chart["tracks"]:
+                for artist in track.get("artists") or []:
+                    name = (artist or {}).get("name") if isinstance(artist, dict) else None
+                    if name and name not in artists:
+                        artists.append(name)
+                if len(artists) >= 3:
+                    break
+            charts.append({
+                "key": chart["key"], "name": chart["name"],
+                "track_count": len(chart["tracks"]), "artists": artists[:3],
+            })
         return render_template(
             "dashboard.html",
             status=service.status(),
             report_job=service.report_job(),
             local_key_once=session.pop("local_api_key_once", None),
+            charts=charts,
+            charts_week=offered["week"],
         )
 
     @app.get("/api/report-job")

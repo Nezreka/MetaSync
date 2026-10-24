@@ -1,11 +1,43 @@
 {% extends "base.html" %}
 {% block title %}MetaSync · Dashboard{% endblock %}
 {% block content %}
-<div class="page-head">
-  <p class="eyebrow-chip">SoulSync network node</p>
-  <h1>Dashboard</h1>
-  <p class="page-sub">This node’s identity, its connection to your SoulSync, and the playlists it keeps in sync on your behalf.</p>
-</div>
+{% set live_pools = status.pools | selectattr("enabled") | list %}
+{% set last = status.last_report.values() | list %}
+<header class="page-head">
+  <h1>Your node</h1>
+  <p class="page-sub">What your MetaSync shares with the network, what it brings back, and how it is connected.</p>
+</header>
+
+<section class="hero{{ ' hero-dry' if status.dry_run }}">
+  <div class="hero-glow" aria-hidden="true"></div>
+  <div class="hero-body">
+    <p class="hero-eyebrow"><span class="live-dot{{ ' off' if status.dry_run }}"></span>{{ "Dry run" if status.dry_run else "Live" }}<span class="hero-sep">|</span>Reports {{ status.report_week }}</p>
+    <h2 class="hero-title">{{ "Nothing leaves this machine" if status.dry_run else "Sharing with the network" }}</h2>
+    <p class="hero-lede">
+      {%- if status.dry_run -%}
+        Dry run builds the exact weekly report and shows it on the Payload preview page, but sends nothing. Turn it off when you are happy with what you see.
+      {%- else -%}
+        Once a week this node sends last week's yes/no album signals to {{ live_pools | length }} pool{{ "" if live_pools | length == 1 else "s" }}, and brings the network's charts back to SoulSync.
+      {%- endif -%}
+    </p>
+    <p class="hero-meta">
+      <span><span class="status-dot {{ 'on' if status.soulsync_connected else 'off' }}"></span>SoulSync {{ "connected" if status.soulsync_connected else "not connected" }}</span>
+      <span class="meta-sep">•</span>
+      <span>{{ live_pools | length }} pool{{ "" if live_pools | length == 1 else "s" }}</span>
+      <span class="meta-sep">•</span>
+      <span>Last report {% if last %}{{ last[0].week }}{% else %}never{% endif %}</span>
+    </p>
+    <div class="hero-actions">
+      <form method="post" action="{{ url_for('action_report') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="primary" type="submit" {% if report_job and report_job.status == "running" %}disabled{% endif %}>{{ "Report running…" if report_job and report_job.status == "running" else "Run weekly report now" }}</button></form>
+      <form method="post" action="{{ url_for('action_refresh') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button type="submit">Refresh playlists now</button></form>
+      <a class="btn-ghost" href="{{ url_for('preview') }}">See the payload</a>
+    </div>
+  </div>
+  <div class="hero-badge" aria-hidden="true">
+    <img src="{{ url_for('static', filename='logo.png') }}" alt="">
+    <code>{{ status.node_fingerprint }}</code>
+  </div>
+</section>
 
 {% for p in status.pools if p.binding_status == "pending_approval" %}
 <section class="card alert-card">
@@ -41,6 +73,56 @@
 </section>
 {% endif %}
 
+<div class="stat-tiles">
+  <div class="stat-tile"><span class="stat-num">{{ status.charts_offered }}</span><span class="stat-label">Charts ready for SoulSync</span></div>
+  <div class="stat-tile"><span class="stat-num">{% if last %}{{ last[0].signal_count }}{% else %}–{% endif %}</span><span class="stat-label">Signals in the last report</span></div>
+  <div class="stat-tile"><span class="stat-num">{{ live_pools | length }}</span><span class="stat-label">Pools joined</span></div>
+  <div class="stat-tile"><span class="stat-num small">{{ status.last_refresh_at[:10] if status.last_refresh_at else "never" }}</span><span class="stat-label">Charts last refreshed</span></div>
+</div>
+
+<section class="shelf">
+  <div class="shelf-head">
+    <div>
+      <h2>Charts offered to SoulSync</h2>
+      <p class="shelf-sub">{{ status.charts_offered }} chart{{ "" if status.charts_offered == 1 else "s" }} ready{% if charts_week %} for {{ charts_week }}{% endif %}. SoulSync fetches them once a day (its "Refresh MetaSync Charts" automation), matches them, and shows them on its dashboard and Discover page. Nothing is synced or downloaded until someone opens one there and presses Sync &amp; download.</p>
+    </div>
+  </div>
+  {% if charts %}
+  <div class="chart-grid">
+    {% for chart in charts %}
+    <article class="chart-tile">
+      <div class="chart-cover cover-{{ loop.index0 % 8 }}"><span>{{ chart.name.split(" · ")[0] }}</span></div>
+      <h3>{{ chart.name }}</h3>
+      <p>{{ chart.track_count }} tracks{% if chart.artists %} · {{ chart.artists | join(", ") }}{% endif %}</p>
+    </article>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty-state"><strong>No charts yet</strong>Join a pool and refresh: the network's charts land here, ready for SoulSync to pick up.</div>
+  {% endif %}
+</section>
+
+<section class="card">
+  <div class="card-head">
+    <p class="eyebrow">What this node shares</p>
+    <h2>Sharing</h2>
+  </div>
+  <div class="switch-list">
+    <form method="post" action="{{ url_for('action_dry_run') }}" class="switch-row"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <div class="switch-text"><strong>Dry run</strong><span>{{ "On: nothing is sent or synced. The report is built and shown on the Payload preview page." if status.dry_run else "Off: the weekly report is sent to your pools." }}</span></div>
+      <label class="switch"><input type="checkbox" name="dry_run" onchange="this.form.submit()" {% if status.dry_run %}checked{% endif %}><span class="switch-track"></span><span class="sr-only">Dry run</span></label>
+    </form>
+    <form method="post" action="{{ url_for('action_share_churn') }}" class="switch-row"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <div class="switch-text"><strong>Share drop signals <em>optional</em></strong><span>Drop signals say "I removed music I had downloaded" — they help the charts tell a fad from a keeper. Off by default; the exact signals are always visible on the Payload preview page before anything is sent.</span></div>
+      <label class="switch"><input type="checkbox" name="share_churn" onchange="this.form.submit()" {% if status.share_churn %}checked{% endif %}><span class="switch-track"></span><span class="sr-only">Share drop signals (optional)</span></label>
+    </form>
+    <form method="post" action="{{ url_for('action_share_listening') }}" class="switch-row"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <div class="switch-text"><strong>Share listening signals <em>optional</em></strong><span>Listening signals say "I played at least 3 different tracks from this album last week", for at most your 50 most-played albums — no play counts, times, or track names, and nothing from a SoulSync profile that keeps its own listening history. They power the On Repeat chart. Off by default; with it off, MetaSync does not even read your listening history.</span></div>
+      <label class="switch"><input type="checkbox" name="share_listening" onchange="this.form.submit()" {% if status.share_listening %}checked{% endif %}><span class="switch-track"></span><span class="sr-only">Share listening signals (optional)</span></label>
+    </form>
+  </div>
+</section>
+
 <div class="grid">
   <section class="card">
     <div class="card-head">
@@ -57,21 +139,6 @@
       <dt>Dry run</dt><dd>{{ "ON — nothing is sent or synced" if status.dry_run else "OFF — live" }}</dd>
       <dt>Last refresh</dt><dd>{{ status.last_refresh_at or "never" }}</dd>
     </dl>
-    <form method="post" action="{{ url_for('action_dry_run') }}" class="inline"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-      <label class="switch"><input type="checkbox" name="dry_run" onchange="this.form.submit()" {% if status.dry_run %}checked{% endif %}> Dry run</label>
-    </form>
-    <form method="post" action="{{ url_for('action_share_churn') }}" class="inline"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-      <label class="switch"><input type="checkbox" name="share_churn" onchange="this.form.submit()" {% if status.share_churn %}checked{% endif %}> Share drop signals (optional)</label>
-    </form>
-    <p class="muted">Drop signals say "I removed music I had downloaded" — they help the charts tell a fad from a keeper. Off by default; the exact signals are always visible on the Payload preview page before anything is sent.</p>
-    <form method="post" action="{{ url_for('action_share_listening') }}" class="inline"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-      <label class="switch"><input type="checkbox" name="share_listening" onchange="this.form.submit()" {% if status.share_listening %}checked{% endif %}> Share listening signals (optional)</label>
-    </form>
-    <p class="muted">Listening signals say "I played at least 3 different tracks from this album last week", for at most your 50 most-played albums — no play counts, times, or track names, and nothing from a SoulSync profile that keeps its own listening history. They power the On Repeat chart. Off by default; with it off, MetaSync does not even read your listening history.</p>
-    <div class="row actions">
-      <form method="post" action="{{ url_for('action_report') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="primary" type="submit" {% if report_job and report_job.status == "running" %}disabled{% endif %}>{{ "Report running…" if report_job and report_job.status == "running" else "Run weekly report now" }}</button></form>
-      <form method="post" action="{{ url_for('action_refresh') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button type="submit">Refresh playlists now</button></form>
-    </div>
   </section>
 
   <section class="card">
@@ -166,13 +233,6 @@
   {% endif %}
 </section>
 
-<section class="card">
-  <div class="card-head">
-    <p class="eyebrow">Provided by this node</p>
-    <h2>Charts offered to SoulSync</h2>
-  </div>
-  <p>{{ status.charts_offered }} chart{{ "" if status.charts_offered == 1 else "s" }} ready for SoulSync. SoulSync fetches them once a day (its "Refresh MetaSync Charts" automation), matches them, and shows them on its dashboard and Discover page. Nothing is synced or downloaded until someone opens one there and presses Sync &amp; download.</p>
-</section>
 {% if status.last_errors %}
 <section class="card">
   <div class="card-head">
