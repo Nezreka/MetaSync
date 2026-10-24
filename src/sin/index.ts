@@ -100,6 +100,7 @@ import {
 import {
   buildEditions,
   CHART_MAX_TRACKS,
+  editionRepeatsBase,
   COUNT_RETENTION_WEEKS,
   interleaveByRank,
   sourcedName,
@@ -1292,6 +1293,9 @@ app.post("/v1/compose", async (c) => {
   const published: string[] = [];
   const pending: Record<string, number> = {};
   const now = new Date();
+  // Each published chart's track ids, so an edition that would replay its
+  // base (bases come first in allSpecs) is skipped, and so withdrawn.
+  const publishedIds = new Map<string, string[]>();
   for (const spec of allSpecs) {
     // Each item's tracks, best first; laid out round by round below.
     const perItem: PlaylistTrack[][] = [];
@@ -1327,6 +1331,9 @@ app.post("/v1/compose", async (c) => {
       pending[spec.key] = missing;
       continue;
     }
+    const ids = capped.map((t) => t.id);
+    if (spec.base && editionRepeatsBase(ids, publishedIds.get(spec.base) ?? [])) continue;
+    publishedIds.set(spec.key, ids);
     const name = sourcedName(
       spec.key in PUBLIC_FILL_CHARTS ? PUBLIC_FILL_CHARTS[spec.key as PublicFillKey] : spec.name,
       networkIncluded,

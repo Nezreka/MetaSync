@@ -1294,6 +1294,8 @@ export interface ChartSpec {
   key: string;
   name: string;
   items: ChartItem[];
+  /** An edition's base chart key ("trending" for "trending-rock"). */
+  base?: string;
 }
 
 function sumsFor(
@@ -1515,18 +1517,36 @@ export function buildEditions(
         key: `${base.key}-${slugifyGenre(genre)}`,
         name: `${base.name.split(" in SoulSync")[0]}: ${genreDisplay(genre)}`,
         items,
+        base: base.key,
       });
     }
+    // Everything that just landed is from this decade: no decade editions.
+    if (base.key === "just-landed") continue;
     for (const [label, items] of byDecade) {
       if (items.length < CHART_MIN_EDITION_ITEMS || !distinct(items)) continue;
       editions.push({
         key: `${base.key}-${label}`,
         name: `${base.name.split(" in SoulSync")[0]}: ${label}`,
         items,
+        base: base.key,
       });
     }
   }
   return editions;
+}
+
+/** Share of a base chart's published tracks an edition may repeat. */
+export const EDITION_MAX_OVERLAP = 0.8;
+
+/** True when an edition's published tracks are mostly its base chart's
+ *  again. buildEditions only sees candidates; the base publishes its top
+ *  50 tracks, so an edition can differ on paper and still play the same
+ *  songs (Just Landed: 2020s was Just Landed, 42 of 42). */
+export function editionRepeatsBase(editionIds: string[], baseIds: string[]): boolean {
+  if (baseIds.length === 0) return false;
+  const base = new Set(baseIds);
+  const shared = editionIds.filter((id) => base.has(id)).length;
+  return shared >= EDITION_MAX_OVERLAP * baseIds.length;
 }
 
 /* ------------------------------------------------------------------ */
