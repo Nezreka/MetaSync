@@ -27,8 +27,9 @@ closed → the backend counts it on arrival (+1 per item on a running
 tally; nothing per node is stored) and publishes only items at or above
 **k = 15 nodes** → a composer turns the surviving counts
 into charts, resolving titles/track lists from MusicBrainz **once, on
-the server** → nodes pull the charts back and create playlists inside
-the user's own SoulSync. Nothing in the system ever moves a title, a
+the server** → nodes pull the charts back and offer them to the user's
+own SoulSync, which pulls them once a day and shows them as playlists
+the user can open (§13). Nothing in the system ever moves a title, a
 file path, or a listening record off the user's machine.
 
 ## 1. What the node reads from SoulSync
@@ -284,9 +285,8 @@ typically `./data`). Files (`node/metasync_node/store.py`,
   - `pool_auth` — per pool: exchange mode, binding status, the live
     **access token** and its expiry, last exchange result;
   - `last_report` (per pool: week, time, signal count),
-    `last_refresh_at`, `index_cache`, `playlists_cache`,
-    `managed_playlists` (what was synced into SoulSync, with content
-    hashes), `built_definitions` (admin mode only), `report_job`
+    `last_refresh_at`, `index_cache`, `playlists_cache` (the charts
+    offered on `GET /local/charts`), `built_definitions` (admin mode only), `report_job`
     (live job record), `last_report_attempt` (scheduler back-off), `pairing_session` / `pairing_attempts` /
     `last_pairing` (§11), `last_errors` (newest 20).
 
