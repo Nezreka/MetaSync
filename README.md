@@ -85,7 +85,7 @@ and lists that week's events, never your library:
 |---|---|---|
 | `watchlist_add` | You started watching this artist this week | artist MBID |
 | `wishlist_add` | You wishlisted this album this week | release-group MBID |
-| `hunt_demand` | Wishlisted 7+ days ago, still not downloaded | release-group MBID |
+| `hunt_demand` | Wishlisted 7+ days ago, tried by SoulSync, still not downloaded, and not already in your library | release-group MBID |
 | `import_keep` | Reached 14 days in your library this week (sent once per album) | release-group MBID |
 | `recent_add` | Landed in your library this week | release-group MBID |
 | `download_grab` | Re-grabbed, upgraded, or gap-filled an album you already own this week (new arrivals are `recent_add`'s job) | release-group MBID |
@@ -160,8 +160,11 @@ or downloaded until you press Sync & download** on it.
    then sends one signed report per joined pool.
 4. The pool validates the report and counts it on arrival — one +1 per
    item, one report per install per week; nothing per install is stored.
-5. The composer turns counts into charts (only items at or above k = 15)
-   and publishes them for nodes to pull.
+5. Every day a scheduled job runs the composer, which turns counts into
+   charts (only items at or above k = 15) and publishes them for nodes
+   to pull, then checks the network's vital signs. If there are no
+   charts, or no reports by Tuesday, the job fails and GitHub emails
+   the owner.
 
 ## SIN backend API (for the curious)
 
@@ -172,14 +175,18 @@ Pool URL is shown on your portal dashboard after sign-in.
 | `GET /health` | public | `{ ok, service: "sin", version, build: { commit, dirty, source, deployedAt } }`: the exact public commit the live server runs, set from git at deploy |
 | `GET /v1/auth/public-key` | public | The pool's token-signing public key, so a node can verify its access token |
 | `POST /v1/auth/exchange` | pool key + node signature | Trades key + signature for a 24h token; unbound keys get `202 binding_pending` and no token |
-| `POST /v1/report` | token + signature (or the operator's env key) | One weekly report: `{ week, token, signals: [{ type, mbid }] }` for the closed or current week, once per token — max 5,000 signals (1,000 per type, 100 `listen_album`) / 1 MB, strict validation, unknown fields rejected |
+| `POST /v1/report` | token + signature (or the operator's env key) | One weekly report: `{ week, token, signals: [{ type, mbid }], churn_optin? }` (`churn_optin: true` only from a node sharing drop signals; counted per week, never stored per node) for the closed or current week, once per token — max 5,000 signals (1,000 per type, 100 `listen_album`) / 1 MB, strict validation, unknown fields rejected |
 | `GET /v1/whoami` | token or env key | Connection test for a node |
 | `GET /v1/index/trending` · `most-wanted` · `breakouts` | token or env key | The public chart indexes for a week |
 | `GET /v1/playlists` | token or env key | The latest published charts as full track lists |
 | `POST /v1/aggregate` | admin only | Run one aggregation pass |
-| `POST /v1/compose` | admin only | Build and publish this week's charts (budget-resumable) |
+| `POST /v1/compose` | admin only | Build and publish the closed week's charts (budget-resumable); runs daily from `.github/workflows/compose.yml` |
+| `GET /v1/admin/status` | admin key only | The closed and current week's report counts and the closed week's chart keys, for the daily job's health check |
 
 ## Development
+
+GitHub Actions runs all three suites on every push and pull request
+(`.github/workflows/tests.yml`).
 
 ```bash
 npm run build   # tsc --noEmit (strict) over the backend + tests

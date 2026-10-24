@@ -1,0 +1,76 @@
+name: Compose charts
+
+# The SIN composer only runs when called. This calls it every day, after
+# Monday's report slots (0-6h UTC) and again on the following days so late
+# reports are counted, then checks the network's vital signs. A failed run
+# is GitHub's alert: it emails whoever owns this workflow.
+#
+# Needs two repository secrets (Settings -> Secrets and variables -> Actions):
+#   SIN_URL        the pool URL, e.g. https://....neon.tech  (no trailing slash)
+#   SIN_ADMIN_KEY  the backend's SIN_ADMIN_KEY
+on:
+  schedule:
+    - cron: "15 8 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: compose
+  cancel-in-progress: false
+
+jobs:
+  compose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SIN_URL: ${{ secrets.SIN_URL }}
+      SIN_ADMIN_KEY: ${{ secrets.SIN_ADMIN_KEY }}
+    steps:
+      - name: Secrets are set
+        run: |
+          if [ -z "$SIN_URL" ] || [ -z "$SIN_ADMIN_KEY" ]; then
+            echo "::error::Set the SIN_URL and SIN_ADMIN_KEY repository secrets."
+            exit 1
+          fi
+
+      - name: The pool is up
+        run: |
+          curl -fsS --max-time 30 "$SIN_URL/health" | tee health.json
+          jq -e '.ok == true' health.json > /dev/null
+
+      - name: Compose until nothing is pending
+        # Each pass resolves up to 200 albums on MusicBrainz (about 1 per
+        # second) and publishes every chart whose albums all resolved; a
+        # chart still waiting is "pending" and the next pass resumes it.
+        run: |
+          for pass in 1 2 3 4 5 6; do
+            curl -fsS --max-time 600 -X POST "$SIN_URL/v1/compose" \
+              -H "x-sin-key: $SIN_ADMIN_KEY" -H "content-type: application/json" \
+              -d '{"budget":200}' > compose.json
+            echo "pass $pass: $(jq -c '{week, published, pending}' compose.json)"
+            if jq -e '(.pending // {}) | length == 0' compose.json > /dev/null; then
+              exit 0
+            fi
+          done
+          echo "::warning::Charts still pending after 6 passes: $(jq -c '.pending' compose.json). Tomorrow's run resumes them."
+
+      - name: Vital signs
+        run: |
+          curl -fsS --max-time 30 "$SIN_URL/v1/admin/status" -H "x-sin-key: $SIN_ADMIN_KEY" | tee status.json
+          echo
+          charts=$(jq '.charts.count' status.json)
+          reports=$(jq '.reports.closed' status.json)
+          week=$(jq -r '.weeks.closed' status.json)
+          # Monday = 1. Nodes report the closed week in Monday's first six
+          # hours; by Tuesday it is a fault if none have.
+          dow=$(date -u +%u)
+          failed=0
+          if [ "$charts" -eq 0 ]; then
+            echo "::error::No charts published for $week."
+            failed=1
+          fi
+          if [ "$dow" -ge 2 ] && [ "$reports" -eq 0 ]; then
+            echo "::error::No node has reported $week yet. Check the nodes and the pool's /v1/report route."
+            failed=1
+          fi
+          echo "$week: $reports reports, $charts charts ($(jq -c '.charts.keys' status.json))"
+          exit $failed

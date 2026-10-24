@@ -90,10 +90,10 @@ window's end.
 | Signal | Key | Fires when (all conditions) |
 |---|---|---|
 | `watchlist_add` | artist MBID | artist's `date_added` is in the report week and the MBID is UUID-shaped |
-| `wishlist_add` | release-group MBID | wishlist item's `date_added` is in the report week and a group MBID was found in `track_data` |
-| `hunt_demand` | release-group MBID | wishlist item's `date_added` is 7+ days before the week's end (proxy for "wanted, still not got": SoulSync removes fulfilled items; there is no per-item success flag — GAP-4) |
-| `import_keep` | release-group MBID | album's 14-day mark (`created_at` + 14 days) falls **in the report week**, it is still in the library, and its release resolves to this group — **once per album**, never re-sent |
-| `recent_add` | release-group MBID | album's `created_at` is in the report week and its release resolves to this group |
+| `wishlist_add` | release-group MBID | wishlist item's `date_added` is in the report week and a group MBID was found — or it was added up to 14 days earlier and matched only now (**late match**, below) |
+| `hunt_demand` | release-group MBID | wishlist item's `date_added` is 7+ days before the week's end, SoulSync has **tried** it (`retry_count ≥ 1`), and the album is **not already in the library**. SoulSync removes fulfilled items, so still listed + tried = "searched for, still not got" (GAP-4) |
+| `import_keep` | release-group MBID | album's 14-day mark falls **in the report week**, counted from the **earliest** date the node has seen for the group (`first_seen`, below), it is still in the library, and its release resolves to this group — **once per album**, never re-sent |
+| `recent_add` | release-group MBID | album's `created_at` is in the report week, its release resolves to this group, and the node has **not** seen the group before (a re-scan that resets `created_at` is not an arrival) — or it landed up to 14 days earlier and matched only now (**late match**) |
 | `download_grab` | release-group MBID | download-activity row has `completed_since ≥ 1` (SoulSync counted completions at/after the week start the node passed), the release resolves, **and the group produced no `recent_add` this run** — disjoint by construction |
 | `download_churn` | release-group MBID | **opt-in only** (§7). Group is in the node's accumulated download history with a first download 14+ days before the week's end, was present in the library snapshot from two **weeks** ago, and is absent from last week's snapshot **and** this one (two consecutive weekly absences), on a **complete** library read |
 | `listen_album` | release-group MBID | **opt-in only** (§7). At least **3 distinct tracks** of the album were played in the report week (SoulSync's shared listening pile); at most the **50** most-played such albums per report (DESIGN-LISTEN-SIGNALS.md) |
@@ -107,7 +107,18 @@ sampled to 500 by a hash of (week, MBID). So a report is a week of
 events, never a library or wishlist listing.
 
 Album `created_at` is SoulSync's library-row creation time — the
-import-date proxy (GAP-3); there is no dedicated `imported_at`.
+import-date proxy (GAP-3); there is no dedicated `imported_at`. A
+re-scan or migration can reset it, so the node keeps `first_seen`: per
+release group, the earliest `created_at` it has ever read. `recent_add`
+skips groups seen before, and `import_keep` counts from the earliest
+date, so a reset re-sends neither.
+
+**Late matches** (GAP-1). A wishlist row or library album that had no
+release group in its own week (SoulSync's MusicBrainz worker had not
+matched it yet) waits in the node's `late_pending` for up to 14 days.
+When it is matched, its `wishlist_add` / `recent_add` goes in that
+week's report, once. A re-run of the same week (a dry-run preview, then
+the real send) gives the same report; the next week never repeats it.
 
 ## 3. What the signals become — report payload
 
@@ -119,12 +130,20 @@ payload, nothing else is in it:
 {
   "week": "2026-W43",
   "token": "<64 hex chars>",
-  "signals": [{ "type": "import_keep", "mbid": "<uuid>" }, …]
+  "signals": [{ "type": "import_keep", "mbid": "<uuid>" }, …],
+  "churn_optin": true
 }
 ```
 
+`churn_optin` is present (and `true`) **only** when the user turned on
+"Share drop signals"; every other node leaves it out. The pool counts
+how many reports carry it each week (`report_populations`, §8) so
+Loved & Kept can weigh drops from the opted-in share against keeps from
+everyone (§9). It is never stored per node.
+
 Server-side validation (`src/sin/logic.ts::validateReport`) is strict:
-the body may contain **exactly** `week`, `token`, `signals`; each
+the body may contain **exactly** `week`, `token`, `signals`, and the
+optional `churn_optin` (which must be `true` when present); each
 signal exactly `type` and `mbid`; `type` must be one of the eight;
 `mbid` must be UUID-shaped; `week` must be a real ISO week **and an open one**: the week that just
 closed, or the current week (`openReportWeeks`), so nobody can backfill
@@ -279,6 +298,11 @@ typically `./data`). Files (`node/metasync_node/store.py`,
   - `library_group_snapshots` — `[{week, groups}]`, one **complete**
     library read per reported week, the last three weeks (the churn
     two-absence rule);
+  - `library_first_seen` — release group MBID → the earliest
+    `created_at` the node has read for it (§2, GAP-3);
+  - `late_pending` — SoulSync row ids (wishlist rows, library albums)
+    still waiting for a release group, with their date, for at most
+    14 days (§2, late matches);
   - `previews` — per pool, the **exact last report payload** (week,
     token, signals) so the preview page renders a snapshot, never a
     recomputation;
@@ -323,12 +347,13 @@ preview before first send; toggle-gated types stay off until flipped.
 
 ## 8. What the backend stores (Neon Postgres)
 
-Schema: `src/sin/schema.ts`, migrations `db/migrations/0001`–`0008`.
+Schema: `src/sin/schema.ts`, migrations `db/migrations/0001`–`0010`.
 
 | Table | Columns (complete) | Purpose / retention |
 |---|---|---|
 | `report_tokens` | `week`, `token_hash` (PK) | One row per accepted report: the weekly dedupe token, so a second report for the same week counts nothing. **Holds no signals and is never joined to the counts.** Pruned after 3 weeks (the report window is 2). |
 | `aggregate_counts` | `week`, `signal`, `mbid`, `node_count` (PK = week+signal+mbid) | Private running distinct-node counts, **including below-k ones**. A report adds +1 per distinct signal the moment it arrives, in the same transaction as its token claim. No route reads this table. **Deleted 3 weeks after its week**: once a week can no longer receive reports, the aggregation pass publishes everything at or above k, then drops the week's remaining (below-k) counts. |
+| `report_populations` | `week` (PK), `reports`, `churn_optin` | Per week: how many reports were accepted, and how many carried `churn_optin`. +1s in the same transaction as the token claim (migration 0010). **Counts only, nothing per node.** Used to scale drops in Loved & Kept (§9) and by `GET /v1/admin/status`. |
 | `raw_reports` | `id`, `week`, `token_hash`, `signal`, `mbid`, `received_at` | **No longer written** (migration 0008). The next aggregation pass drains any rows left by the old ingest path into `aggregate_counts` and deletes them. Drop the table once it is empty. |
 | `aggregates` | `week`, `signal`, `mbid`, `node_count`, `computed_at` (PK = week+signal+mbid) | Distinct-node counts **after** the k filter — below-k rows are never written. The only table the public index reads. Kept indefinitely (it is the published history). |
 | `index_publications` | `id`, `week`, `trigger`, `aggregate_count`, `raw_deleted`, `published_at` | Audit log of aggregation runs. No user data. |
@@ -357,21 +382,34 @@ every running count at **k ≥ 15** (`K_PUBLISH_THRESHOLD`) into
   left, so an item reported by 15 installs over more than a day never
   reached k.
 - Publication is triggered (admin `POST /v1/aggregate`, and as the
-  first step of compose). Nodes report the closed week through Monday
-  and stragglers later, so compose a week once most reports are in
-  (Tuesday or later), and re-compose to pick up late ones.
+  first step of compose). The scheduled GitHub Actions workflow
+  `.github/workflows/compose.yml` composes **every day at 08:15 UTC**:
+  after Monday's report slots (0–6 h), and again each following day to
+  pick up late reports. It repeats compose until nothing is pending (up
+  to 6 passes), then reads `GET /v1/admin/status` (admin key: report
+  counts and chart keys for the closed week) and **fails** — GitHub then
+  emails the workflow's owner — when the closed week has no charts, or
+  no reports by Tuesday.
+- Compose builds **the week that just closed** unless told otherwise.
+  (It used to default to the latest week with published counts, which
+  would have pinned the charts to that old week whenever no newer week
+  reached k.)
 
 **Composition** (`POST /v1/compose`, admin scope; logic
 `selectChartSpecs` + `buildEditions` in `src/sin/logic.ts`):
 inputs are `aggregates` only — composition never reads raw reports.
 
 - **Most Wanted**: `wishlist_add + hunt_demand` per group, top 25.
-- **Loved & Kept**: `import_keep − download_churn` per group (both now
-  fire once per album: keeps the week an album reaches 14 days, drops
-  the week it is confirmed gone); albums whose net is ≤ 0 drop out. Churn aggregates exist only where ≥ 15
-  **toggle-on** nodes reported that album's churn, so the subtraction
-  never mixes populations; where no churn aggregate exists there is
-  no dampening. Churn is a ranking input only — no chart displays it,
+- **Loved & Kept**: `import_keep − download_churn × scale` per group
+  (both fire once per album: keeps the week an album reaches 14 days,
+  drops the week it is confirmed gone); albums whose net is ≤ 0 drop
+  out. Keeps come from every reporter but drops only from the
+  **opted-in** share, so raw drops undercount by that share: `scale` =
+  reports ÷ opted-in reports for the week (`report_populations`), at
+  least 1 and at most 5 (`CHURN_SCALE_MAX`), and 1 for weeks without
+  population counts. Churn aggregates exist only where ≥ 15 toggle-on
+  nodes reported that album's churn; where none exists there is no
+  dampening. Churn is a ranking input only — no chart displays it,
   and chart reason strings cite keeps only.
 - **Just Landed**: `recent_add` counts, top 25.
 - **On Repeat**: `listen_album` counts, top 25. It exists only where at

@@ -68,6 +68,14 @@ export const reportTokens = pgTable(
   (t) => [primaryKey({ columns: [t.week, t.tokenHash] })],
 );
 
+/** Per week: how many installs reported, and how many of those share
+ *  drop signals. Bare counts, +1 per accepted report (migration 0010). */
+export const reportPopulations = pgTable("report_populations", {
+  week: varchar("week", { length: 8 }).primaryKey(),
+  reports: integer("reports").notNull(),
+  churnOptin: integer("churn_optin").notNull(),
+});
+
 export const aggregateCounts = pgTable(
   "aggregate_counts",
   {

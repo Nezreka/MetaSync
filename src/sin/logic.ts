@@ -108,6 +108,10 @@ export interface ReportInput {
   /** Rotating dedupe token: hash(node_key + week). Unlinkable across weeks. */
   token: string;
   signals: SignalInput[];
+  /** Sent (as true) only by a node that shares drop signals. Counted per
+   *  week in report_populations, never stored per node; it lets Loved &
+   *  Kept scale churn from the opted-in share up to every reporter. */
+  churnOptin?: boolean;
 }
 
 export interface RawReportRow {
@@ -171,9 +175,12 @@ export function validateReport(input: unknown): ValidationResult {
   const obj = input as Record<string, unknown>;
 
   for (const key of Object.keys(obj)) {
-    if (key !== "week" && key !== "token" && key !== "signals") {
+    if (key !== "week" && key !== "token" && key !== "signals" && key !== "churn_optin") {
       errors.push(`unknown field: ${key}`);
     }
+  }
+  if (obj.churn_optin !== undefined && obj.churn_optin !== true) {
+    errors.push("churn_optin, when present, must be true");
   }
   if (!isIsoWeekString(obj.week)) {
     errors.push("week must be an ISO week string like 2026-W43");
@@ -232,6 +239,7 @@ export function validateReport(input: unknown): ValidationResult {
       token: valid.token,
       // Normalise (dedupe within the payload) so callers insert binary rows.
       signals: dedupeSignals(valid.signals),
+      ...(obj.churn_optin === true ? { churnOptin: true } : {}),
     },
   };
 }
@@ -1336,6 +1344,24 @@ function topItems(
     .slice(0, limit);
 }
 
+/** How many installs reported a week, and how many of them share drop
+ *  signals (report_populations). Counts only: never which installs. */
+export interface WeekPopulation {
+  reports: number;
+  churnOptin: number;
+}
+
+/** Churn is reported by the opted-in share only; one drop stands for
+ *  reports/churnOptin drops across everyone. Capped, so a handful of
+ *  opted-in installs can never multiply a drop past CHURN_SCALE_MAX.
+ *  No population data (weeks before it was counted) means 1, the old
+ *  unscaled rule. */
+export const CHURN_SCALE_MAX = 5;
+export function churnScale(population?: WeekPopulation): number {
+  if (!population || population.churnOptin <= 0 || population.reports <= 0) return 1;
+  return Math.min(CHURN_SCALE_MAX, Math.max(1, population.reports / population.churnOptin));
+}
+
 /**
  * Build the week's flagship chart specs from k-filtered aggregates.
  * Trending here ranks release groups by heat (max of wishlist adds and
@@ -1348,6 +1374,7 @@ export function selectChartSpecs(
   week: string,
   priorWeeks: string[],
   previousWeek: string | null,
+  population?: WeekPopulation,
 ): ChartSpec[] {
   const specs: ChartSpec[] = [];
   const push = (key: string, name: string, items: ChartItem[]) => {
@@ -1369,11 +1396,16 @@ export function selectChartSpecs(
   // subtracting them never mixes populations; where no churn aggregate
   // exists there is no dampening. Albums whose churn meets or beats
   // their keeps drop out. Churn is a ranking input only — never shown.
+  //
+  // Keeps come from every reporter, drops only from the opted-in share,
+  // so raw churn undercounts drops by that share. churnScale scales it
+  // back up from the week's population counts.
   const keeps = sumsFor(aggregates, week, ["import_keep"]);
   const churn = sumsFor(aggregates, week, ["download_churn"]);
+  const scale = churnScale(population);
   const netKeeps = new Map<string, number>();
   for (const [mbid, keep] of keeps) {
-    const net = keep - (churn.get(mbid) ?? 0);
+    const net = keep - (churn.get(mbid) ?? 0) * scale;
     if (net > 0) netKeeps.set(mbid, net);
   }
   push(

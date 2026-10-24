@@ -15,6 +15,7 @@ import {
   canonicalPlaylists as playlistsTable,
   portalKeys as portalKeysTable,
   rawReports as rawReportsTable,
+  reportPopulations as populationsTable,
   reportTokens as reportTokensTable,
   sinRequestNonces as noncesTable,
 } from "../src/sin/schema.ts";
@@ -119,6 +120,12 @@ class FakeQuery {
         )
         .map((r) => ({ ...r }));
     }
+    if (this.table === populationsTable) {
+      // where(eq(week, w)) or where(inArray(week, [...])).
+      return this.fake.populationRows
+        .filter((r) => params.length === 0 || params.includes(r.week))
+        .map((r) => ({ ...r }));
+    }
     if (this.table === aggregateCountsTable) {
       // where(gte(nodeCount, k)) optionally and(eq(week, w), ...).
       const k = params.find((p) => typeof p === "number") as number | undefined;
@@ -195,6 +202,17 @@ class InsertQuery {
       }
       return inserted;
     }
+    if (this.table === populationsTable) {
+      // Production upserts reports + 1, churn_optin + (0 or 1).
+      for (const v of rows as unknown as PopulationRow[]) {
+        const existing = fake.populationRows.find((r) => r.week === v.week);
+        if (existing) {
+          existing.reports += v.reports;
+          existing.churnOptin += v.churnOptin;
+        } else fake.populationRows.push({ ...v });
+      }
+      return [];
+    }
     if (this.table === aggregateCountsTable) {
       // Production upserts with node_count = node_count + excluded.node_count.
       for (const v of rows as unknown as CountRow[]) {
@@ -258,11 +276,18 @@ class InsertQuery {
   }
 }
 
+export interface PopulationRow {
+  week: string;
+  reports: number;
+  churnOptin: number;
+}
+
 export class FakeSinDb {
   portalRows: PortalRow[];
   rawRows: RawRow[] = [];
   reportTokens = new Set<string>();
   countRows: CountRow[] = [];
+  populationRows: PopulationRow[] = [];
   aggregateRows: Record<string, unknown>[] = [];
   playlistRows: PlaylistRow[] = [];
   nonceRows = new Map<string, { nodeId: string; nonceHash: string; expiresAt: Date }>();

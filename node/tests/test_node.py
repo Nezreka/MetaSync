@@ -119,7 +119,7 @@ class TestSignals(unittest.TestCase):
         self.assertEqual(result["week"], "2026-W43")
         keys = sorted(f"{s['type']}:{s['mbid']}" for s in result["signals"])
         self.assertEqual(keys, sorted([
-            f"hunt_demand:{RG_A}", f"import_keep:{RG_A}", f"recent_add:{RG_A}",
+            f"hunt_demand:{RG_B}", f"import_keep:{RG_A}", f"recent_add:{RG_A}",
             f"watchlist_add:{ART_NEW}",
             f"wishlist_add:{RG_A}", f"wishlist_add:{RG_B}",
         ]))

@@ -23,6 +23,8 @@
  *   POST /v1/playlists          X-SIN-Key: admin key ONLY — publish the
  *                               week's canonical playlist definitions
  *                               (or an admin-scope access token)
+ *   GET  /v1/admin/status       X-SIN-Key: admin key ONLY — report counts
+ *                               and chart keys for the daily compose job
  *
  * Key model (DESIGN-NODE.md §9 + PORTAL-DESIGN.md §3A): the same
  * X-SIN-Key header carries both env keys — the VALUE determines the
@@ -94,6 +96,7 @@ import {
   mbResolutions,
   portalKeys,
   rawReports,
+  reportPopulations,
   reportTokens,
   sinRequestNonces,
 } from "./schema.ts";
@@ -973,6 +976,17 @@ export async function countReport(
       .onConflictDoNothing()
       .returning({ week: reportTokens.week });
     if (claimed.length === 0) return null;
+    const optin = report.churnOptin ? 1 : 0;
+    await tx
+      .insert(reportPopulations)
+      .values({ week: report.week, reports: 1, churnOptin: optin })
+      .onConflictDoUpdate({
+        target: reportPopulations.week,
+        set: {
+          reports: sql`${reportPopulations.reports} + 1`,
+          churnOptin: sql`${reportPopulations.churnOptin} + ${optin}`,
+        },
+      });
     await addToCounts(tx, increments.map((i) => ({ ...i, nodeCount: 1 })));
     return increments.length;
   });
@@ -1124,6 +1138,54 @@ app.post("/v1/aggregate", async (c) => {
   return c.json({ ok: true, ...result });
 });
 
+/**
+ * What the daily scheduled job (.github/workflows/compose.yml) checks
+ * after it composes: how many installs reported the week that closed and
+ * the current one, and which charts are published for the closed week.
+ * Counts and chart keys only, nothing per install. Exported for tests.
+ */
+export async function adminStatus(db: SinDb, now: Date = new Date()) {
+  const [closed, current] = openReportWeeks(now) as [string, string];
+  const populations = (
+    await db.select().from(reportPopulations).where(inArray(reportPopulations.week, [closed, current]))
+  ).filter((r) => r.week === closed || r.week === current);
+  const pop = (week: string) => populations.find((r) => r.week === week);
+  const charts = (
+    await db
+      .select({ week: canonicalPlaylists.week, key: canonicalPlaylists.key, publishedAt: canonicalPlaylists.publishedAt })
+      .from(canonicalPlaylists)
+      .where(eq(canonicalPlaylists.week, closed))
+  ).filter((r) => r.week === closed);
+  const lastPublished = charts.reduce<Date | null>(
+    (latest, r) => (r.publishedAt && (!latest || r.publishedAt > latest) ? r.publishedAt : latest),
+    null,
+  );
+  return {
+    now: now.toISOString(),
+    weeks: { closed, current },
+    reports: {
+      closed: pop(closed)?.reports ?? 0,
+      current: pop(current)?.reports ?? 0,
+      closedChurnOptin: pop(closed)?.churnOptin ?? 0,
+    },
+    charts: {
+      week: closed,
+      count: charts.length,
+      keys: charts.map((r) => r.key).sort(),
+      lastPublishedAt: lastPublished ? lastPublished.toISOString() : null,
+    },
+  };
+}
+
+app.get("/v1/admin/status", async (c) => {
+  // The operator's env admin key only: this is for the scheduled job.
+  const denied = requireAdminKey(c.req.raw);
+  if (denied) return denied;
+  const found = requireDb();
+  if ("response" in found) return found.response;
+  return c.json({ ok: true, ...(await adminStatus(found.db)) });
+});
+
 /* ------------------------------------------------------------------ */
 /* Composer: weekly auto-publish (see logic.ts selectChartSpecs).      */
 /* One pass: aggregate fresh, select chart specs, resolve up to        */
@@ -1190,14 +1252,20 @@ app.post("/v1/compose", async (c) => {
   }
 
   await aggregateOnce(db, { trigger: "compose" });
-  // The latest counted week; on an empty network, the week that just
-  // closed — the public fill below still gives it charts.
-  const week = weekArg ?? (await resolveWeek(db, undefined)) ?? openReportWeeks()[0]!;
+  // The week that just closed: nodes report it from Monday on, and a
+  // daily compose picks up late reports. (Defaulting to the latest week
+  // with published counts would pin the charts to that old week for as
+  // long as no newer week reaches k.)
+  const week = weekArg ?? openReportWeeks()[0]!;
 
   const priors = await priorWeeksOf(db, week);
   const previousWeek = priors[priors.length - 1] ?? null;
   const rows = await loadAggregates(db, [week, ...priors]);
-  const networkSpecs = selectChartSpecs(rows, week, priors, previousWeek);
+  const [population] = await db
+    .select()
+    .from(reportPopulations)
+    .where(eq(reportPopulations.week, week));
+  const networkSpecs = selectChartSpecs(rows, week, priors, previousWeek, population);
   const chartedMbids = new Set(rows.filter((r) => r.week === week).map((r) => r.mbid));
 
   // Cold start (logic.ts fillFromPublic): Trending and Just Landed take

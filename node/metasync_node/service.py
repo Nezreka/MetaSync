@@ -26,7 +26,7 @@ from .identity import NodeIdentity, load_or_create_identity, token_for_week
 from .musicbrainz import MusicBrainzResolver
 from .playlists import build_canonical_playlists
 from .pool import PoolBindingPending, PoolClient, PoolError, PoolNotAvailable, is_loopback_url
-from .signals import compute_signals, is_uuid_shape
+from .signals import KEEP_AFTER, LATE_WINDOW, compute_signals, is_uuid_shape
 from .soulsync import SoulSyncClient, SoulSyncError
 from .store import Store, default_pool_from_env
 from .weekutil import closed_week_start, iso_week_string
@@ -518,8 +518,21 @@ class NodeService:
             except Exception as err:  # noqa: BLE001 — same rule as downloads: an older SoulSync without the endpoint just sends no listening signals.
                 listening_error = str(err)
         emit({"phase": "resolving", "detail": "Matching albums to MusicBrainz release groups", "page": None, "pages_total": None})
+        # This week's work first: download and listening rows, then the
+        # albums whose signals depend on this week (landed in it, crossing
+        # their 14-day mark in it, or waiting for a late match). The rest
+        # of the library only feeds churn snapshots and coverage numbers,
+        # so a huge library spends its lookup budget on what is reported.
+        late_albums = set(((self.store.state.get("late_pending") or {}).get("albums") or {}).keys())
+        window_start = week_start - KEEP_AFTER - LATE_WINDOW
+
+        def this_weeks_album(album: dict[str, Any]) -> bool:
+            created = _parse_time(album.get("created_at"))
+            return (created is not None and window_start <= created < week_end) or str(album.get("id")) in late_albums
+
         priority_release_ids = [
-            str(row.get("musicbrainz_release_id")) for row in [*(downloads or []), *(listening or [])]
+            str(row.get("musicbrainz_release_id"))
+            for row in [*(downloads or []), *(listening or []), *(a for a in albums if this_weeks_album(a))]
             if is_uuid_shape(row.get("musicbrainz_release_id"))
         ]
         release_to_group = self._resolve_album_groups(
@@ -567,7 +580,13 @@ class NodeService:
             share_churn=bool(self.store.settings.get("share_churn", False)),
             library_complete=not albums_truncated,
             listening=listening,
+            first_seen=self.store.state.get("library_first_seen") or {},
+            late_pending=self.store.state.get("late_pending") or {},
         )
+        # The node's own memory (never sent): earliest date per album group,
+        # and rows still waiting for a MusicBrainz match (signals.py GAP-1/3).
+        self.store.state["library_first_seen"] = result.pop("first_seen")
+        self.store.state["late_pending"] = result.pop("late_pending")
         result["diagnostics"]["albums_truncated"] = albums_truncated
         result["diagnostics"]["wishlist_truncated"] = "/wishlist" in truncated
         result["diagnostics"]["downloads_available"] = downloads is not None
@@ -628,11 +647,16 @@ class NodeService:
         return mapping
 
     def payload_for_pool(self, pool: dict[str, Any], report: dict[str, Any]) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "week": report["week"],
             "token": token_for_week(self.identity, report["week"]),
             "signals": report["signals"],
         }
+        # Only a node sharing drop signals says so: the pool counts how many
+        # do, never which, to weigh drops against every reporter's keeps.
+        if self.store.settings.get("share_churn", False):
+            payload["churn_optin"] = True
+        return payload
 
     def report_slot(self) -> timedelta:
         """This node's fixed offset into Monday (0-6h UTC) before the

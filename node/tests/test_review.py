@@ -84,7 +84,7 @@ class TestClosedWeekRules(unittest.TestCase):
 
     def test_standing_hunt_demand_is_sampled_not_dropped(self):
         wishlist = [
-            {"track_data": {"musicbrainz_release_group_id": _mbid("3", i)}, "date_added": "2026-09-01T00:00:00"}
+            {"track_data": {"musicbrainz_release_group_id": _mbid("3", i)}, "date_added": "2026-09-01T00:00:00", "retry_count": 1}
             for i in range(HUNT_DEMAND_LIMIT + 40)
         ]
         result = compute_signals(

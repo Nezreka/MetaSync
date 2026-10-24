@@ -10,7 +10,10 @@ GAP-1 (wishlist MBID): closed by SoulSync's metasync/release-group-enrichment
   background and serves ``musicbrainz_release_group_id`` on the row. Until
   that runs (or on an older SoulSync) a row only contributes when its raw
   track_data carries a release-group MBID under one of
-  WISHLIST_RG_MBID_KEYS; others are skipped and counted.
+  WISHLIST_RG_MBID_KEYS. A row added in the week but matched only later
+  is not lost: it waits in ``late_pending`` and fires in the report of the
+  week it is matched, up to LATE_WINDOW after it was added. Library albums
+  whose release group resolves late get the same treatment for recent_add.
 
 GAP-2 (album release-group): SIN keys album signals by RELEASE-GROUP mbid.
   SoulSync now serves ``musicbrainz_release_group_id`` on library albums
@@ -19,12 +22,18 @@ GAP-2 (album release-group): SIN keys album signals by RELEASE-GROUP mbid.
   release id is missing or unresolved are skipped.
 
 GAP-3 (import date): an album's created_at is when its row entered the
-  library DB (the recently-added endpoint orders by it), so it is the
-  import-date proxy for import_keep. There is no dedicated imported_at.
+  library DB, the import-date proxy; there is no dedicated imported_at. A
+  re-scan or migration can reset it, so the node keeps ``first_seen``:
+  per release group, the earliest of every created_at it has read. An
+  album whose group was seen before the week is not a recent_add again,
+  and import_keep counts 14 days from the earliest date, so a reset never
+  re-sends a keeper either.
 
-GAP-4 (hunt_demand success): "no successful download yet" is proxied by
-  "still on the wishlist" — SoulSync removes fulfilled wishlist items;
-  the API exposes no per-item download-success flag.
+GAP-4 (hunt_demand success): SoulSync removes fulfilled wishlist items,
+  so "still on the wishlist" means "not downloaded". A row is a hunt only
+  when SoulSync has actually tried it (retry_count >= 1: searched, and
+  nothing found or kept) and its album is not already in the library (a
+  missing track of an owned album is not demand for the album).
 
 THE REPORT IS ONE CLOSED WEEK (DESIGN-NODE.md §12). The node reports the
 ISO week that just ended, [week_start, week_end): "this week" signals are
@@ -73,6 +82,9 @@ LISTEN_LIMIT = 50
 
 KEEP_AFTER = timedelta(days=14)
 HUNT_AFTER = timedelta(days=7)
+# How long a wishlist row or library album unmatched in its own week waits
+# for its release group before it is forgotten (GAP-1).
+LATE_WINDOW = timedelta(days=14)
 
 _UUID_SHAPE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
 
@@ -111,6 +123,13 @@ def _instant(value: Any) -> datetime | None:
     return parse_iso(value) if isinstance(value, str) else None
 
 
+def _row_key(row: dict[str, Any]) -> str | None:
+    """SoulSync's own row id: stable across reads, says nothing outside
+    this install, and never leaves the node."""
+    value = row.get("id")
+    return str(value) if value not in (None, "") else None
+
+
 def _hunt_sample_key(week: str, mbid: str) -> str:
     return hashlib.sha256(f"{week}:{mbid}".encode()).hexdigest()
 
@@ -129,9 +148,14 @@ def compute_signals(
     share_churn: bool = False,
     library_complete: bool = True,
     listening: list[dict[str, Any]] | None = None,
+    first_seen: dict[str, str] | None = None,
+    late_pending: dict[str, dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """The signals for the closed week starting at ``week_start`` (a UTC
-    Monday 00:00). ``listening`` is None unless the user opted in."""
+    Monday 00:00). ``listening`` is None unless the user opted in.
+    ``first_seen`` (group -> earliest created_at seen) and ``late_pending``
+    are the node's own memory from earlier runs (GAP-1, GAP-3); the
+    result carries the updated versions for the caller to store."""
     week_end = week_start + timedelta(days=7)
     week = iso_week_string(week_start)
     found: dict[str, list[str]] = {t: [] for t in SIGNAL_TYPES}
@@ -165,20 +189,44 @@ def compute_signals(
             continue
         add("watchlist_add", mbid)
 
-    for track in wishlist:
-        rg = wishlist_release_group_mbid(track)
-        if rg is None:
-            gaps["wishlist_no_mbid"] += 1
-            continue
-        if in_week(track.get("date_added")):
-            add("wishlist_add", rg)
-        added = _instant(track.get("date_added"))
-        if added is not None and week_end - added >= HUNT_AFTER:
-            add("hunt_demand", rg)
-
     # The library's release groups right now (resolved ones only) — the
     # churn rule and the caller's snapshot rotation both key off this set.
     # Coverage gaps are counted over the whole library.
+    seen_before = dict(first_seen or {})
+    prior_late = late_pending or {}
+    prior_late_albums = prior_late.get("albums") or {}
+    prior_late_wishlist = prior_late.get("wishlist") or {}
+    new_first_seen = dict(seen_before)
+    new_late: dict[str, dict[str, dict[str, str]]] = {"albums": {}, "wishlist": {}}
+    late_fired = {"recent_add": 0, "wishlist_add": 0}
+
+    def waiting(prior: dict[str, Any], key: str | None) -> bool:
+        # Still waiting, or fired for THIS week (a re-run of the same
+        # week, e.g. a dry-run preview then the real send, must give the
+        # same report). Fired for an earlier week: done, never again.
+        entry = prior.get(key) if key else None
+        if entry is None:
+            return False
+        fired = entry.get("fired") if isinstance(entry, dict) else None
+        return fired is None or fired == week
+
+    def remember(bucket: str, key: str, when: datetime, fired: bool = False) -> None:
+        entry = {"at": when.isoformat()}
+        if fired:
+            entry["fired"] = week
+        new_late[bucket][key] = entry
+
+    def recently(when: datetime | None) -> bool:
+        # Inside the late window, before this week (this week is on time).
+        return when is not None and week_start - LATE_WINDOW <= when < week_start
+
+    def new_to_library(rg: str, created: datetime) -> bool:
+        # A group first seen (by an earlier read) before this album's own
+        # date is an album the library already had: a re-scan, a
+        # migration, a second edition. Never a recent_add.
+        earlier = _instant(seen_before.get(rg))
+        return earlier is None or earlier >= created - timedelta(days=1)
+
     current_groups: set[str] = set()
     albums_recent = 0
     recent_groups: set[str] = set()
@@ -194,16 +242,58 @@ def compute_signals(
         created = _instant(album.get("created_at"))
         if created is None:
             continue
+        key = _row_key(album)
+        if rg:
+            stored = _instant(new_first_seen.get(rg))
+            if stored is None or created < stored:
+                new_first_seen[rg] = created.isoformat()
         # recent_add: landed in the library during the week.
         if week_start <= created < week_end:
             albums_recent += 1
-            if rg:
+            if rg and new_to_library(rg, created):
                 add("recent_add", rg)
                 recent_groups.add(rg)
+            elif not rg and key:
+                remember("albums", key, created)
+        elif waiting(prior_late_albums, key) and recently(created):
+            # Landed in an earlier week, matched only now (GAP-1).
+            if rg:
+                if new_to_library(rg, created):
+                    add("recent_add", rg)
+                    recent_groups.add(rg)
+                    late_fired["recent_add"] += 1
+                    remember("albums", key, created, fired=True)
+            else:
+                remember("albums", key, created)
         # import_keep: crossed its 14-day mark during the week and is still
         # here — once per album, the week it became a keeper, never again.
-        if rg and week_start <= created + KEEP_AFTER < week_end:
-            add("import_keep", rg)
+        # Counted from the earliest date the node ever saw for the group,
+        # so a reset created_at cannot make an old album a keeper again.
+        if rg:
+            basis = min(created, _instant(seen_before.get(rg)) or created)
+            if week_start <= basis + KEEP_AFTER < week_end:
+                add("import_keep", rg)
+
+    for track in wishlist:
+        rg = wishlist_release_group_mbid(track)
+        added = _instant(track.get("date_added"))
+        key = _row_key(track)
+        if rg is None:
+            gaps["wishlist_no_mbid"] += 1
+            if key and added is not None and (week_start <= added < week_end or (waiting(prior_late_wishlist, key) and recently(added))):
+                remember("wishlist", key, added)
+            continue
+        if in_week(track.get("date_added")):
+            add("wishlist_add", rg)
+        elif waiting(prior_late_wishlist, key) and recently(added):
+            add("wishlist_add", rg)  # added earlier, matched only now (GAP-1)
+            late_fired["wishlist_add"] += 1
+            remember("wishlist", key, added, fired=True)
+        # hunt_demand (GAP-4): wanted for a week, tried by SoulSync without
+        # success, and the album still not in the library.
+        tried = int(track.get("retry_count") or 0) >= 1
+        if added is not None and week_end - added >= HUNT_AFTER and tried and rg not in current_groups:
+            add("hunt_demand", rg)
 
     # download_grab (DESIGN-DOWNLOAD-SIGNALS.md): acquisition this week
     # that recent_add cannot see — re-grabs, upgrades and gap-fills of
@@ -323,7 +413,11 @@ def compute_signals(
             "listen_sent": fired("listen_album"),
             "bulk_suppressed": bulk_suppressed,
             "library_groups_now": len(current_groups),
+            "late_matched": late_fired,
+            "late_waiting": {k: sum(1 for e in v.values() if "fired" not in e) for k, v in new_late.items()},
             "gaps": gaps,
         },
         "library_groups": sorted(current_groups),
+        "first_seen": new_first_seen,
+        "late_pending": new_late,
     }
