@@ -127,7 +127,9 @@ code.sub { display: block; margin-top: 4px; font-size: 12px; color: var(--muted)
   color: var(--text);
 }
 .brand:hover { text-decoration: none; }
-.brand-logo { width: 36px; height: 36px; border-radius: 10px; }
+/* The logo is not square (514x387): every tile keeps its shape. */
+.brand-logo, .hero-badge img, .auth-logo { object-fit: contain; }
+.brand-logo { width: 36px; height: 36px; }
 .brand-text { display: flex; flex-direction: column; line-height: 1.15; }
 .brand-name { font-size: 19px; font-weight: 800; letter-spacing: -0.02em; color: var(--text); }
 .brand-sub { font-size: 10.5px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted); }
@@ -315,7 +317,9 @@ code.sub { display: block; margin-top: 4px; font-size: 12px; color: var(--muted)
 .hero-badge img {
   width: 92px;
   height: 92px;
+  padding: 14px;
   border-radius: 26px;
+  background: rgba(0, 0, 0, 0.35);
   box-shadow: 0 0 0 1px var(--border-strong), 0 18px 48px rgba(var(--accent-rgb), 0.25);
 }
 .hero-badge code { font-size: 13px; letter-spacing: 0.08em; }
@@ -719,7 +723,7 @@ pre {
 .auth-main { display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; max-width: 480px; padding: 48px 20px; }
 .auth-main .app-footer { width: 100%; text-align: center; }
 .auth-brand { display: flex; flex-direction: column; align-items: center; gap: 10px; margin-bottom: 26px; text-align: center; }
-.auth-logo { width: 76px; height: 76px; border-radius: 22px; box-shadow: 0 18px 48px rgba(var(--accent-rgb), 0.3); }
+.auth-logo { width: 76px; height: 76px; padding: 10px; border-radius: 22px; background: rgba(0, 0, 0, 0.35); box-shadow: 0 0 0 1px var(--border-strong), 0 18px 48px rgba(var(--accent-rgb), 0.3); }
 .auth-brand .brand-name { font-size: 30px; }
 .auth-sub { color: var(--muted); margin: 0; }
 .auth-card { width: 100%; padding: 32px; }
