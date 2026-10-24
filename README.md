@@ -163,8 +163,8 @@ or downloaded until you press Sync & download** on it.
 5. Every day a scheduled job runs the composer, which turns counts into
    charts (only items at or above k = 15) and publishes them for nodes
    to pull, then checks the network's vital signs. If there are no
-   charts, or no reports by Tuesday, the job fails and GitHub emails
-   the owner.
+   charts, or reports stopped (none this week after some the week
+   before), the job fails and GitHub emails the owner.
 
 ## SIN backend API (for the curious)
 

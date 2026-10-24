@@ -389,7 +389,9 @@ every running count at **k ≥ 15** (`K_PUBLISH_THRESHOLD`) into
   to 6 passes), then reads `GET /v1/admin/status` (admin key: report
   counts and chart keys for the closed week) and **fails** — GitHub then
   emails the workflow's owner — when the closed week has no charts, or
-  no reports by Tuesday.
+  when reports **stopped**: none for the closed week by Tuesday although
+  the week before had some. (Before the first live report, zero is
+  expected and only noted.) Report counts come from `report_tokens`.
 - Compose builds **the week that just closed** unless told otherwise.
   (It used to default to the latest week with published counts, which
   would have pinned the charts to that old week whenever no newer week

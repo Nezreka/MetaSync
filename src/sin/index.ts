@@ -1146,12 +1146,14 @@ app.post("/v1/aggregate", async (c) => {
  */
 export async function adminStatus(db: SinDb, now: Date = new Date()) {
   const [closed, current] = openReportWeeks(now) as [string, string];
+  const previous = isoWeekOf(new Date(now.getTime() - 14 * 86_400_000));
   // Reports: one report_tokens row per accepted report (kept 3 weeks, so
-  // both open weeks are always there). report_populations only began
+  // the week before the closed one is there too: "reports stopped" means
+  // it had some and the closed week has none). report_populations only began
   // counting with migration 0010; it supplies the opted-in share.
   const tokens = (
-    await db.select({ week: reportTokens.week }).from(reportTokens).where(inArray(reportTokens.week, [closed, current]))
-  ).filter((r) => r.week === closed || r.week === current);
+    await db.select({ week: reportTokens.week }).from(reportTokens).where(inArray(reportTokens.week, [previous, closed, current]))
+  ).filter((r) => r.week === previous || r.week === closed || r.week === current);
   const reportsFor = (week: string) => tokens.filter((r) => r.week === week).length;
   const populations = (
     await db.select().from(reportPopulations).where(inArray(reportPopulations.week, [closed, current]))
@@ -1169,8 +1171,9 @@ export async function adminStatus(db: SinDb, now: Date = new Date()) {
   );
   return {
     now: now.toISOString(),
-    weeks: { closed, current },
+    weeks: { previous, closed, current },
     reports: {
+      previous: reportsFor(previous),
       closed: reportsFor(closed),
       current: reportsFor(current),
       closedChurnOptin: pop(closed)?.churnOptin ?? 0,

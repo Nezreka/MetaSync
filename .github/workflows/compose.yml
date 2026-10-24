@@ -59,9 +59,12 @@ jobs:
           echo
           charts=$(jq '.charts.count' status.json)
           reports=$(jq '.reports.closed' status.json)
+          before=$(jq '.reports.previous' status.json)
           week=$(jq -r '.weeks.closed' status.json)
           # Monday = 1. Nodes report the closed week in Monday's first six
-          # hours; by Tuesday it is a fault if none have.
+          # hours. By Tuesday, zero reports is a fault only if reports
+          # STOPPED: the week before had some. Before the first live
+          # report ever (pre-launch), it is just a note.
           dow=$(date -u +%u)
           failed=0
           if [ "$charts" -eq 0 ]; then
@@ -69,8 +72,12 @@ jobs:
             failed=1
           fi
           if [ "$dow" -ge 2 ] && [ "$reports" -eq 0 ]; then
-            echo "::error::No node has reported $week yet. Check the nodes and the pool's /v1/report route."
-            failed=1
+            if [ "$before" -gt 0 ]; then
+              echo "::error::Reports stopped: $before for the week before, none for $week. Check the nodes and the pool's /v1/report route."
+              failed=1
+            else
+              echo "::notice::No reports for $week or the week before. Expected until nodes report live."
+            fi
           fi
           echo "$week: $reports reports, $charts charts ($(jq -c '.charts.keys' status.json))"
           exit $failed

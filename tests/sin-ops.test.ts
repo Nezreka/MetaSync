@@ -127,6 +127,8 @@ describe("report populations, compose week and admin status (no live database)",
     // the populations row only supplies the opted-in share.
     for (let i = 0; i < 7; i += 1) fake.reportTokens.add(`${closed}|token-${i}`);
     fake.reportTokens.add(`${current}|token-x`);
+    const previous = isoWeekOf(new Date(now.getTime() - 14 * 86_400_000));
+    fake.reportTokens.add(`${previous}|token-p1`).add(`${previous}|token-p2`);
     fake.populationRows.push({ week: closed, reports: 3, churnOptin: 2 });
     fake.playlistRows.push(
       { week: closed, key: "trending", name: "T", tracks: [], publishedAt: now },
@@ -140,10 +142,10 @@ describe("report populations, compose week and admin status (no live database)",
       const res = await mod.default.request("/v1/admin/status", { headers: { "x-sin-key": ADMIN } });
       assert.equal(res.status, 200);
       const body = (await res.json()) as {
-        reports: { closed: number; current: number; closedChurnOptin: number };
+        reports: { previous: number; closed: number; current: number; closedChurnOptin: number };
         charts: { week: string; count: number; keys: string[] };
       };
-      assert.deepEqual(body.reports, { closed: 7, current: 1, closedChurnOptin: 2 });
+      assert.deepEqual(body.reports, { previous: 2, closed: 7, current: 1, closedChurnOptin: 2 });
       assert.deepEqual(body.charts.keys, ["top-tracks", "trending"]);
       assert.equal(body.charts.week, closed);
     } finally {
