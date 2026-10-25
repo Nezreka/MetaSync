@@ -33,8 +33,23 @@ sign-in works for everyone; Google sign-in is still limited while its
 consent screen is in testing.) The key is shown **once** — copy it
 somewhere safe. The portal only ever stores a hash of it.
 
-**2. Run a node.** Docker: see
+**2. Run a node.** Docker is the easy way — the image is published on
+Docker Hub (and mirrored on GHCR):
+
+```bash
+docker run -d --name metasync \
+  -p 8790:8790 \
+  -v metasync_data:/data \
+  boulderbadgedad/metasync:latest
+```
+
+The `/data` volume holds your node's identity key, settings, and caches —
+keep it. If it is ever lost, the node gets a new identity and the portal
+asks you to approve it again. To run MetaSync in the same compose file as
+your SoulSync, see
 [`node/docker-compose.example.yml`](node/docker-compose.example.yml).
+The GHCR mirror is `ghcr.io/nezreka/metasync:latest` — the same image.
+
 Bare metal:
 
 ```bash
@@ -122,8 +137,8 @@ library size, usernames, emails, IP-based identity, or your SoulSync URL.
   exchange time, so the key itself is almost never sent — and it works
   only from the one node you approved, never presented directly.
 - **Users can never publish.** Nodes only push their own signals and pull
-  data. The shared charts are composed and published only by the official
-  MetaSync (admin role).
+  data. The shared charts are composed and published by the pool server
+  itself — no node can publish.
 
 ## What you get back
 
@@ -133,8 +148,9 @@ SoulSync**, **Most Wanted**, **Breakout Artists**, **Loved & Kept**,
 signal), plus genre and decade editions when enough
 charted albums share a tag. The shared work happens once, on the server:
 only charted albums get looked up on MusicBrainz (track lists, genre,
-year), and each contributes its 2 most popular tracks by ListenBrainz's
-public listening statistics — SIN itself never collects track data.
+year), and each contributes up to its 5 most popular tracks, ranked by
+ListenBrainz's public listening statistics — SIN itself never collects
+track data.
 Everything is cached for everyone. While the network is young, Trending
 and Just Landed fill their empty slots from ListenBrainz's public weekly
 charts. The playlist name says so ("Trending · from ListenBrainz"), and
@@ -186,7 +202,11 @@ Pool URL is shown on your portal dashboard after sign-in.
 ## Development
 
 GitHub Actions runs all three suites on every push and pull request
-(`.github/workflows/tests.yml`).
+(`.github/workflows/tests.yml`). Docker images publish from
+`.github/workflows/docker-publish.yml`, mirroring SoulSync: every push
+to main builds `:latest`, and a manual dispatch with a version tag cuts
+a numbered release — both to Docker Hub (`boulderbadgedad/metasync`)
+and GHCR (`ghcr.io/nezreka/metasync`), for amd64 and arm64.
 
 ```bash
 npm run build   # tsc --noEmit (strict) over the backend + tests
