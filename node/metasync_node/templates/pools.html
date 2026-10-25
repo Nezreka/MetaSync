@@ -5,7 +5,7 @@
   <p class="eyebrow-chip">Step B · Optional</p>
   <h1>Pools</h1>
   <p class="page-sub">A pool is a network this node exchanges data with; SIN is one pool. Normally the pool key is entered in <strong>SoulSync</strong>, handed to MetaSync over the protected local connection, and exchanged here for a short-lived access token. This page is therefore mainly connection status. The manual key form stays at the bottom, collapsed, as a labelled fallback.</p>
-  <p class="page-sub">A normal node can only push its weekly report and pull index/playlist data. The <strong>admin</strong> role is only for Boulder's official MetaSync, which publishes the shared playlist data — user nodes never publish.</p>
+  <p class="page-sub">A normal node can only push its weekly report and pull index/playlist data — no node publishes. The shared charts are composed and published by the pool's own server, from the combined counts, on a schedule. The <strong>admin</strong> role belongs to the pool operator, for running that server side; it is never a setting a user node needs.</p>
   <div class="row">
     <a class="btn-link" href="https://metasync.ssync.net" target="_blank" rel="noopener">Get a pool key</a>
     <span class="muted">Opens the SIN front desk at metasync.ssync.net — sign in there to create or manage your pool key, then hand it to MetaSync from SoulSync's settings.</span>
@@ -59,7 +59,7 @@
         <label>Role
           <select name="role">
             <option value="node" {% if p.role != "admin" %}selected{% endif %}>node — push report, pull data (normal)</option>
-            <option value="admin" {% if p.role == "admin" %}selected{% endif %}>admin — official MetaSync only (publishes playlist data)</option>
+            <option value="admin" {% if p.role == "admin" %}selected{% endif %}>admin — pool operator only (server-side)</option>
           </select>
         </label>
         <button type="submit">Save fallback key &amp; exchange</button>
@@ -80,7 +80,7 @@
     <label>Role
       <select name="role">
         <option value="node" selected>node — push report, pull data (normal)</option>
-        <option value="admin">admin — official MetaSync only (publishes playlist data)</option>
+        <option value="admin">admin — pool operator only (server-side)</option>
       </select>
     </label>
     <button class="primary" type="submit">Add pool manually</button>
