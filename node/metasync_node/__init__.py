@@ -6,4 +6,4 @@ back from the pool, and materializes/updates those playlists inside the
 local SoulSync. See DESIGN-NODE.md at the repo root.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

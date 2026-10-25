@@ -2,14 +2,15 @@
 # to SoulSync does NOT join any network — join a pool from the MetaSync UI.
 services:
   soulsync:
-    image: soulsync:latest # your existing SoulSync service
+    image: boulderbadgedad/soulsync:latest # your existing SoulSync service
     # ... your existing SoulSync configuration ...
     ports:
       - "8000:8000"
 
   metasync:
-    build: .
-    image: metasync-node:latest
+    image: boulderbadgedad/metasync:latest
+    # Building from source instead: replace the image line with `build: .`
+    # (this example lives in the node/ directory, next to the Dockerfile).
     environment:
       METASYNC_STATE_DIR: /data
       METASYNC_PORT: "8790"
