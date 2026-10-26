@@ -20,6 +20,7 @@ import base64
 import hashlib
 import json
 import re
+import secrets
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
@@ -36,7 +37,7 @@ SOULID_VERSION = _soulid.SOULID_VERSION
 # Anything else — "soul_" alone, SoulSync's soul_unnamed_<pk> placeholder
 # (which also leaks a local primary key), legacy IDs — is not a v1 claim
 # subject (§6: legacy subjects are alias entries, never v2 subjects).
-_SUBJECT_RE = re.compile(r"^soul_[0-9a-f]{16}$")
+_SUBJECT_RE = re.compile(r"soul_[0-9a-f]{16}")
 
 KINDS = ("artist", "album", "track")
 
@@ -62,6 +63,7 @@ RESERVED_SOURCES = ("user_edit",)
 
 MAX_CLAIMS_PER_BATCH = 50_000          # backfill allowance (§6)
 MAX_CLAIMS_PER_BATCH_STEADY = 5_000   # steady-state daily cap (§6)
+MAX_RETRACTIONS_PER_BATCH = 5_000     # a batch is not a bulk-delete tool
 MAX_NAME_CHARS = 512                   # ingest cap (§10)
 
 
@@ -80,6 +82,18 @@ class ClaimError(ValueError):
 def _check_canonical_value(v, path="$"):
     if isinstance(v, float):
         raise ClaimError(f"float forbidden in batch at {path}")
+    if isinstance(v, str):
+        # Postgres jsonb refuses NUL, and a lone surrogate cannot be
+        # encoded to UTF-8 at all: a batch carrying either could be
+        # signed here and then wedge the ingest mid-write. Refuse at
+        # construction, on both sides of the wire.
+        if "\x00" in v:
+            raise ClaimError(f"NUL character forbidden in batch at {path}")
+        try:
+            v.encode("utf-8")
+        except UnicodeEncodeError as e:
+            raise ClaimError(
+                f"unpaired surrogate in batch at {path}") from e
     if isinstance(v, int) and not isinstance(v, bool) \
             and abs(v) > 2**53 - 1:
         # Beyond 2^53 a JCS (double-based) implementation serializes a
@@ -90,6 +104,10 @@ def _check_canonical_value(v, path="$"):
         for k, val in v.items():
             if not isinstance(k, str):
                 raise ClaimError(f"non-string key at {path}")
+            # Keys are strings too: the same NUL/surrogate rules apply
+            # (the TS canonical form checks them, so a batch signed
+            # here must not carry one either).
+            _check_canonical_value(k, f"{path}.<key>")
             _check_canonical_value(val, f"{path}.{k}")
     elif isinstance(v, (list, tuple)):
         for i, val in enumerate(v):
@@ -112,7 +130,7 @@ def validate_claim(claim) -> dict:
     if not isinstance(claim, dict):
         raise ClaimError("claim must be an object")
     subject = claim.get("subject")
-    if not isinstance(subject, str) or not _SUBJECT_RE.match(subject):
+    if not isinstance(subject, str) or not _SUBJECT_RE.fullmatch(subject):
         raise ClaimError("claim.subject must be a SoulID string")
     if claim.get("kind") not in KINDS:
         raise ClaimError(f"claim.kind must be one of {KINDS}")
@@ -174,7 +192,7 @@ def validate_claim(claim) -> dict:
                 "album_track value needs exactly "
                 "track/disc/position/variant")
         if not isinstance(value["track"], str) or \
-                not _SUBJECT_RE.match(value["track"]):
+                not _SUBJECT_RE.fullmatch(value["track"]):
             raise ClaimError("album_track track must be a SoulID string")
         for k in ("disc", "position"):
             if isinstance(value[k], bool) or not isinstance(value[k], int) \
@@ -202,13 +220,30 @@ def _check_batch_claims(claims) -> None:
 
 
 def _check_retractions(retractions) -> None:
-    if not isinstance(retractions, list) or \
-            not all(isinstance(r, dict) for r in retractions):
-        raise ClaimError("retractions must be a list of objects")
+    """A retraction IS a claim object (§6): it identifies one
+    previously-sent claim by (subject, field, value) and is validated
+    with the same rules, so the signer and the ingest can never drift
+    into accepting different retraction shapes."""
+    if not isinstance(retractions, list):
+        raise ClaimError("retractions must be a list")
+    if len(retractions) > MAX_RETRACTIONS_PER_BATCH:
+        raise ClaimError("batch over retraction cap")
+    for r in retractions:
+        validate_claim(r)
 
 
-def make_batch(node_pubkey_b64: str, claims, retractions=None) -> dict:
-    """Build an unsigned batch envelope from validated claims."""
+def make_batch(node_pubkey_b64: str, claims, retractions=None,
+               nonce: str | None = None) -> dict:
+    """Build an unsigned batch envelope from validated claims.
+
+    The header carries a random `nonce`: a batch's digest is its
+    identity at ingest, and without the nonce two identical claim
+    sets would be the same batch forever — claim X sent, retracted,
+    and re-sent in an identical batch could never land again. The
+    nonce makes each sending its own batch; per-claim dedupe is the
+    (subject, field, value, account) unique rule at ingest, not the
+    batch digest.
+    """
     claims = [validate_claim(c) for c in claims]
     if len(claims) > MAX_CLAIMS_PER_BATCH:
         raise ClaimError("batch over claim cap")
@@ -218,6 +253,7 @@ def make_batch(node_pubkey_b64: str, claims, retractions=None) -> dict:
         "version": BATCH_VERSION,
         "node": node_pubkey_b64,
         "claim_count": len(claims),
+        "nonce": nonce or b64url_encode(secrets.token_bytes(16)),
     }
     batch = {"header": header, "claims": claims,
              "retractions": retractions or []}
@@ -266,6 +302,8 @@ def verify_batch(public_key_b64: str, envelope: dict) -> dict:
         raise ClaimError("unsupported batch version")
     if header.get("node") != public_key_b64:
         raise ClaimError("batch header node does not match the signing key")
+    if not isinstance(header.get("nonce"), str) or not header["nonce"]:
+        raise ClaimError("batch header nonce missing")
     try:
         pub.verify(sig, digest)
     except InvalidSignature as e:

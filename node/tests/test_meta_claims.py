@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
 )
+
 from metasync_node.meta import claims as C
 from metasync_node.meta import soulid as S
 
@@ -155,6 +156,34 @@ class TestBatchSignVerify(unittest.TestCase):
         b1 = C.make_batch(PUB, [name_claim(), id_claim()])
         b2 = C.make_batch(PUB, [id_claim(), name_claim()])
         self.assertNotEqual(C.batch_digest(b1), C.batch_digest(b2))
+
+    def test_identical_claim_sets_are_still_distinct_batches(self):
+        # The header nonce is what lets claim X be sent, retracted,
+        # and sent again: each sending is its own batch.
+        b1 = C.make_batch(PUB, [id_claim()])
+        b2 = C.make_batch(PUB, [id_claim()])
+        self.assertNotEqual(b1["header"]["nonce"], b2["header"]["nonce"])
+        self.assertNotEqual(C.batch_digest(b1), C.batch_digest(b2))
+        out = C.verify_batch(PUB, C.sign_batch(PRIV, b1))
+        self.assertEqual(out["header"]["nonce"], b1["header"]["nonce"])
+
+    def test_retraction_must_be_a_full_claim(self):
+        with self.assertRaises(C.ClaimError):
+            C.make_batch(PUB, [id_claim()],
+                         retractions=[{"subject": "soul_0123456789abcdef"}])
+        ok = C.make_batch(PUB, [name_claim()], retractions=[id_claim()])
+        C.verify_batch(PUB, C.sign_batch(PRIV, ok))
+
+    def test_nul_and_surrogate_values_refused(self):
+        with self.assertRaises(C.ClaimError):
+            C.make_batch(PUB, [id_claim(field="label", value="a\x00b")])
+        with self.assertRaises(C.ClaimError):
+            C.make_batch(PUB, [id_claim(field="label", value="a\ud800b")])
+
+    def test_subject_with_trailing_newline_refused(self):
+        with self.assertRaises(C.ClaimError):
+            C.validate_claim(id_claim(
+                subject="soul_0123456789abcdef\n"))
 
     def test_duplicate_name_claim_rejected(self):
         with self.assertRaises(C.ClaimError):
