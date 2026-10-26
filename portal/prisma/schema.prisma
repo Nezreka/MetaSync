@@ -29,6 +29,12 @@ model PortalUser {
   image         String?
   emailVerified DateTime? @map("email_verified")
   role          String    @default("user") // "user" | "admin"
+  // Metadata-network contributor gate (migration 0011, DESIGN-METADATA
+  // §5/§12): set by an admin after manual review; the metasync ingest
+  // refuses claim batches from accounts without it. The timestamp
+  // drives the 30-day backfill allowance at ingest.
+  contributorApproved   Boolean   @default(false) @map("contributor_approved")
+  contributorApprovedAt DateTime? @map("contributor_approved_at")
   createdAt     DateTime  @default(now()) @map("created_at")
   updatedAt     DateTime  @updatedAt @map("updated_at")
 

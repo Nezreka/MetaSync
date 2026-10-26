@@ -979,6 +979,12 @@ export const USER_TOKEN_SCOPES = [
   "index:read",
   "playlists:read",
   "whoami:read",
+  // The metadata network's claims ingest (DESIGN-METADATA §6) lives in
+  // the separate `metasync` function; the exchange is the one token
+  // issuer for both services, so the scope is granted here. Holding
+  // the scope is not enough to contribute — the metadata function
+  // additionally requires the account's contributor_approved flag.
+  "meta:write",
 ] as const;
 
 /** Scopes the official MetaSync receives when it exchanges its admin

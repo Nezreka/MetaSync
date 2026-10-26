@@ -1,77 +1,120 @@
 /**
- * MetaSync metadata service — PLANNED schema. SCAFFOLD ONLY.
+ * MetaSync metadata service — real schema (DESIGN-METADATA.md).
  *
- * Nothing in this file is implemented, migrated, or read by any route yet.
- * It records the intended shape so the real build (a separate, larger piece
- * of work) starts from the design in SIDECAR-ARCHITECTURE-SKETCH.md §3,
- * updated Oct 22, 2026: records are keyed by **SoulID** — the canonical ID
- * SoulSync assigns each track, album, and artist.
+ * This file replaces the Oct 22 scaffold sketch. The sketch's shape
+ * (one `metadata_records` table, per-record signatures, a proposed
+ * corroboration N) is superseded by the design doc: the unit of data
+ * is the CLAIM (§6), stored raw at ingest and merged by the compiler
+ * worker — there is no records table, no publisher_node, and
+ * METASYNC_PROPOSED_CORROBORATION_N is deleted (design step 10).
  *
- * SoulID is ONLY for this metadata service. SIN does not use SoulID;
- * SIN signals are keyed by MusicBrainz IDs (see src/sin/logic.ts).
- *
- * Planned tables (Drizzle sketch — DO NOT uncomment until the MetaSync
- * build is commissioned and a migration is written for them):
- *
- * ```ts
- * import {
- *   boolean, index, integer, jsonb, pgTable, text, timestamp, uuid, varchar,
- * } from "drizzle-orm/pg-core";
- *
- * export const metadataRecords = pgTable("metadata_records", {
- *   // SoulID: SoulSync-assigned canonical ID for the track / album / artist.
- *   soulId: varchar("soul_id", { length: 64 }).primaryKey(),
- *   entityType: varchar("entity_type", { length: 16 }).notNull(), // track|album|artist
- *   // MusicBrainz IDs this SoulID resolves to, when known (may be empty —
- *   // a SoulID can exist before any MBID does, e.g. Soulseek long-tail).
- *   artistMbid: uuid("artist_mbid"),
- *   releaseGroupMbid: uuid("release_group_mbid"),
- *   recordingMbid: uuid("recording_mbid"),
- *   // Cross-provider IDs SoulSync already resolved for this entity,
- *   // e.g. { spotify: "...", deezer: "...", itunes: "...", discogs: "..." }
- *   providerIds: jsonb("provider_ids").notNull().default({}),
- *   genres: text("genres").array().notNull().default([]),
- *   tags: text("tags").array().notNull().default([]),
- *   // User-corrected fields, kept in a separate bag and ALWAYS flagged as
- *   // corrections so they are never confused with provider data.
- *   corrections: jsonb("corrections").notNull().default({}),
- *   hasCorrections: boolean("has_corrections").notNull().default(false),
- *   // Every record is signed by the publishing node's keypair.
- *   signature: text("signature").notNull(),
- *   publisherNode: varchar("publisher_node", { length: 128 }).notNull(),
- *   // Corroboration: how many independent peers held this same record.
- *   // A record is only accepted at N >= 3 (proposed) or on a MusicBrainz match.
- *   corroborationCount: integer("corroboration_count").notNull().default(0),
- *   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
- * });
- * ```
- *
- * Trust rules that any implementation MUST keep (sketch §3):
- * - Local data always wins. MetaSync never overwrites a user's own SoulSync
- *   metadata; it fills gaps and offers corrections.
- * - No audio. Ever. Not whole, not in pieces. Metadata only.
- * - No library dumps, no listening data, no file paths, no user identity
- *   beyond the node key that signs a record.
+ * Tables owned by this service: meta_batches, meta_claims
+ * (migration 0011). Tables it READS for door checks only:
+ * portal_keys / portal_users (the contributor gate — the §12
+ * amendment scopes account resolution to THIS service's ingest path;
+ * SIN code never selects user_id, and no SIN table is joined here).
+ * sin_request_nonces is shared §3A.2 replay infrastructure.
  */
+import {
+  bigserial,
+  boolean,
+  index,
+  integer,
+  jsonb,
+  pgTable,
+  primaryKey,
+  text,
+  timestamp,
+  uniqueIndex,
+} from "drizzle-orm/pg-core";
 
-export interface PlannedMetadataRecord {
-  soulId: string;
-  entityType: "track" | "album" | "artist";
-  artistMbid: string | null;
-  releaseGroupMbid: string | null;
-  recordingMbid: string | null;
-  providerIds: Record<string, string>;
-  genres: string[];
-  tags: string[];
-  corrections: Record<string, unknown>;
-  hasCorrections: boolean;
-  signature: string;
-  publisherNode: string;
-  corroborationCount: number;
-}
+/** One row per accepted signed claim batch (migration 0011).
+ *  There is deliberately NO node_id column: a raw node id would let
+ *  anyone reading these tables walk batch → portal_keys.bound_node_id
+ *  → account, undoing the blind. The blind is the only identity here. */
+export const metaBatches = pgTable(
+  "meta_batches",
+  {
+    /** SHA-256 hex of the canonical batch payload — the batch's id. */
+    digest: text("digest").primaryKey(),
+    /** HMAC-SHA256(META_BLIND_SECRET, portal_users.id), hex (§12 Q1). */
+    accountBlind: text("account_blind").notNull(),
+    claimCount: integer("claim_count").notNull(),
+    accepted: integer("accepted").notNull(),
+    receivedAt: timestamp("received_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (t) => [index("meta_batches_blind_received_idx").on(t.accountBlind, t.receivedAt)],
+);
 
-/** Names of the planned tables, for docs/status only. */
-export const METASYNC_PLANNED_TABLES = ["metadata_records"] as const;
+/** One row per (subject, field, value, account blind) — see 0011. */
+export const metaClaims = pgTable(
+  "meta_claims",
+  {
+    id: bigserial("id", { mode: "number" }).primaryKey(),
+    subject: text("subject").notNull(),
+    kind: text("kind").notNull(),
+    field: text("field").notNull(),
+    value: jsonb("value").notNull(),
+    /** SHA-256 hex of the canonical JSON of `value`. */
+    valueHash: text("value_hash").notNull(),
+    source: text("source").notNull(),
+    accountBlind: text("account_blind").notNull(),
+    batchDigest: text("batch_digest")
+      .notNull()
+      .references(() => metaBatches.digest),
+    receivedAt: timestamp("received_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (t) => [
+    uniqueIndex("meta_claims_identity_uq").on(
+      t.subject,
+      t.field,
+      t.valueHash,
+      t.accountBlind,
+    ),
+    index("meta_claims_subject_field_idx").on(t.subject, t.field),
+    index("meta_claims_blind_received_idx").on(t.accountBlind, t.receivedAt),
+    index("meta_claims_batch_digest_idx").on(t.batchDigest),
+  ],
+);
 
-/** Proposed corroboration threshold (open decision, sketch §5). */
-export const METASYNC_PROPOSED_CORROBORATION_N = 3;
+/**
+ * portal_keys — ONLY the columns this service's door checks need.
+ * userId is selected here (and nowhere in SIN) because the contributor
+ * gate resolves token → key → account (§12 amendment).
+ */
+export const portalKeys = pgTable("portal_keys", {
+  id: text("id").primaryKey(),
+  userId: text("user_id").notNull(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }),
+  revokedAt: timestamp("revoked_at", { withTimezone: true }),
+  boundNodeId: text("bound_node_id"),
+  /** Ed25519 public key, base64url (raw 32 bytes). */
+  boundNodePublicKey: text("bound_node_public_key"),
+});
+
+/** portal_users — only the contributor gate columns (migration 0011). */
+export const portalUsers = pgTable("portal_users", {
+  id: text("id").primaryKey(),
+  contributorApproved: boolean("contributor_approved").notNull().default(false),
+  contributorApprovedAt: timestamp("contributor_approved_at", {
+    withTimezone: true,
+  }),
+});
+
+/** Shared §3A.2 replay defence (same table SIN uses; migration 0004). */
+export const sinRequestNonces = pgTable(
+  "sin_request_nonces",
+  {
+    nodeId: text("node_id").notNull(),
+    nonceHash: text("nonce_hash").notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.nodeId, t.nonceHash] }),
+    index("sin_request_nonces_expires_at_idx").on(t.expiresAt),
+  ],
+);

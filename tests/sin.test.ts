@@ -373,14 +373,15 @@ describe("routes (no live database)", () => {
     assert.equal(index.status, 503); // DB not configured in tests
   });
 
-  test("metasync scaffold: health + 501 placeholder", async () => {
+  test("metasync service: health live, scaffold record route deleted", async () => {
     const { default: metaApp } = await import("../src/metasync/index.ts");
     const health = await metaApp.request("/health");
     assert.equal(health.status, 200);
-    assert.equal((await health.json() as { status: string }).status, "scaffold");
+    assert.equal((await health.json() as { status: string }).status, "live");
 
+    // The Oct 22 scaffold's per-record lookup is gone by design
+    // (DESIGN-METADATA step 10): SoulIDs are computed, not registered.
     const record = await metaApp.request("/v1/records/soul_abc123");
-    assert.equal(record.status, 501);
-    assert.equal((await record.json() as { error: string }).error, "not_implemented");
+    assert.equal(record.status, 404);
   });
 });

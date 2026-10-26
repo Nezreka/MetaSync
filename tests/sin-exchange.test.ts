@@ -276,6 +276,7 @@ describe("sin §3A: key exchange + access tokens (fake db)", () => {
       "index:read",
       "playlists:read",
       "whoami:read",
+      "meta:write",
     ]);
     // The token is a pool-signed JWS with the contract's claims.
     const [h, p] = body.access_token.split(".");

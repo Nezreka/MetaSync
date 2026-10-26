@@ -62,11 +62,25 @@ export default defineConfig({
         SIN_BUILD_TIME: BUILD_TIME,
       },
     },
-    // MetaSync metadata service — SCAFFOLD ONLY (src/metasync/index.ts).
-    // Health + a 501 placeholder route; no env, no DB access yet.
+    // MetaSync metadata service (src/metasync/index.ts): the metadata
+    // network's claims ingest (DESIGN-METADATA.md §6/§12). DATABASE_URL
+    // is platform-injected like SIN's. Two secrets:
+    // SIN_TOKEN_PRIVATE_KEY is the SAME pool token key SIN signs with —
+    // this function only verifies tokens (it derives the public half);
+    // the exchange in SIN remains the one issuer.
+    // META_BLIND_SECRET keys the account blinds (§12 Q1): claims are
+    // stored under HMAC(secret, account_id), never a raw account id.
+    // It lives only in this function's env and the compiler worker's;
+    // rotating it orphans stored blinds (dedupe/revocation history),
+    // so treat it like API_KEY_PEPPER: set once, never change casually.
+    // Generate with: openssl rand -hex 32.
     metasync: {
-      name: "MetaSync metadata (scaffold)",
+      name: "MetaSync metadata",
       source: "src/metasync/index.ts",
+      env: {
+        SIN_TOKEN_PRIVATE_KEY: process.env.SIN_TOKEN_PRIVATE_KEY!,
+        META_BLIND_SECRET: process.env.META_BLIND_SECRET!,
+      },
     },
     // The original `hello` function from `neon init` was removed: its job
     // (proving the Neon Functions wiring) is now covered by the /health
