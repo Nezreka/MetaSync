@@ -397,6 +397,66 @@ class PoolClient:
             return self._request(method, path, body, auth=True, _retry=True)
         return status, parsed
 
+    def post_meta_claims(self, envelope: dict[str, Any],
+                         meta_base: str) -> tuple[int, Any]:
+        """POST a signed claim batch to the metadata service
+        (DESIGN-METADATA §5). Returns (status, body) — the caller
+        handles 201/200 (stored/duplicate), 403 (contributor not
+        approved yet) and 429 (daily allowance spent) as outcomes, not
+        exceptions.
+
+        The metadata service is a sibling of the pool backend: it
+        verifies the SAME pool token (meta:write scope) and the same
+        §3A.2 request signature, but lives at its own base URL and
+        additionally requires the account to be contributor-approved.
+        Token mode only — the legacy direct-key fallback has no
+        account, so it can never pass the contributor gate.
+        """
+        if self.identity is None:
+            raise PoolNotAvailable(
+                "metadata contribution needs a node signing identity")
+        if self._ensure_auth() != "token":
+            raise PoolNotAvailable(
+                "metadata contribution needs the key exchange; "
+                "legacy direct-key pools cannot contribute")
+        path = "/v1/meta/claims"
+        raw_body = self._encode_body("POST", envelope)
+        for attempt in (0, 1):
+            token = str(self.auth_state.get("access_token") or "")
+            headers = {
+                "Accept": "application/json",
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                **self.identity.sign_request("POST", path, raw_body),
+            }
+            try:
+                res = self.session.request(
+                    "POST", f"{meta_base.rstrip('/')}{path}",
+                    data=raw_body, headers=headers, timeout=self.timeout_s,
+                )
+            except requests.RequestException as err:
+                raise PoolError(
+                    f"metadata service unreachable: {err}") from err
+            try:
+                parsed = res.json()
+            except ValueError:
+                parsed = {}
+            if res.status_code == 401 and attempt == 0:
+                # Same rule as _request: one fresh exchange + retry —
+                # a token revoked before expiry must not stall
+                # contribution for a day.
+                self._clear_token()
+                self._update_auth(binding_status="unbound", bound=False)
+                try:
+                    self.exchange(force=True)
+                except _ExchangeUnsupported as err:
+                    raise PoolNotAvailable(
+                        "metadata contribution needs the key exchange"
+                    ) from err
+                continue
+            return res.status_code, parsed
+        return res.status_code, parsed  # pragma: no cover — loop returns
+
     # -- node operations ---------------------------------------------------
     def post_report(self, report: dict[str, Any]) -> dict[str, Any]:
         self._require("post_report")

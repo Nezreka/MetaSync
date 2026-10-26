@@ -53,6 +53,10 @@ def scheduler_loop(service: NodeService, stop: threading.Event) -> None:
                     refresh_due = True
             if refresh_due and service.pools():
                 service.run_refresh(now)
+            # Metadata contribution (opt-in): at most a daily walk,
+            # on its own due rule; the run records its own outcome.
+            if service.metadata_due(now):
+                service.run_metadata_contribution(now)
         except Exception as err:  # the scheduler itself must never die
             service.store.record_error("scheduler", err)
             service.store.save_state()

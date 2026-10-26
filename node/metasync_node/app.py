@@ -344,6 +344,44 @@ def create_app(service: NodeService) -> Flask:
         flash(f"Drop signals are now {'ON' if store.settings['share_churn'] else 'OFF'}.", "ok")
         return redirect(url_for("dashboard"))
 
+    @app.post("/actions/share-metadata")
+    @login_required
+    def action_share_metadata():
+        store.settings["share_metadata"] = request.form.get("share_metadata") == "on"
+        store.save_settings()
+        flash(f"Metadata contribution is now {'ON' if store.settings['share_metadata'] else 'OFF'}.", "ok")
+        return redirect(url_for("dashboard"))
+
+    @app.post("/actions/metadata-preview")
+    @login_required
+    def action_metadata_preview():
+        try:
+            preview = service.preview_metadata()
+            flash(
+                f"Preview built from the first page of each kind: "
+                f"{sum(preview['counts'].values())} claims. "
+                "Nothing was sent.", "ok")
+        except Exception as err:  # noqa: BLE001 — surface, never 500 the dashboard
+            flash(f"Preview failed: {err}", "error")
+        return redirect(url_for("dashboard"))
+
+    @app.post("/actions/metadata-run")
+    @login_required
+    def action_metadata_run():
+        import threading
+
+        def _run():
+            try:
+                service.run_metadata_contribution()
+            except Exception as err:  # noqa: BLE001 — the run records its own stops
+                store.record_error("metadata", err)
+                store.save_state()
+
+        threading.Thread(target=_run, daemon=True).start()
+        flash("Metadata contribution started in the background; "
+              "its outcome lands in the Metadata card.", "ok")
+        return redirect(url_for("dashboard"))
+
     @app.route("/settings/soulsync", methods=["GET", "POST"])
     @login_required
     def soulsync_settings():

@@ -22,6 +22,7 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 from .config import Config
+from .contribute import ContributionStopped, Contributor
 from .identity import NodeIdentity, load_or_create_identity, token_for_week
 from .musicbrainz import MusicBrainzResolver
 from .playlists import build_canonical_playlists
@@ -33,6 +34,11 @@ from .weekutil import closed_week_start, iso_week_string
 
 # How many complete weekly library snapshots the churn rule keeps.
 _SNAPSHOT_WEEKS = 3
+
+
+# The metadata service (claims ingest) production base. A setting
+# (meta_url / METASYNC_META_URL) overrides it for development pools.
+DEFAULT_META_URL = "https://br-tiny-mode-b55fkv5s-metasync.compute.c-7.us-east-2.aws.neon.tech"
 
 
 def _env_flag(raw: str) -> bool:
@@ -92,6 +98,12 @@ class NodeService:
             if "METASYNC_SHARE_LISTENING" in env:
                 settings["share_listening"] = _env_flag(env["METASYNC_SHARE_LISTENING"])
                 changed = True
+            if "METASYNC_SHARE_METADATA" in env:
+                settings["share_metadata"] = _env_flag(env["METASYNC_SHARE_METADATA"])
+                changed = True
+            if "METASYNC_META_URL" in env:
+                settings["meta_url"] = env["METASYNC_META_URL"].rstrip("/")
+                changed = True
         if changed:
             self.store.save_settings()
         self.allow_insecure_pools = bool(env and _env_flag(env.get("METASYNC_ALLOW_INSECURE_POOLS", "")))
@@ -113,6 +125,7 @@ class NodeService:
         )
         # The clock the background job and the scheduler read; tests pin it.
         self.clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
+        self._metadata_lock = threading.Lock()
         self._report_lock = threading.Lock()
         # One report run at a time, whoever starts it (UI job or scheduler):
         # two concurrent runs would race the churn snapshots and state.
@@ -697,6 +710,127 @@ class NodeService:
             return False
         return True
 
+    # -- metadata contribution (DESIGN-METADATA step 4) ----------------
+
+    def meta_url(self) -> str:
+        return str(self.store.settings.get("meta_url")
+                   or DEFAULT_META_URL).rstrip("/")
+
+    def metadata_status(self) -> dict[str, Any]:
+        st = self.store.state.get("metadata_contribution") or {}
+        walk = st.get("walk") or {}
+        return {
+            "enabled": bool(self.store.settings.get("share_metadata", False)),
+            "url": self.meta_url(),
+            "last_status": st.get("last_status"),
+            "last_detail": st.get("last_detail"),
+            "last_run_at": st.get("last_run_at"),
+            "last_completed_at": st.get("last_completed_iso"),
+            "last_totals": st.get("last_totals") or {},
+            "walk_entity": walk.get("entity") or "",
+            "preview": self.store.state.get("metadata_preview"),
+        }
+
+    def preview_metadata(self) -> dict[str, Any]:
+        """Build (never send) a sample of what a contribution run
+        would send, and keep it for the dashboard to show."""
+        contributor = Contributor(
+            self.soulsync(), None, self.identity, self.meta_url(),
+            {}, lambda: None)
+        preview = contributor.preview()
+        self.store.state["metadata_preview"] = {
+            "at": _now(), **preview,
+        }
+        self.store.save_state()
+        return preview
+
+    def run_metadata_contribution(
+            self, now: datetime | None = None) -> dict[str, Any]:
+        """One contribution run against the first enabled pool's
+        account. Outcomes are recorded in state and returned; a
+        stopped run (not approved, allowance spent, export missing)
+        is a status, not an exception."""
+        if not self._metadata_lock.acquire(blocking=False):
+            return {"status": "already_running"}
+        try:
+            now = now or self.clock()
+            st = self.store.state.setdefault("metadata_contribution", {})
+            if not self.store.settings.get("share_metadata", False):
+                # The switch is the consent: no path — scheduler,
+                # button, or API — sends claims while it is off.
+                # A refused run is not an attempt: last_run_at is
+                # only stamped once a run actually starts, so
+                # pressing the button with the switch off does not
+                # push the first scheduled run out by a day.
+                st["last_status"] = "sharing_off"
+                st["last_detail"] = "metadata contribution is turned off"
+                self.store.save_state()
+                return {"status": "sharing_off"}
+            pools = self.pools()
+            if not pools:
+                st["last_status"] = "no_pool"
+                st["last_detail"] = "join a pool before contributing"
+                self.store.save_state()
+                return {"status": "no_pool"}
+            try:
+                # The pool token is presented to this URL, so it
+                # gets the same HTTPS rule as a pool URL.
+                check_pool_url(self.meta_url(),
+                               allow_insecure=self.allow_insecure_pools)
+            except ValueError as err:
+                st["last_status"] = "bad_meta_url"
+                st["last_detail"] = str(err)
+                self.store.save_state()
+                return {"status": "bad_meta_url", "detail": str(err)}
+            st["last_run_at"] = now.isoformat()
+            contributor = Contributor(
+                self.soulsync(), self.pool_client(pools[0]),
+                self.identity, self.meta_url(), st, self.store.save_state,
+                sharing_on=lambda: bool(
+                    self.store.settings.get("share_metadata", False)))
+            try:
+                totals = contributor.run(now.isoformat())
+                st["last_status"] = "completed"
+                st["last_detail"] = None
+                st["last_totals"] = totals
+                outcome = {"status": "completed", **totals}
+            except ContributionStopped as stop:
+                st["last_status"] = stop.reason
+                st["last_detail"] = stop.detail or None
+                outcome = {"status": stop.reason, "detail": stop.detail}
+            except PoolError as err:
+                # The contributor records its totals itself for the
+                # stops it raises; a PoolError escapes its run
+                # first, so record the partial totals here — what
+                # was accepted before the failure is dashboard fact.
+                st["last_totals"] = dict(contributor.totals)
+                st["last_status"] = "pool_error"
+                st["last_detail"] = str(err)
+                outcome = {"status": "pool_error", "detail": str(err)}
+            self.store.save_state()
+            return outcome
+        finally:
+            self._metadata_lock.release()
+
+    def metadata_due(self, now: datetime) -> bool:
+        """Scheduler gate: sharing on, a pool joined, and the last
+        attempt at least ~a day ago (a week for structural stops —
+        an old SoulSync or a missing v2 cutover won't fix itself
+        overnight, and approval checks stay on the daily cadence)."""
+        if not self.store.settings.get("share_metadata", False):
+            return False
+        if not self.pools():
+            return False
+        if not (self.store.settings.get("soulsync") or {}).get("url"):
+            return False
+        st = self.store.state.get("metadata_contribution") or {}
+        last = _parse_time(st.get("last_run_at"))
+        if last is None:
+            return True
+        interval = timedelta(days=7) if st.get("last_status") in (
+            "soulid_not_v2", "export_unavailable") else timedelta(hours=20)
+        return now - last >= interval
+
     def run_report(self, now: datetime | None = None, progress: Any = None) -> dict[str, Any]:
         """Pull + compute + (unless dry-run) push last week's report to every enabled pool."""
         emit = progress or (lambda event: None)
@@ -974,6 +1108,8 @@ class NodeService:
             "dry_run": self.dry_run,
             "share_churn": bool(settings.get("share_churn", False)),
             "share_listening": bool(settings.get("share_listening", False)),
+            "share_metadata": bool(settings.get("share_metadata", False)),
+            "metadata": self.metadata_status(),
             "current_week": iso_week_string(datetime.now(timezone.utc)),
             "report_week": iso_week_string(closed_week_start(datetime.now(timezone.utc))),
             "soulsync_connected": bool((settings.get("soulsync") or {}).get("url")),

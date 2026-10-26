@@ -120,7 +120,47 @@
       <div class="switch-text"><strong>Share listening signals <em>optional</em></strong><span>Listening signals say "I played at least 3 different tracks from this album last week", for at most your 50 most-played albums — no play counts, times, or track names, and nothing from a SoulSync profile that keeps its own listening history. They power the On Repeat chart. Off by default; with it off, MetaSync does not even read your listening history.</span></div>
       <label class="switch"><input type="checkbox" name="share_listening" onchange="this.form.submit()" {% if status.share_listening %}checked{% endif %}><span class="switch-track"></span><span class="sr-only">Share listening signals (optional)</span></label>
     </form>
+    <form method="post" action="{{ url_for('action_share_metadata') }}" class="switch-row"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <div class="switch-text"><strong>Contribute library metadata <em>optional</em></strong><span>Shares facts about your library's music — artist/album/track names, provider IDs (Spotify, MusicBrainz, Deezer…), years, genres, tracklists — as signed claims, so every SoulSync can resolve metadata once instead of every install redoing the same lookups. Never file paths, play history, or anything about you beyond your pool account, and nothing is sent until the pool approves your account as a contributor. Off by default; preview exactly what would be sent first.</span></div>
+      <label class="switch"><input type="checkbox" name="share_metadata" onchange="this.form.submit()" {% if status.share_metadata %}checked{% endif %}><span class="switch-track"></span><span class="sr-only">Contribute library metadata (optional)</span></label>
+    </form>
   </div>
+</section>
+
+<section class="card">
+  <div class="card-head">
+    <p class="eyebrow">Metadata network</p>
+    <h2>Metadata contribution</h2>
+  </div>
+  {% set meta = status.metadata %}
+  <p>
+    {% if meta.last_status == "completed" %}
+      Last run completed {{ meta.last_run_at }} — {{ meta.last_totals.accepted or 0 }} claims accepted, {{ meta.last_totals.duplicates or 0 }} already known.
+    {% elif meta.last_status == "not_approved" %}
+      Your pool account is not contributor-approved yet. Claims are refused until the operator approves it; the node checks again daily.
+    {% elif meta.last_status %}
+      Last run: {{ meta.last_status }}{% if meta.last_detail %} — {{ meta.last_detail }}{% endif %}
+    {% else %}
+      No contribution run yet.
+    {% endif %}
+    {% if meta.walk_entity %}A walk is in progress ({{ meta.walk_entity }}).{% endif %}
+  </p>
+  <div class="actions">
+    <form method="post" action="{{ url_for('action_metadata_preview') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button type="submit" class="button">Preview what would be sent</button></form>
+    <form method="post" action="{{ url_for('action_metadata_run') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button type="submit" class="button">Contribute now</button></form>
+  </div>
+  {% if meta.preview %}
+  <div class="preview-sample">
+    <p>Preview from {{ meta.preview.at }} (first page of each kind, nothing sent):</p>
+    <p>{% for field, count in meta.preview.counts.items() %}<span class="pill">{{ field }}: {{ count }}</span> {% endfor %}</p>
+    {% for note in meta.preview.notes %}<p class="note">{{ note }}</p>{% endfor %}
+    <details>
+      <summary>Sample claims</summary>
+      <pre>{% for claim in meta.preview.sample %}{{ claim.kind }} {{ claim.field }} = {{ claim.value }} ({{ claim.source }})
+{% endfor %}</pre>
+    </details>
+  </div>
+  {% endif %}
 </section>
 
 <div class="grid">

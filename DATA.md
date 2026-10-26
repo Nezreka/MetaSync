@@ -282,6 +282,8 @@ typically `./data`). Files (`node/metasync_node/store.py`,
     raw pool key lives here (it must, to present at exchange);
   - `dry_run` (default **on**), `share_churn` and `share_listening`
     (both default **off**, §7);
+  - `share_metadata` (default **off**) and `meta_url` — the metadata
+    contribution switch and the metadata service base it posts to;
   - `ui_password_hash` (werkzeug hash of the node's local admin
     password), `local_api_key_hash` / `local_api_key_prefix` /
     `local_api_key_created_at` (§11).
@@ -344,6 +346,32 @@ design is DESIGN-LISTEN-SIGNALS.md.
 Standing rule: new signal types never activate silently on existing
 nodes — base-set additions ship announced and visible in the payload
 preview before first send; toggle-gated types stay off until flipped.
+
+**Metadata contribution** (DESIGN-METADATA.md) is not a SIN signal:
+it is a separate, third sharing surface with its own switch,
+`share_metadata` ("Contribute library metadata (optional)",
+dashboard or `METASYNC_SHARE_METADATA`), **default off**. With it
+off, the node sends nothing and never reads SoulSync's metadata
+export except when you press **Preview** on the dashboard, which
+builds a sample locally and sends nothing. With it on, the node walks `GET /api/v1/metasync/export`
+(artists, albums, tracks) about once a day and turns each entity
+into signed **claims** — name, provider IDs whose SoulSync match
+status is resolved, year, genres, label, track durations from the
+files, and album tracklists — posted in batches of 5,000 to the
+metadata service under the pool account. Claims are stored there
+against an HMAC blind of the account, never the account or the
+node, and nothing publishes from fewer than 3 contributing
+accounts unless a provider verifies it (DESIGN-METADATA §9). The
+service operator can see which account contributed a claim (the
+Q2 rule in DESIGN-METADATA §12 — contributing is not anonymous to
+the operator); other users cannot. The dashboard's Metadata card
+previews the exact claims a run would send before anything goes
+out. Contribution additionally requires the operator to approve
+the account (`contributor_approved`); until then the service
+refuses batches with `contributor_not_approved` and the node just
+retries daily. No file paths, listening data, or signal data are
+ever part of a claim batch, and the metadata walk reads nothing
+from the SIN report state (or vice versa).
 
 ## 8. What the backend stores (Neon Postgres)
 
