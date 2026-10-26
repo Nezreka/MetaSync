@@ -1,0 +1,510 @@
+{
+ "soulid_version": "kinded_v2",
+ "source": "SoulSync core/soulid_worker.py, PR #1883 (commit 9b21ba21)",
+ "vectors": [
+  {
+   "kind": "artist",
+   "parts": [
+    "Beyoncé"
+   ],
+   "normalized": [
+    "beyonce"
+   ],
+   "soul_id": "soul_5d38354c0d9a2a14"
+  },
+  {
+   "kind": "artist",
+   "parts": [
+    "Beyonce"
+   ],
+   "normalized": [
+    "beyonce"
+   ],
+   "soul_id": "soul_5d38354c0d9a2a14"
+  },
+  {
+   "kind": "artist",
+   "parts": [
+    "שָׁלוֹם"
+   ],
+   "normalized": [
+    "שלום"
+   ],
+   "soul_id": "soul_9edd124de945d72e"
+  },
+  {
+   "kind": "artist",
+   "parts": [
+    "שלום"
+   ],
+   "normalized": [
+    "שלום"
+   ],
+   "soul_id": "soul_9edd124de945d72e"
+  },
+  {
+   "kind": "artist",
+   "parts": [
+    "مُحَمَّد"
+   ],
+   "normalized": [
+    "محمد"
+   ],
+   "soul_id": "soul_f7d15f4eaf6ebd68"
+  },
+  {
+   "kind": "artist",
+   "parts": [
+    "محمد"
+   ],
+   "normalized": [
+    "محمد"
+   ],
+   "soul_id": "soul_f7d15f4eaf6ebd68"
+  },
+  {
+   "kind": "artist",
+   "parts": [
+    "أحمد"
+   ],
+   "normalized": [
+    "احمد"
+   ],
+   "soul_id": "soul_aa0a565563696882"
+  },
+  {
+   "kind": "artist",
+   "parts": [
+    "احمد"
+   ],
+   "normalized": [
+    "احمد"
+   ],
+   "soul_id": "soul_aa0a565563696882"
+  },
+  {
+   "kind": "artist",
+   "parts": [
+    "Кино"
+   ],
+   "normalized": [
+    "кино"
+   ],
+   "soul_id": "soul_f214d04feba96766"
+  },
+  {
+   "kind": "artist",
+   "parts": [
+    "周杰倫"
+   ],
+   "normalized": [
+    "周杰倫"
+   ],
+   "soul_id": "soul_19e7794d2c99cdf6"
+  },
+  {
+   "kind": "artist",
+   "parts": [
+    "がくせい"
+   ],
+   "normalized": [
+    "がくせい"
+   ],
+   "soul_id": "soul_30f177fbc5d2457e"
+  },
+  {
+   "kind": "artist",
+   "parts": [
+    "学生"
+   ],
+   "normalized": [
+    "学生"
+   ],
+   "soul_id": "soul_6d0637316982ff21"
+  },
+  {
+   "kind": "artist",
+   "parts": [
+    "हिन्दी"
+   ],
+   "normalized": [
+    "हिन्दी"
+   ],
+   "soul_id": "soul_eec88d1bedcde117"
+  },
+  {
+   "kind": "artist",
+   "parts": [
+    "เก้า"
+   ],
+   "normalized": [
+    "เก้า"
+   ],
+   "soul_id": "soul_5fc394b2ca843fd7"
+  },
+  {
+   "kind": "artist",
+   "parts": [
+    "!!!"
+   ],
+   "normalized": [
+    "!!!"
+   ],
+   "soul_id": "soul_a95d66061bd5ec2a"
+  },
+  {
+   "kind": "artist",
+   "parts": [
+    "( )"
+   ],
+   "normalized": [
+    "()"
+   ],
+   "soul_id": "soul_adbf60f2dc7e2ebb"
+  },
+  {
+   "kind": "artist",
+   "parts": [
+    "Sigur Rós"
+   ],
+   "normalized": [
+    "sigurros"
+   ],
+   "soul_id": "soul_b0141cd19029e5e8"
+  },
+  {
+   "kind": "artist",
+   "parts": [
+    "Motörhead"
+   ],
+   "normalized": [
+    "motorhead"
+   ],
+   "soul_id": "soul_3f3279da1957b0b2"
+  },
+  {
+   "kind": "artist",
+   "parts": [
+    "Ａｒｃｔｉｃ Ｍｏｎｋｅｙｓ"
+   ],
+   "normalized": [
+    "arcticmonkeys"
+   ],
+   "soul_id": "soul_930682008a5e783b"
+  },
+  {
+   "kind": "artist",
+   "parts": [
+    "Straße"
+   ],
+   "normalized": [
+    "strasse"
+   ],
+   "soul_id": "soul_1a5e9a728e7dd5bd"
+  },
+  {
+   "kind": "artist",
+   "parts": [
+    "Nirvana"
+   ],
+   "normalized": [
+    "nirvana"
+   ],
+   "soul_id": "soul_d0de8060edb97dc5"
+  },
+  {
+   "kind": "artist",
+   "parts": [
+    "The Beatles"
+   ],
+   "normalized": [
+    "thebeatles"
+   ],
+   "soul_id": "soul_a12a644971f70b8a"
+  },
+  {
+   "kind": "artist",
+   "parts": [
+    "Beatles"
+   ],
+   "normalized": [
+    "beatles"
+   ],
+   "soul_id": "soul_1dd311fe22f59ee5"
+  },
+  {
+   "kind": "album",
+   "parts": [
+    "Radiohead",
+    "OK Computer"
+   ],
+   "normalized": [
+    "radiohead",
+    "okcomputer"
+   ],
+   "soul_id": "soul_d33bce31545ea6cc"
+  },
+  {
+   "kind": "album",
+   "parts": [
+    "Radiohead",
+    "OK Computer (Deluxe Edition)"
+   ],
+   "normalized": [
+    "radiohead",
+    "okcomputer"
+   ],
+   "soul_id": "soul_d33bce31545ea6cc"
+  },
+  {
+   "kind": "album",
+   "parts": [
+    "Beyoncé",
+    "Renaissance"
+   ],
+   "normalized": [
+    "beyonce",
+    "renaissance"
+   ],
+   "soul_id": "soul_3a532841ca18cbed"
+  },
+  {
+   "kind": "album",
+   "parts": [
+    "Кино",
+    "Группа крови"
+   ],
+   "normalized": [
+    "кино",
+    "группакрови"
+   ],
+   "soul_id": "soul_2ba2de0e3e9b53bc"
+  },
+  {
+   "kind": "album",
+   "parts": [
+    "!!!",
+    "!!!"
+   ],
+   "normalized": [
+    "!!!",
+    "!!!"
+   ],
+   "soul_id": "soul_4b3724bb83194ee4"
+  },
+  {
+   "kind": "album",
+   "parts": [
+    "Various Artists",
+    "(Intro)"
+   ],
+   "normalized": [
+    "variousartists",
+    "intro"
+   ],
+   "soul_id": "soul_181093157b51df95"
+  },
+  {
+   "kind": "album",
+   "parts": [
+    "Radiohead",
+    ""
+   ],
+   "normalized": [
+    "radiohead",
+    ""
+   ],
+   "soul_id": ""
+  },
+  {
+   "kind": "track",
+   "parts": [
+    "Radiohead",
+    "Karma Police"
+   ],
+   "normalized": [
+    "radiohead",
+    "karmapolice"
+   ],
+   "soul_id": "soul_4d5708635a27471f"
+  },
+  {
+   "kind": "track",
+   "parts": [
+    "Nirvana",
+    "Lithium"
+   ],
+   "normalized": [
+    "nirvana",
+    "lithium"
+   ],
+   "soul_id": "soul_f02e34529b1bd849"
+  },
+  {
+   "kind": "track",
+   "parts": [
+    "Taylor Swift",
+    "Love Story"
+   ],
+   "normalized": [
+    "taylorswift",
+    "lovestory"
+   ],
+   "soul_id": "soul_22436ea8f863181f"
+  },
+  {
+   "kind": "track",
+   "parts": [
+    "Taylor Swift",
+    "Love Story (Taylor's Version)"
+   ],
+   "normalized": [
+    "taylorswift",
+    "lovestory"
+   ],
+   "soul_id": "soul_22436ea8f863181f"
+  },
+  {
+   "kind": "album_track",
+   "parts": [
+    "Radiohead",
+    "OK Computer",
+    "Airbag"
+   ],
+   "normalized": [
+    "radiohead",
+    "okcomputer",
+    "airbag"
+   ],
+   "soul_id": "soul_c525b7c55c902e62"
+  },
+  {
+   "kind": "album_track",
+   "parts": [
+    "Radiohead",
+    "OK Computer",
+    "Paranoid Android"
+   ],
+   "normalized": [
+    "radiohead",
+    "okcomputer",
+    "paranoidandroid"
+   ],
+   "soul_id": "soul_530d0a2ecab3e21c"
+  },
+  {
+   "kind": "artist",
+   "parts": [
+    "!!!‏"
+   ],
+   "normalized": [
+    "!!!"
+   ],
+   "soul_id": "soul_a95d66061bd5ec2a"
+  },
+  {
+   "kind": "artist",
+   "parts": [
+    "A‍B"
+   ],
+   "normalized": [
+    "ab"
+   ],
+   "soul_id": "soul_bad9d0d1e85a4f0d"
+  },
+  {
+   "kind": "artist",
+   "parts": [
+    "So­ft"
+   ],
+   "normalized": [
+    "soft"
+   ],
+   "soul_id": "soul_8d7fe41f14fa281f"
+  },
+  {
+   "kind": "artist",
+   "parts": [
+    "﻿Name"
+   ],
+   "normalized": [
+    "name"
+   ],
+   "soul_id": "soul_1c1429b21d62a76f"
+  },
+  {
+   "kind": "artist",
+   "parts": [
+    "(foo]"
+   ],
+   "normalized": [
+    "foo"
+   ],
+   "soul_id": "soul_b7643cbf5f6cdc65"
+  },
+  {
+   "kind": "artist",
+   "parts": [
+    "한국"
+   ],
+   "normalized": [
+    "한국"
+   ],
+   "soul_id": "soul_02b9d386394f4d44"
+  },
+  {
+   "kind": "artist",
+   "parts": [
+    "1́"
+   ],
+   "normalized": [
+    "1́"
+   ],
+   "soul_id": "soul_161c80b89ddec184"
+  },
+  {
+   "kind": "artist",
+   "parts": [
+    "!́x"
+   ],
+   "normalized": [
+    "x"
+   ],
+   "soul_id": "soul_fcb7f942f740071c"
+  },
+  {
+   "kind": "artist",
+   "parts": [
+    "A\u001fB"
+   ],
+   "normalized": [
+    "ab"
+   ],
+   "soul_id": "soul_bad9d0d1e85a4f0d"
+  },
+  {
+   "kind": "track",
+   "parts": [
+    "Some Artist",
+    "Song (Live) [Remaster] (2020)"
+   ],
+   "normalized": [
+    "someartist",
+    "song"
+   ],
+   "soul_id": "soul_34e2b57a820b15f0"
+  },
+  {
+   "kind": "album",
+   "parts": [
+    "Radiohead",
+    "OK Computer (Deluxe) [2CD]"
+   ],
+   "normalized": [
+    "radiohead",
+    "okcomputer"
+   ],
+   "soul_id": "soul_d33bce31545ea6cc"
+  }
+ ]
+}
