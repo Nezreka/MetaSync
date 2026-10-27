@@ -654,3 +654,35 @@ bugs anyone is hiding:
 | Scheduler retried every 60 s after a failure or in dry run | Once per week, per-node slot, 6 h back-off | Each retry re-read the whole library |
 | Exchange 404 → direct-key mode for any pool; HTTP pool URLs allowed | Loopback only; HTTPS required off loopback | A proxy or wrong URL downgraded the node to sending its key in the clear |
 | No listening signal | Opt-in `listen_album` (§2, §7) | Boulder's request; see DESIGN-LISTEN-SIGNALS.md |
+
+## 17. The metadata network connection (node side)
+
+Separate from everything above: SIN moves counts about the *user*;
+the metadata network moves facts about the *music* (DESIGN-METADATA.md).
+This section covers only the node's connection to it.
+
+- **The relay.** Nodes cannot accept inbound connections, so they hold
+  one persistent outbound WebSocket to a relay: a small always-on
+  program on the operator's infrastructure that forwards queries to
+  connected nodes and routes their answers back by query ID. The relay
+  **stores nothing** — no claims, no queries, no answers. Presence
+  (which node keys are connected) lives in its memory only and is gone
+  when it restarts; its only database touch is a read-only check at
+  connect time that the node's pool key is valid and bound.
+- **The switch.** The node connects only when the user turns the
+  metadata network on: settings `meta_network`, **default off**, plus
+  a relay URL in `meta_relay_url`. With the switch off the node never
+  dials the relay. The connection authenticates with the pool exchange
+  token (which now carries the `meta:read` scope) plus a signature by
+  the node key binding a per-connection challenge from the relay, so a
+  captured hello cannot be replayed.
+- **The mode.** `meta_node_mode` says how the node answers other
+  nodes' queries: `full` (own library plus re-served cache),
+  `own_library` (**default**: answer, never re-serve), or `leech`
+  (never answer; asking still works). Asking needs no approval.
+- **This step is transport only.** The client keeps the connection
+  alive (reconnect with backoff, heartbeat) and can ask and answer in
+  signed claim batches it does not parse. What a node answers from
+  (its claims stores) and how it verifies and merges what comes back
+  are the responder and search steps that follow; query content itself
+  is covered there and in DESIGN-METADATA.md §12.
