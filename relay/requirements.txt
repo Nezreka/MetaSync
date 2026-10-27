@@ -1,3 +1,2 @@
 websockets>=15,<18
 cryptography>=42
-psycopg[binary]>=3.1

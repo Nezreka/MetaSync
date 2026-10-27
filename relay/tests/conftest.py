@@ -75,25 +75,6 @@ class NodeIdentity:
         return self.private.sign(data)
 
 
-class FakeKeyStore:
-    """In-memory KeyStore. Records every call so tests can prove the
-    relay only ever performs this one read, and nothing else."""
-
-    def __init__(self) -> None:
-        self.calls: list[tuple] = []
-        self._bound: dict[str, tuple[str, bytes]] = {}
-
-    def bind(self, key_id: str, node: NodeIdentity) -> None:
-        self._bound[key_id] = (node.node_id, node.public_raw)
-
-    def unbind(self, key_id: str) -> None:
-        self._bound.pop(key_id, None)
-
-    def is_bound_and_valid(self, key_id: str, node_id: str, node_public_key: bytes) -> bool:
-        self.calls.append(("is_bound_and_valid", key_id, node_id))
-        return self._bound.get(key_id) == (node_id, node_public_key)
-
-
 @pytest.fixture(scope="session")
 def pool_private() -> Ed25519PrivateKey:
     return Ed25519PrivateKey.generate()
@@ -102,11 +83,6 @@ def pool_private() -> Ed25519PrivateKey:
 @pytest.fixture(scope="session")
 def pool_public(pool_private):
     return pool_private.public_key()
-
-
-@pytest.fixture()
-def store() -> FakeKeyStore:
-    return FakeKeyStore()
 
 
 @pytest.fixture()

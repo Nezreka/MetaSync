@@ -31,6 +31,7 @@ from .musicbrainz import MusicBrainzResolver
 from .playlists import build_canonical_playlists
 from .pool import PoolBindingPending, PoolClient, PoolError, PoolNotAvailable, is_loopback_url
 from .relay import RelayClient, RelayError, normalize_mode
+from .revocations import RevocationStore
 from .signals import KEEP_AFTER, LATE_WINDOW, compute_signals, is_uuid_shape
 from .soulsync import SoulSyncClient, SoulSyncError
 from .store import Store, default_pool_from_env
@@ -135,6 +136,11 @@ class NodeService:
         # the network on. None means "never started on this process".
         self._relay_client: RelayClient | None = None
         self._relay_lock = threading.Lock()
+        # The node's ONE revocation store (§9/§10), created lazily by
+        # _revocation_store() and shared by the relay client, the
+        # pool clients, and the meta store: a list learned on any
+        # channel is the list every enforcement point reads.
+        self._shared_revocation_store: RevocationStore | None = None
         # The metadata claims store + responder (DESIGN-METADATA.md
         # section 5), created lazily: a node that never turns the
         # metadata network on never opens the store file.
@@ -187,6 +193,8 @@ class NodeService:
             auth_state=auth_state,
             persist=self.store.save_state,
             allow_legacy=self.allow_insecure_pools,
+            issuer_key_provider=self._meta_issuer_key,
+            revocation_sink=self._note_exchange_revocations,
         )
 
     def test_soulsync(self) -> dict[str, Any]:
@@ -997,19 +1005,21 @@ class NodeService:
     def _meta_node_mode(self) -> str:
         return normalize_mode(self.store.settings.get("meta_node_mode"))
 
-    def _relay_token(self) -> str:
+    def _relay_token(self, *, force: bool = False) -> str:
         """A current pool access token for the relay hello.
 
         The relay authenticates with the SIN exchange token (section
         10): the first enabled pool's client exchanges as usual, and
         the token must carry the meta:read scope the pools now grant.
         Anything else (no pool, legacy pool, missing scope) is a
-        connect failure the relay client backs off on."""
+        connect failure the relay client backs off on. With
+        ``force``, the exchange is never served from the client's
+        cache — the re-auth path's requirement (§10)."""
         pools = self.pools()
         if not pools:
             raise RelayError("no pool joined: the relay hello needs a pool key exchange")
         client = self.pool_client(pools[0])
-        client.exchange()
+        client.exchange(force=force)
         token = client.auth_state.get("access_token")
         if not token:
             raise RelayError("pool exchange produced no access token (legacy pool?)")
@@ -1022,12 +1032,89 @@ class NodeService:
             raise RelayError("pool access token does not carry the meta:read scope")
         return str(token)
 
+    def _relay_token_fresh(self) -> str:
+        """The relay client's fresh-token provider: a forced exchange
+        (§10 — every in-band re-authentication is preceded by a fresh
+        exchange, which is also the revocation list's delivery
+        moment). Handing re-auth the CACHED token instead was gate
+        M4: the relay acks the same expiry, the client's re-auth
+        loop recomputes a past-due delay, and it re-auths once per
+        round trip for ~90 seconds."""
+        return self._relay_token(force=True)
+
+    def _meta_issuer_key(self) -> Any | None:
+        """The token issuer's Ed25519 public key, from the optional
+        meta_issuer_public_key setting (base64url raw key or PEM), for
+        verifying relay-carried revocation lists and exchange-carried
+        attestations. Unset or unparsable means the client cannot
+        verify lists and drops them — the relay still enforces its
+        own verified copy at hello. The silence here is deliberate
+        (a lookup must not raise); the LOUD version of this state is
+        _issuer_key_note in relay_status (gate S6)."""
+        raw = str(self.store.settings.get("meta_issuer_public_key") or "").strip()
+        if not raw:
+            return None
+        from .revocations import parse_issuer_public_key
+
+        return parse_issuer_public_key(raw)
+
+    def _revocation_store(self) -> RevocationStore:
+        """The node's ONE revocation store (§9/§10), shared by the
+        relay client (welcome/push lists), the pool clients
+        (exchange-carried lists), and the meta store (admission,
+        re-serve filtering, cache purge) — a list learned on any
+        channel is the list every enforcement point reads. Its
+        per-issuer high-water marks AND the signed lists that
+        earned them persist in the state dir, the lists re-verified
+        against the issuer key on load: rollback protection (§10)
+        and enforcement itself must survive restarts and network
+        toggles, each of which builds a fresh relay client."""
+        if self._shared_revocation_store is None:
+            self._shared_revocation_store = RevocationStore(
+                persist_path=self.store.dir / "meta_revocations.json",
+                issuer_key_provider=self._meta_issuer_key)
+        return self._shared_revocation_store
+
+    def _purge_revoked_from_cache(self, applied: Any) -> None:
+        """A NEW verified revocation list landed (relay push or pool
+        exchange): the named keys' cached batches die now (§10),
+        not at some later sweep. Only when a meta store exists —
+        a list must not conjure the store file into being on a node
+        that never built one. Failure-isolated: the purge is
+        defense in depth (admission and the read filter also check),
+        and it must never break the channel that delivered the list."""
+        if not self._meta_store_created():
+            return
+        try:
+            self.meta_store().purge_revoked(set(applied.keys))
+        except Exception:  # noqa: BLE001, S110 - see docstring
+            pass
+
+    def _note_exchange_revocations(self, payload: Any) -> None:
+        """PoolClient revocation sink (§10): a token exchange
+        response's revocation list, verified against the issuer key
+        and applied to the shared store at its sequence. The
+        exchange is the issuer's own endpoint — the one delivery
+        channel a withholding relay does not sit on — so this is
+        what bounds a withheld revocation's delay to one token
+        lifetime. (The portal emitting the field is the known
+        portal follow-up; pools that don't send it change nothing.)
+        """
+        applied = self._revocation_store().apply(
+            payload, self._meta_issuer_key())
+        if applied is not None:
+            self._purge_revoked_from_cache(applied)
+
     def _new_relay_client(self) -> RelayClient:
         return RelayClient(
             self.identity,
             url_provider=self._meta_relay_url,
             mode_provider=self._meta_node_mode,
             token_provider=self._relay_token,
+            issuer_key_provider=self._meta_issuer_key,
+            revocation_store=self._revocation_store(),
+            revocations_applied=self._purge_revoked_from_cache,
+            fresh_token_provider=self._relay_token_fresh,
         )
 
     def sync_relay_client(self) -> dict[str, Any]:
@@ -1089,6 +1176,33 @@ class NodeService:
                 if self._relay_client is client:
                     self._relay_client = None
 
+    def _issuer_key_note(self) -> str | None:
+        """Gate S6, the loud version of _meta_issuer_key's silence:
+        with no usable issuer key, EVERY attestation an exchange
+        delivers is dropped (this node's batches count zero support)
+        and EVERY revocation list is dropped (no local enforcement;
+        only the relay's own hello check remains) — a node in that
+        state must not look identical to a healthy one in status.
+        None when a key is configured and parses."""
+        raw = str(self.store.settings.get("meta_issuer_public_key") or "").strip()
+        if raw and self._meta_issuer_key() is not None:
+            return None
+        if not raw:
+            return (
+                "meta_issuer_public_key is not set: binding "
+                "attestations and revocation lists cannot be "
+                "verified, so this node drops them all — its "
+                "batches count zero support and revocation is "
+                "enforced only by the relay at hello, never locally"
+            )
+        return (
+            "meta_issuer_public_key does not parse as an Ed25519 "
+            "public key: binding attestations and revocation lists "
+            "are dropped as unverifiable — this node's batches "
+            "count zero support and revocation is not enforced "
+            "locally"
+        )
+
     def relay_status(self) -> dict[str, Any]:
         """Relay connection status for the dashboard and diagnostics."""
         enabled = bool(self.store.settings.get("meta_network", False))
@@ -1102,10 +1216,15 @@ class NodeService:
                 "mode": self._meta_node_mode(),
                 "relay_url": self._meta_relay_url(),
                 "last_error": None,
+                "revocations": None,
+                "attestation_note": self._attestation_pool_note(),
+                "issuer_note": self._issuer_key_note(),
             }
         status = client.status()
         status["enabled"] = enabled
         status["answering"] = self.meta_answering()
+        status["attestation_note"] = self._attestation_pool_note()
+        status["issuer_note"] = self._issuer_key_note()
         return status
 
     # -- metadata responder (claims store, DESIGN-METADATA.md section 5) --
@@ -1118,8 +1237,61 @@ class NodeService:
         if self._meta_store is None:
             with self._meta_construct_lock:
                 if self._meta_store is None:
-                    self._meta_store = MetaStore(self.store.dir)
+                    self._meta_store = MetaStore(
+                        self.store.dir,
+                        revocations=self._revocation_store())
         return self._meta_store
+
+    def _attestation_source(self) -> tuple[str | None, dict[str, Any] | None]:
+        """(pool id, attestation) for the first joined pool carrying
+        a verified binding attestation, else (None, None). A pool
+        whose client raises is skipped (SF-2 doctrine): attestation
+        trouble degrades to 'no attestation', never to a broken
+        caller."""
+        for pool in self.pools():
+            try:
+                attestation = self.pool_client(pool).current_attestation()
+            except Exception:  # noqa: BLE001 - degrade, never break
+                attestation = None
+            if attestation is not None:
+                return str(pool.get("id") or "pool"), attestation
+        return None, None
+
+    def _current_attestation(self) -> dict[str, Any] | None:
+        """The node's current binding attestation (§9): the verified
+        one a pool's exchange last handed over, stored on that pool
+        client's auth state. The first joined pool carrying one
+        wins — a node binds its key per pool, and v1 runs one
+        official pool. None when no exchange has delivered one."""
+        return self._attestation_source()[1]
+
+    def _attestation_pool_note(self) -> str | None:
+        """SF-4 visibility for the first-pool-wins simplification
+        above: the relay session's token always comes from the FIRST
+        enabled pool (_relay_token), so when the attestation being
+        embedded came from a DIFFERENT pool, askers on the session's
+        pool verify it against the wrong issuer and this node's
+        answers count zero support there — silently, without this
+        note. The real fix (choose the attestation for the pool the
+        session belongs to) belongs to step 6; for now the mismatch
+        is at least visible in relay_status. None when there is
+        nothing to warn about."""
+        pools = self.pools()
+        if len(pools) < 2:
+            return None
+        source_id, attestation = self._attestation_source()
+        if attestation is None or source_id is None:
+            return None
+        session_id = str(pools[0].get("id") or "pool")
+        if source_id == session_id:
+            return None
+        return (
+            f"the embedded binding attestation is from pool "
+            f"{source_id}, but the relay session runs on pool "
+            f"{session_id}: answers count zero support on the "
+            f"session's pool until that pool's exchange delivers an "
+            f"attestation (per-pool attestation selection is step 6)"
+        )
 
     def _meta_responder_obj(self) -> Responder:
         if self._meta_responder is None:
@@ -1127,7 +1299,8 @@ class NodeService:
                 if self._meta_responder is None:
                     self._meta_responder = Responder(
                         self.meta_store(), self.identity,
-                        mode_provider=self._meta_node_mode)
+                        mode_provider=self._meta_node_mode,
+                        attestation_provider=self._current_attestation)
         return self._meta_responder
 
     def _meta_store_created(self) -> bool:
@@ -1149,7 +1322,8 @@ class NodeService:
         # regardless of the switch.
         return LibraryBuilder(
             self.soulsync(), self.identity, self.meta_store(),
-            enabled_on=self.meta_answering if live_gate else None)
+            enabled_on=self.meta_answering if live_gate else None,
+            attestation_provider=self._current_attestation)
 
     def meta_status(self) -> dict[str, Any]:
         if not self._meta_store_created():

@@ -159,10 +159,35 @@ class Responder:
     """
 
     def __init__(self, store: MetaStore, identity: Any,
-                 mode_provider: Callable[[], str]):
+                 mode_provider: Callable[[], str],
+                 attestation_provider: Callable[[], dict | None]
+                 | None = None):
         self.store = store
         self.identity = identity
         self.mode_provider = mode_provider
+        # Live re-read of the node's current binding attestation
+        # (§9), in the builder's pattern: answers are minted fresh
+        # per query, so they embed the attestation current at
+        # ANSWER time — a renewal lands on the next answer, not the
+        # next build. None means mint from the store's noted value.
+        self.attestation_provider = attestation_provider
+
+    def _current_attestation(self) -> dict | None:
+        """The attestation to embed in a freshly minted answer: the
+        provider's latest when one is wired (noted into the store
+        on the way past, so every mint path agrees), else the
+        store's noted value. Failure-isolated (SF-2): a raising
+        provider degrades to the store's noted value — answers must
+        never break over attestation trouble."""
+        if self.attestation_provider is not None:
+            try:
+                attestation = self.attestation_provider()
+            except Exception:  # noqa: BLE001 - degrade, never break
+                attestation = None
+            if attestation is not None:
+                self.store.set_attestation(attestation)
+                return self.store.attestation()
+        return self.store.attestation()
 
     # -- query resolution ---------------------------------------------
 
@@ -254,11 +279,13 @@ class Responder:
             [c for c in claims if not claim_reservable(c)],
         )
         out = []
+        attestation = self._current_attestation()
         for part in partitions:
             if not part:
                 continue
             batch = meta_claims.make_batch(
-                self.identity.public_key_b64url, part)
+                self.identity.public_key_b64url, part,
+                attestation=attestation)
             out.append(meta_claims.sign_batch(
                 self.identity.signing_private_key, batch))
         return out

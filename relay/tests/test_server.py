@@ -1,6 +1,8 @@
-"""Relay integration tests: real WebSocket server, fake key store,
-in-test Ed25519 identities, tokens minted by the conftest issuer that
-mirrors src/sin/logic.ts issueAccessToken."""
+"""Relay integration tests: real WebSocket server, in-test Ed25519
+identities, tokens minted by the conftest issuer that mirrors
+src/sin/logic.ts issueAccessToken. Protocol v2 removed the relay's
+guest-list peek: tokens are verified offline, so no key store is
+involved anywhere in this suite."""
 
 from __future__ import annotations
 
@@ -12,7 +14,8 @@ import time
 from typing import Self
 
 import pytest
-from conftest import FULL_SCOPES, FakeKeyStore, NodeIdentity, issue_token
+from conftest import FULL_SCOPES, NodeIdentity, issue_token
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from metasync_relay.config import RelayConfig
 from metasync_relay.protocol import Query
 from metasync_relay.server import Relay, _Connection, hello_signing_text, start_server
@@ -71,8 +74,7 @@ class Client:
 class Harness:
     def __init__(self, pool_private, pool_public, **config_overrides) -> None:
         self.pool_private = pool_private
-        self.store = FakeKeyStore()
-        self.relay = Relay(self.store, pool_public, RelayConfig(**config_overrides))
+        self.relay = Relay(pool_public, RelayConfig(**config_overrides))
         self.port = _free_port()
         self.server = None
         self.clients: list[Client] = []
@@ -84,6 +86,7 @@ class Harness:
     async def __aexit__(self, *exc) -> None:
         for client in self.clients:
             await client.close()
+        await self.relay.aclose()
         self.server.close()
         await self.server.wait_closed()
 
@@ -129,7 +132,6 @@ class Harness:
         return client
 
     async def connect_ok(self, node: NodeIdentity, key_id: str = "key-1", **kw) -> Client:
-        self.store.bind(key_id, node)
         client = await self.connect(node, key_id=key_id, **kw)
         welcome = await client.next()
         assert welcome["type"] == "welcome", welcome
@@ -173,7 +175,6 @@ def test_hello_accepted_and_peer_count_grows(pool_private, pool_public, node_a, 
 def test_hello_rejected_when_token_node_mismatch(pool_private, pool_public, node_a, node_b):
     async def scenario():
         async with Harness(pool_private, pool_public) as h:
-            h.store.bind("key-1", node_a)
             # Token minted for node_b, presented by node_a with node_a's key.
             foreign = h.token(node_b)
             client = await h.connect(node_a, token=foreign)
@@ -185,10 +186,16 @@ def test_hello_rejected_when_token_node_mismatch(pool_private, pool_public, node
     asyncio.run(scenario())
 
 
-def test_hello_rejected_when_key_unbound(pool_private, pool_public, node_a):
+def test_hello_rejected_with_foreign_pool_signature(pool_private, pool_public, node_a):
+    # Protocol v2: there is no guest-list peek at the relay — the token
+    # is verified offline against the issuer key. A token signed by a
+    # DIFFERENT pool key is refused, which is the offline check doing
+    # the work the database peek used to do.
     async def scenario():
         async with Harness(pool_private, pool_public) as h:
-            client = await h.connect(node_a)  # store never bound
+            foreign = Ed25519PrivateKey.generate()
+            tok = issue_token(foreign, "key-1", node_a.node_id, FULL_SCOPES)
+            client = await h.connect(node_a, token=tok)
             refused = await client.next()
             assert refused["reason"] == "auth"
             await client.expect_closed()
@@ -196,21 +203,9 @@ def test_hello_rejected_when_key_unbound(pool_private, pool_public, node_a):
     asyncio.run(scenario())
 
 
-def test_hello_rejected_when_bound_to_another_node(pool_private, pool_public, node_a, node_b):
-    async def scenario():
-        async with Harness(pool_private, pool_public) as h:
-            h.store.bind("key-1", node_b)  # the key belongs to node_b's binding
-            client = await h.connect(node_a)
-            refused = await client.next()
-            assert refused["reason"] == "auth"
-
-    asyncio.run(scenario())
-
-
 def test_hello_rejected_without_meta_read_scope(pool_private, pool_public, node_a):
     async def scenario():
         async with Harness(pool_private, pool_public) as h:
-            h.store.bind("key-1", node_a)
             client = await h.connect(node_a, token=h.token(node_a, scopes=NO_META_SCOPES))
             refused = await client.next()
             assert refused["reason"] == "auth"
@@ -221,7 +216,6 @@ def test_hello_rejected_without_meta_read_scope(pool_private, pool_public, node_
 def test_hello_rejected_with_bad_signature(pool_private, pool_public, node_a):
     async def scenario():
         async with Harness(pool_private, pool_public) as h:
-            h.store.bind("key-1", node_a)
             bogus = encode_base64url(node_a.sign(b"some other text"))
             client = await h.connect(node_a, signature=bogus)
             refused = await client.next()
@@ -233,7 +227,6 @@ def test_hello_rejected_with_bad_signature(pool_private, pool_public, node_a):
 def test_hello_rejected_with_stale_timestamp(pool_private, pool_public, node_a):
     async def scenario():
         async with Harness(pool_private, pool_public) as h:
-            h.store.bind("key-1", node_a)
             client = await h.connect(node_a, timestamp=int(time.time()) - 3600)
             refused = await client.next()
             assert refused["reason"] == "auth"
@@ -244,7 +237,6 @@ def test_hello_rejected_with_stale_timestamp(pool_private, pool_public, node_a):
 def test_hello_rejected_with_expired_token(pool_private, pool_public, node_a):
     async def scenario():
         async with Harness(pool_private, pool_public) as h:
-            h.store.bind("key-1", node_a)
             stale = h.token(node_a, now=time.time() - 90000)
             client = await h.connect(node_a, token=stale)
             refused = await client.next()
@@ -274,7 +266,6 @@ def test_hello_replay_rejected_fresh_challenge_accepted(
 ):
     async def scenario():
         async with Harness(pool_private, pool_public) as h:
-            h.store.bind("key-1", node_a)
 
             async def raw_client() -> tuple[Client, str]:
                 ws = await ws_connect(f"ws://127.0.0.1:{h.port}")
@@ -392,7 +383,7 @@ def test_leech_node_gets_no_queries_and_cannot_delay_close(
             assert got["type"] == "query"
             await leech.expect_silence()
             oq = h.relay.open_queries[qid(15)]
-            assert oq.expected == {node_b.node_id}
+            assert set(oq.expected) == {node_b.node_id}
             # The only expected responder signalling done closes the
             # window early; the leech's silence must not hold it open.
             await b.send({"type": "done", "query_id": qid(15)})
@@ -420,16 +411,18 @@ class _FakeWS:
 
 
 def test_fanout_not_blocked_by_stuck_peer(
-    pool_public, store, node_a, node_b, node_c
+    pool_public, node_a, node_b, node_c
 ):
     async def scenario():
-        relay = Relay(store, pool_public, RelayConfig(send_timeout_seconds=0.2))
+        relay = Relay(pool_public, RelayConfig(send_timeout_seconds=0.2))
 
         def add(node, ws) -> _Connection:
             conn = _Connection(ws=ws)
             conn.node_id = node.node_id
             conn.mode = "own_library"
+            conn.version = 1
             relay.presence[node.node_id] = conn
+            relay._start_sender(conn)
             return conn
 
         asker_ws = _FakeWS()
@@ -440,12 +433,18 @@ def test_fanout_not_blocked_by_stuck_peer(
         query = Query(
             query_id=qid(81), kind="track", mode="exact", subjects=("soul_x",)
         )
-        # Sequential sends could park on the stuck peer indefinitely;
-        # the fan-out must complete on the per-send timeout instead.
+        # Sends are queued per connection now: routing returns at
+        # once, the good peer's sender delivers promptly, and the
+        # stuck peer's hang stays inside its own sender loop.
         await asyncio.wait_for(relay._route_query(asker, query), timeout=5)
+        for _ in range(50):
+            if good_ws.sent:
+                break
+            await asyncio.sleep(0.02)
         assert len(good_ws.sent) == 1
         assert json.loads(good_ws.sent[0])["query_id"] == qid(81)
         assert asker_ws.sent == []
+        await relay.aclose()
 
     asyncio.run(scenario())
 
@@ -533,14 +532,16 @@ def test_asker_disconnect_orphans_query_answers_drop_silently(
             await b.send(answer(qid(17)))
             await b.send({"type": "done", "query_id": qid(17)})
             await asyncio.sleep(0.3)
-            assert h.relay.node_state[node_b.node_id].violations == 0
-            # The purge sweeper removes the tombstone on the same 60s
-            # margin as expired queries (stand the deadline in for the
-            # margin having passed, then let any dispatch drive the
-            # sweep).
+            state = h.relay.node_state.get(node_b.node_id)
+            assert state is None or state.violations == 0
+            # The sweeper removes the tombstone on the same 60s margin
+            # as expired queries (stand the deadline in for the margin
+            # having passed, then wait for a sweep to land).
             oq.deadline = time.monotonic() - 3600
-            await b.send({"type": "done", "query_id": qid(999)})
-            await asyncio.sleep(0.2)
+            for _ in range(60):
+                if qid(17) not in h.relay.open_queries:
+                    break
+                await asyncio.sleep(0.05)
             assert qid(17) not in h.relay.open_queries
 
     asyncio.run(scenario())
@@ -641,9 +642,15 @@ def test_query_budget_exceeded_drops(pool_private, pool_public, node_a, node_b):
     asyncio.run(scenario())
 
 
-def test_answer_budget_exceeded_drops(pool_private, pool_public, node_a, node_b):
+def test_answer_byte_budget_exceeded_drops(pool_private, pool_public, node_a, node_b):
+    # Protocol v2 budgets are byte-based: the hourly answer budget is
+    # a byte count, not a message count. One small answer fits; the
+    # second pushes the node over its hourly bytes and is dropped.
+    one = len(json.dumps(answer(qid(31))).encode())
     async def scenario():
-        async with Harness(pool_private, pool_public, answers_per_hour=1) as h:
+        async with Harness(
+            pool_private, pool_public, answer_bytes_per_hour=one + 10
+        ) as h:
             a = await h.connect_ok(node_a)
             b = await h.connect_ok(node_b, key_id="key-2")
             await a.send(exact_query(qid(31)))
@@ -652,7 +659,7 @@ def test_answer_budget_exceeded_drops(pool_private, pool_public, node_a, node_b)
             await b.next()
             await b.send(answer(qid(31)))
             assert (await a.next())["type"] == "answer"
-            await b.send(answer(qid(32)))  # over the hourly answer budget
+            await b.send(answer(qid(32)))  # over the hourly byte budget
             await a.expect_silence(0.6)
 
     asyncio.run(scenario())
@@ -690,9 +697,9 @@ def test_query_budget_survives_reconnect(pool_private, pool_public, node_a, node
     asyncio.run(scenario())
 
 
-def test_dispatch_stops_after_closing_violation(pool_public, store, node_b):
+def test_dispatch_stops_after_closing_violation(pool_public, node_b):
     async def scenario():
-        relay = Relay(store, pool_public, RelayConfig(max_violations=0))
+        relay = Relay(pool_public, RelayConfig(max_violations=0))
         conn = _Connection(ws=_FakeWS())
         conn.node_id = node_b.node_id
         conn.mode = "own_library"

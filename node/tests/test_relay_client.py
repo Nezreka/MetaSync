@@ -1,11 +1,14 @@
 """Relay client tests — the REAL relay server, in-process, and the
 real node RelayClient against it (DESIGN-METADATA.md section 10).
 
-The server runs on an ephemeral port in its own thread/loop with a
-fake key store (the relay/tests/conftest.py pattern) and tokens from
-an in-test issuer mirroring issueAccessToken in src/sin/logic.ts:
-header {"alg": "EdDSA", "typ": "SIN"}, claims exactly
-{key_id, node_id, scopes, exp, iat}, Ed25519 over the dotted input.
+The server runs on an ephemeral port in its own thread/loop and
+tokens from an in-test issuer mirroring issueAccessToken in
+src/sin/logic.ts: header {"alg": "EdDSA", "typ": "SIN"}, claims
+exactly {key_id, node_id, scopes, exp, iat}, Ed25519 over the dotted
+input. Protocol v2: the relay verifies tokens offline — there is no
+key store and no binding step anywhere in this harness; the old
+bind() helper remains as a documented no-op so call sites read the
+same (the binding check lives at the token exchange now).
 """
 from __future__ import annotations
 
@@ -30,6 +33,7 @@ from metasync_node import relay as relay_module
 from metasync_node.config import Config
 from metasync_node.identity import NodeIdentity, b64url_encode
 from metasync_node.relay import (
+    MAX_RELAY_GRACE_SECONDS,
     RelayClient,
     RelayError,
     RelayNotConnected,
@@ -67,33 +71,21 @@ def issue_token(pool_private, key_id, node_id, scopes, now=None, ttl=24 * 3600):
     return f"{signing_input}.{encode_base64url(signature)}"
 
 
-class FakeKeyStore:
-    """In-memory guest list, the relay/tests/conftest.py pattern."""
-
-    def __init__(self) -> None:
-        self.calls: list[tuple] = []
-        self._bound: dict[str, tuple[str, bytes]] = {}
-
-    def bind(self, key_id: str, node_id: str, public_raw: bytes) -> None:
-        self._bound[key_id] = (node_id, public_raw)
-
-    def is_bound_and_valid(self, key_id: str, node_id: str, node_public_key: bytes) -> bool:
-        self.calls.append(("is_bound_and_valid", key_id, node_id))
-        return self._bound.get(key_id) == (node_id, node_public_key)
-
-
 class RelayServerThread:
     """The real relay server on an ephemeral port, own thread + loop."""
 
     def __init__(self, pool_public, **config_overrides) -> None:
-        self.store = FakeKeyStore()
-        config = RelayConfig(window_seconds=0.5, grace_seconds=1.0, **config_overrides)
-        self.relay = Relay(self.store, pool_public, config)
         sock = socket.socket()
         sock.bind(("127.0.0.1", 0))
         self.port = sock.getsockname()[1]
         sock.close()
         self.url = f"ws://127.0.0.1:{self.port}"
+        # Protocol v2 requires a configured relay origin (gate M5):
+        # the harness models a correctly configured relay, which is
+        # configured with the very origin its clients dial.
+        config_overrides.setdefault("relay_origin", self.url)
+        config = RelayConfig(window_seconds=0.5, grace_seconds=1.0, **config_overrides)
+        self.relay = Relay(pool_public, config)
         self.loop = asyncio.new_event_loop()
         self._started = threading.Event()
         self._server = None
@@ -112,6 +104,7 @@ class RelayServerThread:
 
     def stop(self) -> None:
         async def shutdown() -> None:
+            await self.relay.aclose()
             self._server.close()
             await self._server.wait_closed()
             self.loop.stop()
@@ -166,7 +159,11 @@ class RelayClientCase(unittest.TestCase):
         return issue_token(self.pool_private, KEY_ID, identity.node_id, FULL_SCOPES)
 
     def bind(self, identity: NodeIdentity) -> None:
-        self.server.store.bind(KEY_ID, identity.node_id, identity.public_key_bytes)
+        # Protocol v2: there is nothing to bind — the relay verifies
+        # the token offline and the binding check lives at the token
+        # exchange. Kept as a no-op so existing call sites (and their
+        # intent: "this node is a legitimate guest") stay readable.
+        return None
 
     def make_client(self, identity=None, mode="own_library", url=None, token_provider=None) -> RelayClient:
         identity = identity or NodeIdentity(key=secrets.token_hex(32))
@@ -700,24 +697,220 @@ class TestQueryBuffering(unittest.TestCase):
         self.assertTrue(state.finished.is_set())
         self.assertTrue(other.finished.is_set())
 
+    def test_packed_frame_charges_each_envelope_its_own_size(self) -> None:
+        # MF-2: one packed frame carrying many envelopes must charge
+        # each envelope's own serialized size — charging the whole
+        # frame per envelope truncated packed answers on phantom
+        # bytes (30 small batches in a 500KB-ish frame died at ~16).
+        client, state = self._client_with_query()
+        envelopes = [{"n": n, "pad": "x" * 40} for n in range(30)]
+        frame = json.dumps(
+            {"type": "answer", "query_id": state.query_id, "batches": envelopes}
+        )
+        client._dispatch(frame, None)
+        self.assertFalse(state.finished.is_set())
+        self.assertEqual(state.queued_batches, 30)
+        expected = sum(
+            len(json.dumps(e, separators=(",", ":")).encode()) for e in envelopes
+        )
+        self.assertEqual(state.queued_bytes, expected)
+        self.assertLess(state.queued_bytes, len(frame))
+
+    def test_draining_credits_the_buffer_accounting(self) -> None:
+        # MF-2: the caps bound what is BUFFERED, not the query's
+        # lifetime volume — a consumer that drains makes room again.
+        client, state = self._client_with_query()
+        with mock.patch.object(relay_module, "MAX_QUEUED_BATCHES_PER_QUERY", 4):
+            for n in range(4):
+                client._dispatch(self._answer_frame(state, {"n": n}), None)
+            self.assertEqual(state.queued_batches, 4)
+            stream = _QueryStream(client, state)
+            self.assertEqual(next(stream), {"n": 0})
+            self.assertEqual(next(stream), {"n": 1})
+            self.assertEqual(state.queued_batches, 2)
+            self.assertEqual(
+                state.queued_bytes,
+                sum(
+                    len(json.dumps({"n": n}, separators=(",", ":")).encode())
+                    for n in (2, 3)
+                ),
+            )
+            # Room again: two more route without finishing the query,
+            # even though the lifetime total (6) exceeds the cap (4).
+            for n in range(4, 6):
+                client._dispatch(self._answer_frame(state, {"n": n}), None)
+            self.assertFalse(state.finished.is_set())
+            self.assertEqual(state.queued_batches, 4)
+
+
+class TestReauthExpiryAdoption(unittest.TestCase):
+    """SF-5: when the relay's reauth_ok ack carries no exp, the client
+    adopts the expiry of the token it just presented — it must never
+    spin re-exchanging against the stale expiry."""
+
+    def _client(self):
+        identity = NodeIdentity(key=secrets.token_hex(32))
+        return RelayClient(
+            identity,
+            url_provider=lambda: "",
+            mode_provider=lambda: "own_library",
+            token_provider=lambda: "tok",
+        )
+
+    def test_silent_ack_adopts_the_presented_tokens_expiry(self) -> None:
+        client = self._client()
+        client._token_exp = 111.0  # the old token's expiry
+        client._reauth_pending_exp = 999_999.0  # the fresh token's
+        client._dispatch(json.dumps({"type": "reauth_ok"}), None)
+        self.assertEqual(client._token_exp, 999_999.0)
+        self.assertIsNone(client._reauth_pending_exp)
+
+    def test_ack_exp_wins_over_the_local_value(self) -> None:
+        client = self._client()
+        client._token_exp = 111.0
+        client._reauth_pending_exp = 999_999.0
+        client._dispatch(json.dumps({"type": "reauth_ok", "exp": 555.0}), None)
+        self.assertEqual(client._token_exp, 555.0)
+        self.assertIsNone(client._reauth_pending_exp)
+
 
 class TestNoEarlyClose(RelayClientCase):
     """Finding 6: there is no done-based early close. The client cannot
     know the responder set, so a responder's done — however early —
     leaves the asker's stream open until the window+grace deadline."""
 
-    def test_done_does_not_close_the_stream_early(self) -> None:
+    def test_complete_closes_the_stream_early(self) -> None:
+        # Protocol v2: dones are answerer->relay signals; the relay —
+        # which knows the responder set — sends the asker `complete`,
+        # and THAT closes the stream early. (In v1 this stream ran to
+        # its full deadline: the client had no honest early bound.)
         responder = self.connect_client()
         asker = self.connect_client()
         batch = {"claims": [{"n": 1}]}
         responder.set_query_handler(lambda query: [batch])
         started = time.monotonic()
         results = list(
-            asker.query("track", "exact", subjects=["soul_e"], window_s=0.4, grace_s=0.8)
+            asker.query("track", "exact", subjects=["soul_e"], window_s=0.4, grace_s=5.0)
         )
         elapsed = time.monotonic() - started
         self.assertEqual(results, [batch])
-        self.assertGreaterEqual(elapsed, 1.1)  # the full 1.2s deadline ran
+        # The client deadline was 5.4s; the relay's complete (the
+        # responder's done reached it) closed the stream in ~1s.
+        self.assertLess(elapsed, 3.0)
+
+    def test_stream_honours_the_relay_grace_after_complete(self) -> None:
+        # Gate S3: after `complete`, the stream stays open for the
+        # RELAY's grace (learned from the welcome), because the relay
+        # keeps admitting answers until complete + its grace — they
+        # still land in the cache. The old fixed 1s grace closed the
+        # stream while charged answers were still in flight.
+        client = self.make_client()
+        batch = {"batch": {"header": {"node": "x"}, "claims": []}, "sig": "s"}
+        state = _QueryState(
+            query_id="d" * 32, window_seconds=60.0, grace_seconds=10.0)
+        state.complete_grace_seconds = 10.0
+        state.completed_at = time.monotonic() - 3.0  # inside the grace
+        with client._lock:
+            client._queries[state.query_id] = state
+        client._route_batch(state, batch)
+        self.assertEqual(next(_QueryStream(client, state)), batch)
+        # Past the relay's grace, the stream is over even with
+        # window time left.
+        state2 = _QueryState(
+            query_id="e" * 32, window_seconds=60.0, grace_seconds=10.0)
+        state2.complete_grace_seconds = 10.0
+        state2.completed_at = time.monotonic() - 11.0
+        with client._lock:
+            client._queries[state2.query_id] = state2
+        with self.assertRaises(StopIteration):
+            next(_QueryStream(client, state2))
+
+    def test_client_learns_the_relay_grace_from_the_welcome(self) -> None:
+        client = self.connect_client()
+        # RelayServerThread runs grace_seconds=1.0.
+        self.assertEqual(client._relay_grace_seconds, 1.0)
+
+    def test_stream_deadline_covers_the_relay_grace(self) -> None:
+        # Gate re-pass S-c: the caller's grace must not cut the
+        # relay's longer grace short — the stream's outer deadline
+        # folds the relay grace in, or answers the relay admitted
+        # inside its grace die against the asker's earlier deadline.
+        state = _QueryState(
+            query_id="f" * 32, window_seconds=6.0, grace_seconds=10.0)
+        state.complete_grace_seconds = 30.0
+        self.assertAlmostEqual(
+            state.deadline, state.started + 36.0, places=6)
+        # And the deadline never shrinks below the caller's own
+        # window + grace when the relay's grace is the shorter one.
+        state2 = _QueryState(
+            query_id="0" * 32, window_seconds=6.0, grace_seconds=20.0)
+        state2.complete_grace_seconds = 10.0
+        self.assertAlmostEqual(
+            state2.deadline, state2.started + 26.0, places=6)
+
+    def _welcome_grace(self, grace_literal: str):
+        # Drive _hello against a fake socket whose welcome carries
+        # grace_literal verbatim on the wire, so "Infinity" below is
+        # the exact bytes a hostile relay would send (json.loads on
+        # the client accepts it as float('inf')).
+        client = self.make_client()
+        challenge = json.dumps(
+            {"type": "challenge", "nonce": b64url_encode(b"\x02" * 32)}
+        )
+        welcome = (
+            '{"type": "welcome", "version": 2, "peers": 0,'
+            f' "grace_seconds": {grace_literal}}}'
+        )
+        incoming = [challenge, welcome]
+
+        class FakeWS:
+            async def recv(self) -> str:
+                return incoming.pop(0)
+
+            async def send(self, text: str) -> None:
+                pass
+
+        asyncio.run(
+            client._hello(FakeWS(), self.server.url, "own_library", "tok")
+        )
+        return client._relay_grace_seconds
+
+    def test_welcome_grace_non_finite_or_negative_is_ignored(self) -> None:
+        # Final gate pass: an Infinity grace would feed max() in the
+        # stream deadline and stall the query forever. Non-finite or
+        # negative values are ignored (the client keeps no relay
+        # grace, so the caller's grace governs), never adopted.
+        for literal in ("Infinity", "-Infinity", "NaN", "-5"):
+            with self.subTest(grace=literal):
+                self.assertIsNone(self._welcome_grace(literal))
+
+    def test_welcome_grace_huge_finite_is_capped(self) -> None:
+        for literal in ("1e300", "3600"):
+            with self.subTest(grace=literal):
+                self.assertEqual(
+                    self._welcome_grace(literal), MAX_RELAY_GRACE_SECONDS
+                )
+
+    def test_welcome_grace_normal_value_is_adopted(self) -> None:
+        self.assertEqual(self._welcome_grace("7.5"), 7.5)
+        self.assertEqual(self._welcome_grace("10"), 10.0)
+
+    def test_bare_done_message_does_not_close_the_stream(self) -> None:
+        # A done reaching the client anyway (a v1 relay forwards them)
+        # changes nothing: only `complete` closes a stream early.
+        client = self.make_client()
+        state = _QueryState(query_id="a" * 32)
+        with client._lock:
+            client._queries[state.query_id] = state
+        client._dispatch(
+            json.dumps({"type": "done", "query_id": state.query_id}), None
+        )
+        self.assertIsNone(state.completed_at)
+        self.assertFalse(state.finished.is_set())
+        client._dispatch(
+            json.dumps({"type": "complete", "query_id": state.query_id}), None
+        )
+        self.assertIsNotNone(state.completed_at)
 
 
 class TestDeliverRace(unittest.TestCase):
@@ -836,6 +1029,370 @@ class TestServiceTokenScopes(RelayClientCase):
     def test_meta_read_accepted(self) -> None:
         service = self._service_with_stub(StubPoolClient("tok"))
         self.assertEqual(service._relay_token(), "tok")
+
+
+class TestProtocolV2(RelayClientCase):
+    """Protocol v2 behaviors end to end: sealed answers the relay
+    cannot read, the sender-stamp pre-filter, revocation carriage to
+    the client, in-band re-auth, and query_refused fast failure."""
+
+    def test_sealed_round_trip_relay_never_sees_plaintext(self) -> None:
+        marker = "PLAINTEXT-MARKER-7f3a"
+        responder_identity = NodeIdentity(key=secrets.token_hex(32))
+        responder = self.connect_client(responder_identity)
+        asker = self.connect_client()
+        envelope = {
+            "batch": {
+                "header": {
+                    "version": 1,
+                    "node": responder_identity.public_key_b64url,
+                    "claim_count": 1,
+                    "nonce": "n",
+                },
+                "claims": [{"subject": "soul_x", "value": marker}],
+            },
+            "sig": "c2ln",
+        }
+        seen: dict = {}
+
+        def handler(query):
+            seen.update(query)
+            return [envelope]
+
+        responder.set_query_handler(handler)
+        # Tap everything the relay queues for anyone: structural proof
+        # of what crosses the switchboard.
+        relay = self.server.relay
+        frames: list[str] = []
+        original_enqueue = relay._enqueue
+
+        def tap(conn, payload):
+            frames.append(payload)
+            return original_enqueue(conn, payload)
+
+        relay._enqueue = tap
+        try:
+            results = list(
+                asker.query(
+                    "track", "exact", subjects=["soul_x"], window_s=0.5, grace_s=1.0
+                )
+            )
+        finally:
+            relay._enqueue = original_enqueue
+        self.assertEqual(results, [envelope])
+        # The query carried an ephemeral reply key (a public key is
+        # fine for the relay to see) and a negotiated encoding.
+        self.assertIn("reply_key", seen)
+        self.assertIn("reply_encoding", seen)
+        # Sealing was on for the answers: a sealed frame crossed the
+        # relay, and the marker plaintext appears in NO relay frame.
+        self.assertTrue(any('"sealed"' in frame for frame in frames), frames)
+        self.assertFalse(any(marker in frame for frame in frames), frames)
+
+    def test_stamp_mismatch_dropped_before_routing(self) -> None:
+        client = self.make_client()
+        signer = NodeIdentity(key=secrets.token_hex(32))
+        other = NodeIdentity(key=secrets.token_hex(32))
+        state = _QueryState(query_id="b" * 32)
+        with client._lock:
+            client._queries[state.query_id] = state
+        envelope = {
+            "batch": {
+                "header": {"version": 1, "node": signer.public_key_b64url},
+                "claims": [],
+            },
+            "sig": "c2ln",
+        }
+
+        def answer_with_stamp(stamp_from):
+            return json.dumps(
+                {
+                    "type": "answer",
+                    "query_id": state.query_id,
+                    "batch": envelope,
+                    "stamp": {"from": stamp_from, "query_id": state.query_id},
+                }
+            )
+
+        # The stamp names a different answerer than the batch signer:
+        # dropped by the cheap pre-filter, never routed.
+        client._dispatch(answer_with_stamp(other.node_id), None)
+        self.assertTrue(state.batches.empty())
+        # A matching stamp routes.
+        client._dispatch(answer_with_stamp(signer.node_id), None)
+        self.assertEqual(state.batches.get_nowait(), envelope)
+        # A forwarding envelope is never stamp-checked (the stamp
+        # names the forwarder, the header the origin) — but only the
+        # REAL forwarding shape earns that exemption: the signed
+        # fields the responder actually emits (SF-1).
+        forwarded = {
+            "forward": {
+                "origin_batch_id": "a" * 64,
+                "origin_node": signer.public_key_b64url,
+                "forwarded_at": "2026-10-27T00:00:00+00:00",
+                "sig": "c2ln",
+            },
+            "envelope": envelope,
+        }
+        client._dispatch(
+            json.dumps(
+                {
+                    "type": "answer",
+                    "query_id": state.query_id,
+                    "batches": [forwarded],
+                    "stamp": {"from": other.node_id, "query_id": state.query_id},
+                }
+            ),
+            None,
+        )
+        self.assertEqual(state.batches.get_nowait(), forwarded)
+        # A bare "forward" key no longer opts out: this direct batch
+        # wearing a junk forward key faces the stamp check and the
+        # mismatched stamp drops it.
+        disguised = dict(envelope)
+        disguised["forward"] = {}
+        client._dispatch(
+            json.dumps(
+                {
+                    "type": "answer",
+                    "query_id": state.query_id,
+                    "batch": disguised,
+                    "stamp": {"from": other.node_id, "query_id": state.query_id},
+                }
+            ),
+            None,
+        )
+        self.assertTrue(state.batches.empty())
+
+    def test_pack_answer_messages_refuses_plaintext_for_sealed_query(self) -> None:
+        # Gate S1, answerer hop: a query carrying a reply key is
+        # packed SEALED or not at all — sealing unavailable or a
+        # bad reply key must never fall back to plaintext batches.
+        batch = {
+            "batch": {"header": {"node": "x"}, "claims": []},
+            "sig": "c2ln",
+        }
+        query = {
+            "query_id": "ab" * 16,
+            "reply_key": b64url_encode(b"\x07" * 32),
+            "reply_encoding": "none",
+        }
+        with mock.patch.object(
+            relay_module.sealing, "sealing_available", lambda: False
+        ):
+            self.assertEqual(
+                relay_module._pack_answer_messages(query, [batch]), [])
+        bad_key = dict(query, reply_key="!!not-a-key!!")
+        self.assertEqual(
+            relay_module._pack_answer_messages(bad_key, [batch]), [])
+        short_key = dict(query, reply_key=b64url_encode(b"\x07" * 16))
+        self.assertEqual(
+            relay_module._pack_answer_messages(short_key, [batch]), [])
+        # With sealing available, the sealed path still packs.
+        sealed_msgs = relay_module._pack_answer_messages(query, [batch])
+        self.assertEqual(len(sealed_msgs), 1)
+        self.assertIn('"sealed"', sealed_msgs[0])
+        # And a query WITHOUT a reply key keeps the plain path.
+        plain = relay_module._pack_answer_messages(
+            {"query_id": "ab" * 16}, [batch])
+        self.assertEqual(len(plain), 1)
+        self.assertIn('"batches"', plain[0])
+
+    def test_plaintext_answer_to_own_sealed_query_is_dropped(self) -> None:
+        # Gate S1, asker hop: this query went out with a reply key
+        # (reply_private set), so a plaintext answer frame for it —
+        # from a downgrading relay or answerer — is dropped, never
+        # routed into the stream.
+        client = self.make_client()
+        signer = NodeIdentity(key=secrets.token_hex(32))
+        state = _QueryState(query_id="c" * 32)
+        state.reply_private = b"\x01" * 32
+        with client._lock:
+            client._queries[state.query_id] = state
+        envelope = {
+            "batch": {
+                "header": {"version": 1, "node": signer.public_key_b64url},
+                "claims": [],
+            },
+            "sig": "c2ln",
+        }
+        client._dispatch(
+            json.dumps(
+                {
+                    "type": "answer",
+                    "query_id": state.query_id,
+                    "batches": [envelope],
+                    "stamp": {"from": signer.node_id,
+                              "query_id": state.query_id},
+                }
+            ),
+            None,
+        )
+        self.assertTrue(state.batches.empty())
+
+    def test_revocations_carried_in_welcome_and_pushed(self) -> None:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+            Ed25519PrivateKey,
+        )
+        from metasync_relay.revocations import RevocationFeed, list_signing_text
+
+        issuer_private = Ed25519PrivateKey.generate()
+        issuer_public = issuer_private.public_key()
+
+        def signed(seq, keys):
+            return {
+                "issuer": "issuer-1",
+                "seq": seq,
+                "issued_at": 1700000000,
+                "keys": list(keys),
+                "sig": encode_base64url(
+                    issuer_private.sign(
+                        list_signing_text("issuer-1", seq, 1700000000, keys)
+                    )
+                ),
+            }
+
+        feed = RevocationFeed(
+            "issuer-1",
+            issuer_public,
+            "https://issuer.example/revoked.json",
+            fetch=lambda url: json.dumps(signed(1, ["f" * 64])).encode(),
+        )
+        self.server.relay.revocations = feed
+        asyncio.run_coroutine_threadsafe(
+            self.server.relay.refresh_revocations(), self.server.loop
+        ).result(timeout=10)
+        identity = NodeIdentity(key=secrets.token_hex(32))
+        client = RelayClient(
+            identity,
+            url_provider=lambda: self.server.url,
+            mode_provider=lambda: "own_library",
+            token_provider=lambda: self.token_for(identity),
+            issuer_key_provider=lambda: issuer_public,
+        )
+        self.clients.append(client)
+        client.start()
+        wait_until(lambda: client.connected)
+        current = client.revocations()
+        self.assertIsNotNone(current)
+        self.assertEqual(current["seq"], 1)
+        self.assertEqual(current["keys"], ["f" * 64])
+        self.assertEqual(
+            client.status()["revocations"]["issuers"]["issuer-1"]["seq"], 1
+        )
+        # A newer list is pushed by the relay and lands in the store.
+        feed._fetch = lambda url: json.dumps(signed(2, [])).encode()
+        asyncio.run_coroutine_threadsafe(
+            self.server.relay.refresh_revocations(), self.server.loop
+        ).result(timeout=10)
+        wait_until(lambda: (client.revocations() or {}).get("seq") == 2)
+        self.assertEqual(client.revocations()["keys"], [])
+
+    def test_reauth_keeps_the_session_across_token_expiry(self) -> None:
+        # First token lives 3 seconds; every re-exchange gets a fresh
+        # hour. The relay's expiry grace is 1s: without the client's
+        # in-band re-auth the session would die at ~4s.
+        import dataclasses
+
+        relay = self.server.relay
+        relay.config = dataclasses.replace(relay.config, reauth_grace_seconds=1.0)
+        identity = NodeIdentity(key=secrets.token_hex(32))
+        calls = {"n": 0}
+
+        def token_provider():
+            calls["n"] += 1
+            ttl = 3 if calls["n"] == 1 else 3600
+            return issue_token(
+                self.pool_private, KEY_ID, identity.node_id, FULL_SCOPES, ttl=ttl
+            )
+
+        client = self.make_client(identity, token_provider=token_provider)
+        client.start()
+        wait_until(lambda: client.connected)
+        conn_before = self.server.relay.presence[identity.node_id]
+        time.sleep(5.5)  # past the first token's expiry + grace
+        self.assertTrue(client.connected)
+        # Same connection object at the relay: the session never dropped.
+        self.assertIs(self.server.relay.presence[identity.node_id], conn_before)
+        self.assertGreaterEqual(calls["n"], 2)  # the re-auth re-exchanged
+
+    def test_reauth_uses_the_fresh_exchange_not_the_cached_token(self) -> None:
+        # Gate M4: the plain token provider here returns the SAME
+        # short-lived token forever (a pool client's cache would).
+        # If re-auth presented that cached token, the relay would
+        # ack the same expiry and the session would die at
+        # expiry+grace; it survives only because re-auth goes
+        # through the fresh-exchange provider (§10).
+        import dataclasses
+
+        relay = self.server.relay
+        relay.config = dataclasses.replace(relay.config, reauth_grace_seconds=1.0)
+        identity = NodeIdentity(key=secrets.token_hex(32))
+        first = issue_token(
+            self.pool_private, KEY_ID, identity.node_id, FULL_SCOPES, ttl=3
+        )
+        calls = {"fresh": 0}
+
+        def fresh_provider():
+            calls["fresh"] += 1
+            return issue_token(
+                self.pool_private, KEY_ID, identity.node_id, FULL_SCOPES,
+                ttl=3600,
+            )
+
+        client = RelayClient(
+            identity,
+            url_provider=lambda: self.server.url,
+            mode_provider=lambda: "own_library",
+            token_provider=lambda: first,
+            fresh_token_provider=fresh_provider,
+        )
+        self.clients.append(client)
+        client.start()
+        wait_until(lambda: client.connected)
+        conn_before = self.server.relay.presence[identity.node_id]
+        time.sleep(5.5)  # past the first token's expiry + grace
+        self.assertTrue(client.connected)
+        self.assertIs(self.server.relay.presence[identity.node_id], conn_before)
+        self.assertGreaterEqual(calls["fresh"], 1)
+
+    def test_fetch_token_fresh_selects_the_fresh_provider(self) -> None:
+        import asyncio as _asyncio
+
+        client = RelayClient(
+            NodeIdentity(key=secrets.token_hex(32)),
+            url_provider=lambda: "",
+            mode_provider=lambda: "own_library",
+            token_provider=lambda: "cached",
+            fresh_token_provider=lambda: "fresh",
+        )
+        self.assertEqual(_asyncio.run(client._fetch_token()), "cached")
+        self.assertEqual(
+            _asyncio.run(client._fetch_token(fresh=True)), "fresh")
+        # Without a fresh provider, fresh falls back to the plain one.
+        plain = RelayClient(
+            NodeIdentity(key=secrets.token_hex(32)),
+            url_provider=lambda: "",
+            mode_provider=lambda: "own_library",
+            token_provider=lambda: "only",
+        )
+        self.assertEqual(_asyncio.run(plain._fetch_token(fresh=True)), "only")
+
+    def test_query_refused_fails_the_stream_fast(self) -> None:
+        # A dedicated relay that refuses every query on budget.
+        self.server.stop()
+        self.server = RelayServerThread(self.pool_public, queries_per_hour=0)
+        self.server.start()
+        self.addCleanup(self.server.stop)
+        asker = self.connect_client()
+        started = time.monotonic()
+        with self.assertRaises(RelayNotConnected):
+            list(
+                asker.query(
+                    "track", "exact", subjects=["soul_x"], window_s=30.0, grace_s=30.0
+                )
+            )
+        self.assertLess(time.monotonic() - started, 10.0)
 
 
 if __name__ == "__main__":

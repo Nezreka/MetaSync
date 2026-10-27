@@ -21,6 +21,7 @@ import hashlib
 import json
 import re
 import secrets
+import time
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
@@ -28,6 +29,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 
+from ..attestation import validate_attestation_shape
 from . import soulid as _soulid
 
 BATCH_VERSION = 1
@@ -233,7 +235,9 @@ def _check_retractions(retractions) -> None:
 
 
 def make_batch(node_pubkey_b64: str, claims, retractions=None,
-               nonce: str | None = None) -> dict:
+               nonce: str | None = None,
+               attestation: dict | None = None,
+               asserted_at: int | None = None) -> dict:
     """Build an unsigned batch envelope from validated claims.
 
     The header carries a random `nonce`: a batch's digest is its
@@ -243,18 +247,47 @@ def make_batch(node_pubkey_b64: str, claims, retractions=None,
     nonce makes each sending its own batch; per-claim dedupe is the
     (subject, field, value, account) unique rule at ingest, not the
     batch digest.
+
+    `asserted_at` is the node's clock at minting, in Unix seconds,
+    signed like every other header field (§6): cache ages run from
+    it (§6 Retractions), §9 checks it against the attestation window
+    and computes standing from it. Without a signed assertion time
+    neither check is implementable on a received batch — a cache
+    would have to fall back to receipt time, which every re-serve
+    would refresh, and retracted claims would never age out. It
+    defaults to now; tests pin it explicitly.
+
+    `attestation` is the node's current pool-signed binding
+    attestation (§9), embedded in the header at minting so it
+    travels with the batch (§6); the digest — and therefore the
+    signature — covers it like every other header field. Its shape
+    is validated here (attestation.py owns the shape): a malformed
+    one is a ClaimError, never minted. None mints a batch without
+    one — valid, but it will count zero support under §9, which is
+    the design's rule for unattested batches, not an error.
     """
     claims = [validate_claim(c) for c in claims]
     if len(claims) > MAX_CLAIMS_PER_BATCH:
         raise ClaimError("batch over claim cap")
     _check_batch_claims(claims)
     _check_retractions(retractions or [])
+    if asserted_at is None:
+        asserted_at = int(time.time())
+    if isinstance(asserted_at, bool) or not isinstance(asserted_at, int) \
+            or asserted_at < 0:
+        raise ClaimError("batch asserted_at must be a Unix-seconds int")
     header = {
         "version": BATCH_VERSION,
         "node": node_pubkey_b64,
         "claim_count": len(claims),
         "nonce": nonce or b64url_encode(secrets.token_bytes(16)),
+        "asserted_at": asserted_at,
     }
+    if attestation is not None:
+        normalized = validate_attestation_shape(attestation)
+        if normalized is None:
+            raise ClaimError("batch attestation is malformed")
+        header["attestation"] = normalized
     batch = {"header": header, "claims": claims,
              "retractions": retractions or []}
     _check_canonical_value(batch, "batch")
@@ -279,9 +312,10 @@ def verify_batch(public_key_b64: str, envelope: dict) -> dict:
     """Verify a wire envelope; returns the batch or raises ClaimError.
 
     Checks, in order: the header names this key, the signature is the
-    key's over the batch digest, and every claim validates. Server
-    receipt time is assigned by the receiver, never taken from the
-    batch (§6).
+    key's over the batch digest, and every claim validates. The
+    header's signed `asserted_at` is required (§6): receivers age the
+    batch from it, capped at their own receipt time — the assertion
+    time is taken from the batch, but never trusted past receipt.
     """
     try:
         batch = envelope["batch"]
@@ -304,6 +338,13 @@ def verify_batch(public_key_b64: str, envelope: dict) -> dict:
         raise ClaimError("batch header node does not match the signing key")
     if not isinstance(header.get("nonce"), str) or not header["nonce"]:
         raise ClaimError("batch header nonce missing")
+    asserted_at = header.get("asserted_at")
+    if isinstance(asserted_at, bool) or not isinstance(asserted_at, int) \
+            or asserted_at < 0:
+        # §6: the signed assertion time is what cache ages and §9's
+        # attestation-window/standing checks run from. A batch
+        # without one is refused, never repaired with receipt time.
+        raise ClaimError("batch header asserted_at missing or invalid")
     try:
         pub.verify(sig, digest)
     except InvalidSignature as e:
