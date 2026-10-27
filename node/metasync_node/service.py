@@ -26,6 +26,7 @@ from .identity import NodeIdentity, load_or_create_identity, token_for_week
 from .musicbrainz import MusicBrainzResolver
 from .playlists import build_canonical_playlists
 from .pool import PoolBindingPending, PoolClient, PoolError, PoolNotAvailable, is_loopback_url
+from .relay import RelayClient, RelayError, normalize_mode
 from .signals import KEEP_AFTER, LATE_WINDOW, compute_signals, is_uuid_shape
 from .soulsync import SoulSyncClient, SoulSyncError
 from .store import Store, default_pool_from_env
@@ -117,6 +118,11 @@ class NodeService:
         # One report run at a time, whoever starts it (UI job or scheduler):
         # two concurrent runs would race the churn snapshots and state.
         self._run_lock = threading.Lock()
+        # The metadata-network relay client (DESIGN-METADATA.md section
+        # 10), created lazily by sync_relay_client when the user turns
+        # the network on. None means "never started on this process".
+        self._relay_client: RelayClient | None = None
+        self._relay_lock = threading.Lock()
         # A job record persisted as "running" across a restart is a corpse:
         # its thread died with the old process. Close it out honestly.
         stale_job = self.store.state.get("report_job") or {}
@@ -959,6 +965,110 @@ class NodeService:
                     "tracks": tracks,
                 })
         return {"week": week, "playlists": playlists}
+
+    # -- metadata network (relay transport, DESIGN-METADATA.md section 10) --
+    def _meta_relay_url(self) -> str:
+        return str(self.store.settings.get("meta_relay_url") or "").strip()
+
+    def _meta_node_mode(self) -> str:
+        return normalize_mode(self.store.settings.get("meta_node_mode"))
+
+    def _relay_token(self) -> str:
+        """A current pool access token for the relay hello.
+
+        The relay authenticates with the SIN exchange token (section
+        10): the first enabled pool's client exchanges as usual, and
+        the token must carry the meta:read scope the pools now grant.
+        Anything else (no pool, legacy pool, missing scope) is a
+        connect failure the relay client backs off on."""
+        pools = self.pools()
+        if not pools:
+            raise RelayError("no pool joined: the relay hello needs a pool key exchange")
+        client = self.pool_client(pools[0])
+        client.exchange()
+        token = client.auth_state.get("access_token")
+        if not token:
+            raise RelayError("pool exchange produced no access token (legacy pool?)")
+        scopes = client.auth_state.get("scopes") or []
+        if "meta:read" not in scopes:
+            # Missing or empty scope lists mean the token cannot be
+            # shown to carry meta:read (a legacy pool records none):
+            # fail here with the clear diagnosis instead of letting
+            # the relay refuse a hello it was never entitled to make.
+            raise RelayError("pool access token does not carry the meta:read scope")
+        return str(token)
+
+    def _new_relay_client(self) -> RelayClient:
+        return RelayClient(
+            self.identity,
+            url_provider=self._meta_relay_url,
+            mode_provider=self._meta_node_mode,
+            token_provider=self._relay_token,
+        )
+
+    def sync_relay_client(self) -> dict[str, Any]:
+        """Start or stop the relay client to match the settings.
+
+        The metadata network is its own switch: settings meta_network
+        (default off) plus a relay URL. With the switch off, or no URL,
+        the client stops and nothing connects anywhere. With it on, the
+        client runs; a URL or mode change kicks the live session so it
+        re-hellos with the new values. Idempotent; the scheduler calls
+        it every tick so dashboard changes land without a restart."""
+        want = bool(self.store.settings.get("meta_network", False)) and bool(self._meta_relay_url())
+        stop_client: RelayClient | None = None
+        with self._relay_lock:
+            client = self._relay_client
+            if want:
+                if client is None:
+                    client = self._relay_client = self._new_relay_client()
+                    client.start()
+                elif not client.is_alive():
+                    client.start()
+                elif client.session_params is not None and client.session_params != (
+                    self._meta_relay_url(),
+                    self._meta_node_mode(),
+                ):
+                    client.kick()
+            elif client is not None:
+                stop_client = client
+        # The stop runs OUTSIDE the lock: stop() joins the connection
+        # thread, and holding _relay_lock across that join would stall
+        # every relay_status() for its duration. The reference is only
+        # dropped once stop() confirms the thread is dead; a client
+        # that is still winding down keeps its reference, so the next
+        # tick retries the stop instead of spawning a replacement that
+        # would duel the survivor at the relay.
+        if stop_client is not None and stop_client.stop():
+            with self._relay_lock:
+                if self._relay_client is stop_client:
+                    self._relay_client = None
+        return self.relay_status()
+
+    def stop_relay_client(self) -> None:
+        with self._relay_lock:
+            client = self._relay_client
+        if client is not None and client.stop():
+            with self._relay_lock:
+                if self._relay_client is client:
+                    self._relay_client = None
+
+    def relay_status(self) -> dict[str, Any]:
+        """Relay connection status for the dashboard and diagnostics."""
+        enabled = bool(self.store.settings.get("meta_network", False))
+        client = self._relay_client
+        if client is None:
+            return {
+                "enabled": enabled,
+                "connected": False,
+                "peers": None,
+                "mode": self._meta_node_mode(),
+                "relay_url": self._meta_relay_url(),
+                "last_error": None,
+            }
+        status = client.status()
+        status["enabled"] = enabled
+        return status
 
     # -- status ---------------------------------------------------------------
     def status(self) -> dict[str, Any]:

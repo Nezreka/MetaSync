@@ -37,6 +37,14 @@ def scheduler_loop(service: NodeService, stop: threading.Event) -> None:
     """Weekly report + periodic playlist refresh, each leg isolated."""
     while not stop.is_set():
         try:
+            # The metadata-network relay client follows its settings
+            # switch: sync every tick so a dashboard change (network on
+            # or off, new relay URL, new mode) lands without a restart.
+            service.sync_relay_client()
+        except Exception as err:  # noqa: BLE001 - the relay leg must never kill the scheduler
+            service.store.record_error("relay", err)
+            service.store.save_state()
+        try:
             now = datetime.now(timezone.utc)
             # Once per closed week, after this node's slot, with a back-off
             # after a failure (service.report_due) — never every tick, and
@@ -78,6 +86,10 @@ def main(argv: list[str]) -> int:
         return 0
     if command == "serve":
         stop = threading.Event()
+        # Start the relay client at boot when the metadata network is
+        # switched on (the scheduler's per-tick sync keeps it in step
+        # with settings changes after that).
+        service.sync_relay_client()
         thread = threading.Thread(target=scheduler_loop, args=(service, stop), daemon=True)
         thread.start()
         app = create_app(service)
@@ -86,6 +98,7 @@ def main(argv: list[str]) -> int:
             app.run(host="0.0.0.0", port=service.config.port, threaded=True)
         finally:
             stop.set()
+            service.stop_relay_client()
         return 0
     print(f"unknown command: {command} (expected serve|report|refresh|preview)", file=sys.stderr)
     return 2
