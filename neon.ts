@@ -62,15 +62,9 @@ export default defineConfig({
         SIN_BUILD_TIME: BUILD_TIME,
       },
     },
-    // MetaSync metadata service — SCAFFOLD ONLY (src/metasync/index.ts).
-    // Health + a 501 placeholder route; no env, no DB access yet.
-    metasync: {
-      name: "MetaSync metadata (scaffold)",
-      source: "src/metasync/index.ts",
-    },
     // The original `hello` function from `neon init` was removed: its job
     // (proving the Neon Functions wiring) is now covered by the /health
-    // routes on both functions above.
+    // route on the function above.
   },
   // Branch policy: per-branch tuning
   branch: (branch) => {
