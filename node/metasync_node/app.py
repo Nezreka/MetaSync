@@ -24,7 +24,7 @@ from .service import NodeService, PairingError, PairingRateLimited, check_pool_u
 MACHINE_POST_PATHS = frozenset({
     "/local/pair/request", "/local/pair/claim",
     "/local/handoff/pool-key", "/local/disconnect",
-    "/local/meta/preview",
+    "/local/meta/preview", "/local/meta/query",
 })
 
 LOGIN_MAX_FAILURES = 5
@@ -295,6 +295,31 @@ def create_app(service: NodeService) -> Flask:
         query = body.get("query") if isinstance(body.get("query"), dict) \
             else body
         return service.preview_answers(query)
+
+    @app.post("/local/meta/query")
+    @local_key_required
+    def local_meta_query():
+        # The querier (DESIGN-METADATA §6): cache-first asking.
+        # Body: {kind, mode: exact|text, subjects|terms}. Returns
+        # the merged records AS THE COARSE DEPOT PROJECTION
+        # (merge.project_for_depot: bucketed support, no origin
+        # keys or batch ids — the step-8 contract) plus whether
+        # the network was asked at all.
+        body = _json_body()
+        out = service.meta_query(body)
+        return out, 200 if out.get("ok") else 400
+
+    @app.get("/local/meta/record/<path:entry>")
+    @local_key_required
+    def local_meta_record(entry):
+        # One subject's merged view from local data + cache only —
+        # no relay traffic, served as the same coarse projection.
+        # The entry may be a SoulID, a provider ref (deezer:3135556)
+        # or a verified legacy alias.
+        record = service.meta_record(entry)
+        if record is None:
+            return {"ok": False, "error": "not_found"}, 404
+        return {"ok": True, "record": record}
 
     @app.get("/local/charts")
     @local_key_required

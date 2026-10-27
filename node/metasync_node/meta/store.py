@@ -52,6 +52,7 @@ import re
 import sqlite3
 import threading
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -94,6 +95,11 @@ def claim_reservable(claim: dict[str, Any]) -> bool:
     (be re-served, or sit in a batch that is) when it is a bare
     ID/link claim, or a file_tags/MusicBrainz value that does not
     assert a caution field from a non-MusicBrainz source."""
+    if claim["source"] == "network":
+        # §6: a network-marked value never travels again, not even
+        # as a bare ID link — the mark exists to stop a promoted
+        # value laundering back into network truth.
+        return False
     if claim["field"] in _LINK_FIELDS:
         return True
     if claim["source"] not in RESERVABLE_SOURCES:
@@ -146,6 +152,8 @@ CREATE TABLE IF NOT EXISTS provider_index (
     ref      TEXT NOT NULL,               -- "provider:external_id"
     subject  TEXT NOT NULL,
     via      TEXT NOT NULL,               -- 'id' | 'link_from' | 'link_to'
+    kind     TEXT,                        -- kind of the entity the REF names (gate minor); NULL on pre-fold rows
+    subject_kind TEXT,                    -- kind of the SUBJECT the row resolves to (gate r2); NULL on pre-fold rows
     claim_id INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS provider_index_ref ON provider_index(ref);
@@ -174,6 +182,73 @@ CREATE TABLE IF NOT EXISTS walk_owners (
     owner   TEXT NOT NULL,
     PRIMARY KEY (walk_id, owner)
 );
+-- Step 6 (the querier): legacy SoulID aliases (§6). A legacy id is
+-- an alias entry, never a subject; a row lands here only when the
+-- builder verified the mapping by recomputing the v2 id from the
+-- export row's own name parts (meta/builder.py).
+CREATE TABLE IF NOT EXISTS legacy_aliases (
+    legacy     TEXT PRIMARY KEY,          -- the pre-v2 id, exactly as served
+    subject    TEXT NOT NULL,             -- the verified kinded_v2 subject
+    learned_at REAL NOT NULL
+);
+-- §9 admission record per cached batch: whether the origin met
+-- standing (attested age >= 30 days) when the batch was admitted.
+-- Support counting reads this, never the raw attestation — the
+-- admission decision is made once, at the door.
+CREATE TABLE IF NOT EXISTS batch_admission (
+    batch_id    TEXT PRIMARY KEY,
+    origin_node TEXT NOT NULL,
+    standing    INTEGER NOT NULL,         -- 1 = origin met §9 standing
+    issuer      TEXT,                     -- embedded attestation's issuer (unverified)
+    bound_at    INTEGER,                  -- embedded attestation's bound_at
+    admitted_at REAL NOT NULL
+);
+-- §7 verification verdicts, keyed by CLAIM IDENTITY (origin key,
+-- subject, field, value) — never by batch id (§6: re-minting
+-- changes a batch's id, never its claims' identities).
+CREATE TABLE IF NOT EXISTS claim_verdicts (
+    origin_node TEXT NOT NULL,
+    subject     TEXT NOT NULL,
+    field       TEXT NOT NULL,
+    value_key   TEXT NOT NULL,            -- canonical JSON of the value
+    tier        TEXT NOT NULL,            -- 'plausible' | 'strong-verified'
+    verified_at REAL NOT NULL,
+    detail      TEXT,
+    PRIMARY KEY (origin_node, subject, field, value_key)
+);
+CREATE INDEX IF NOT EXISTS claim_verdicts_subject
+    ON claim_verdicts(subject);
+-- §9 reputation: this node's LOCAL record of how an origin's
+-- claims fared under §7 checks. Display ordering and the sanity
+-- gate only — never support, never admission.
+CREATE TABLE IF NOT EXISTS reputation (
+    origin_node   TEXT PRIMARY KEY,
+    checks_passed INTEGER NOT NULL DEFAULT 0,
+    checks_failed INTEGER NOT NULL DEFAULT 0,
+    updated_at    REAL NOT NULL
+);
+-- §8's bounded sanity rule: one consumed trigger per origin per
+-- subject-field per ROLLING 24 h (R2-SF-8) — fired_at carries
+-- the window; day is retained for the primary key's shape.
+CREATE TABLE IF NOT EXISTS sanity_triggers (
+    origin_node TEXT NOT NULL,
+    subject     TEXT NOT NULL,
+    field       TEXT NOT NULL,
+    day         TEXT NOT NULL,            -- UTC YYYY-MM-DD
+    fired_at    REAL,                     -- Unix seconds
+    PRIMARY KEY (origin_node, subject, field, day)
+);
+-- §7.1 fetch cache: provider responses are cached 90 days; a
+-- not_found row records the lookup outcome, not an absence proof
+-- (absence needs the second-path test in meta/verify.py).
+CREATE TABLE IF NOT EXISTS fetch_cache (
+    provider   TEXT NOT NULL,
+    cache_key  TEXT NOT NULL,
+    fetched_at REAL NOT NULL,
+    not_found  INTEGER NOT NULL DEFAULT 0,
+    payload    TEXT,                      -- JSON; NULL when not_found
+    PRIMARY KEY (provider, cache_key)
+);
 """
 
 
@@ -193,24 +268,52 @@ def name_tokens(text: str) -> set[str]:
     return out
 
 
-def provider_refs(claim: dict[str, Any]) -> list[tuple[str, str]]:
-    """(ref, via) pairs one claim contributes to the provider index."""
+def provider_refs(claim: dict[str, Any]) -> list[tuple[
+        str, str, str | None, str | None]]:
+    """(ref, via, kind, subject_kind) rows one claim contributes
+    to the provider index. `kind` is the kind of the entity the
+    REF names: for id claims and a link's from-end, the claim's
+    own kind (the ref names the subject); for a link's to-end,
+    the link's `to_kind` (it names the OTHER entity) — kept as a
+    separate fact about the far end. `subject_kind` is the kind
+    of the claim's OWN subject — the entity resolution returns —
+    and is recorded on EVERY row (gate r2): resolution filters
+    on it for all via types, so a link's to-end resolves only
+    within its subject's kind. Providers number their kinds
+    separately, so resolution can — and, when the caller knows
+    the kind it is resolving for, must — match within kind."""
     field = claim["field"]
     value = claim["value"]
+    kind = claim.get("kind")
     if field in _PROVIDER_ID_FIELD and isinstance(value, str):
-        return [(f"{_PROVIDER_ID_FIELD[field]}:{value}", "id")]
+        return [(f"{_PROVIDER_ID_FIELD[field]}:{value}", "id",
+                 kind, kind)]
     if field in _MBID_FIELDS and isinstance(value, str):
-        return [(f"musicbrainz:{value}", "id")]
+        return [(f"musicbrainz:{value}", "id", kind, kind)]
     if field == "provider_link" and isinstance(value, dict):
         provider = value.get("provider")
         if isinstance(provider, str) and provider:
             out = []
             if isinstance(value.get("from_id"), str) and value["from_id"]:
-                out.append((f"{provider}:{value['from_id']}", "link_from"))
+                out.append((f"{provider}:{value['from_id']}",
+                            "link_from", kind, kind))
             if isinstance(value.get("to_id"), str) and value["to_id"]:
-                out.append((f"{provider}:{value['to_id']}", "link_to"))
+                to_kind = value.get("to_kind")
+                out.append((f"{provider}:{value['to_id']}", "link_to",
+                            to_kind if to_kind in meta_claims.KINDS
+                            else kind, kind))
             return out
     return []
+
+
+def value_key(value: Any) -> str:
+    """A claim value's identity string: byte-identical to the
+    value_json the claims table stores (same dumps call), so a
+    verdict row and a claim row for the same value always meet.
+    Claim identity everywhere in step 6 — verdicts, merge
+    provenance, the depot link (§6) — is (origin key, subject,
+    field, this string)."""
+    return json.dumps(value, sort_keys=True, ensure_ascii=False)
 
 
 def node_id_for_key(public_key_b64: str) -> str | None:
@@ -251,6 +354,38 @@ class MetaStore:
         # a writer waits instead of failing the operation outright.
         self._db.execute("PRAGMA busy_timeout = 5000")
         self._db.executescript(_SCHEMA)
+        # Rolling-24h sanity windows (R2-SF-8) need fired_at on
+        # sanity_triggers; databases created before it lack the
+        # column (their rows read as long-ago, which is safe).
+        columns = {row[1] for row in self._db.execute(
+            "PRAGMA table_info(sanity_triggers)")}
+        if "fired_at" not in columns:
+            self._db.execute(
+                "ALTER TABLE sanity_triggers ADD COLUMN fired_at"
+                " REAL")
+        # Provider-index rows carry the kind of the entity their
+        # ref names (gate minor: Deezer numbers artist, album and
+        # track ids separately, so an artist id must never resolve
+        # inside an album/track-scoped lookup). Rows written
+        # before the column existed keep NULL and read as
+        # kind-unknown — resolution treats them as matching any
+        # kind (backwards-compatible reads; the index rebuilds
+        # from batches on write, so kinds fill in as claims move).
+        pi_columns = {row[1] for row in self._db.execute(
+            "PRAGMA table_info(provider_index)")}
+        if "kind" not in pi_columns:
+            self._db.execute(
+                "ALTER TABLE provider_index ADD COLUMN kind TEXT")
+        # Every row also records the SUBJECT's kind (gate r2):
+        # resolution filters on it for ALL via types, link_to
+        # included — the kind column above stays as a fact about
+        # the ref's far end. Pre-fold rows keep NULL and read as
+        # kind-unknown, the same backwards-compatible convention
+        # as the kind column.
+        if "subject_kind" not in pi_columns:
+            self._db.execute(
+                "ALTER TABLE provider_index ADD COLUMN subject_kind"
+                " TEXT")
         self._db.commit()
         try:
             os.chmod(self.path, 0o600)
@@ -349,11 +484,12 @@ class MetaStore:
              json.dumps(claim["value"], sort_keys=True, ensure_ascii=False),
              claim["source"]))
         claim_id = cur.lastrowid
-        for ref, via in provider_refs(claim):
+        for ref, via, ref_kind, subj_kind in provider_refs(claim):
             cur.execute(
-                "INSERT INTO provider_index(ref, subject, via, claim_id) "
-                "VALUES (?, ?, ?, ?)",
-                (ref, claim["subject"], via, claim_id))
+                "INSERT INTO provider_index(ref, subject, via, kind,"
+                " subject_kind, claim_id) VALUES (?, ?, ?, ?, ?, ?)",
+                (ref, claim["subject"], via, ref_kind, subj_kind,
+                 claim_id))
         if claim["field"] in ("name", "display_name"):
             tokens: set[str] = set()
             for part in claim["value"]:
@@ -658,29 +794,60 @@ class MetaStore:
             rows = self._db.execute(
                 "SELECT batch_id, origin_node FROM batches "
                 "WHERE origin = 'cache'").fetchall()
-            doomed = [batch_id for batch_id, origin_node in rows
-                      if node_id_for_key(origin_node) in node_ids]
-            if not doomed:
+            doomed_pairs = [(batch_id, origin_node)
+                            for batch_id, origin_node in rows
+                            if node_id_for_key(origin_node) in node_ids]
+            if not doomed_pairs:
                 return 0
             cur = self._db.cursor()
-            for batch_id in doomed:
+            for batch_id, origin_node in doomed_pairs:
+                # The batch's §7 verdicts die with it: a verdict is
+                # evidence ABOUT a claim this node holds, and a
+                # purged claim must not leave a verdict behind that
+                # a later identical claim could inherit (§6 keys
+                # provenance by claim identity — the identity is
+                # gone from this node's cache, so the verdict goes).
+                cur.execute(
+                    "DELETE FROM claim_verdicts WHERE origin_node = ? "
+                    "AND (subject, field, value_key) IN "
+                    "(SELECT subject, field, value_json FROM claims "
+                    "WHERE batch_id = ?)",
+                    (origin_node, batch_id))
                 self._delete_claims(cur, "batch_id = ?", (batch_id,))
                 cur.execute(
                     "DELETE FROM answer_cache WHERE batch_id = ?",
                     (batch_id,))
                 cur.execute(
+                    "DELETE FROM batch_admission WHERE batch_id = ?",
+                    (batch_id,))
+                cur.execute(
                     "DELETE FROM batches WHERE batch_id = ?", (batch_id,))
             self._db.commit()
-            return len(doomed)
+            return len(doomed_pairs)
 
     def put_cached_batch(self, envelope: dict[str, Any],
-                         received_at: float | None = None) -> str:
+                         received_at: float | None = None,
+                         *, standing: bool = False,
+                         attestation_issuer: str | None = None,
+                         attestation_bound_at: int | None = None,
+                         ) -> str:
         """Store one received batch, frozen. Verifies the origin
         signature and every claim first — an invalid batch is refused
         (ClaimError), never repaired. Idempotent per batch digest.
         The envelope shape is validated BEFORE any indexing into
         it: a malformed envelope is a ClaimError, never a bare
         KeyError or TypeError.
+
+        The §9 admission outcome rides along (meta/admission.py
+        computes it; this method only records it): `standing` says
+        the origin met attested-age standing at the door, and the
+        batch_admission row is written in the same commit as the
+        batch itself, so support counting never sees a cached batch
+        without its admission record. A direct caller that passes
+        nothing records standing=False — zero support is the safe
+        default for a batch nobody ran admission on. A repeat call
+        for an already-stored digest still reconciles the admission
+        row — upward only (R1-SF-1).
 
         A batch whose ORIGIN key is named on a held revocation list
         is refused here too (§9: the revocation check runs at
@@ -720,6 +887,23 @@ class MetaStore:
             cur = self._db.cursor()
             if cur.execute("SELECT 1 FROM batches WHERE batch_id = ?",
                            (batch_id,)).fetchone():
+                # Re-admission of a known batch (R1-SF-1): the
+                # claims are already stored, but the §9 verdict is
+                # not frozen at first sight — a batch admitted
+                # before this node could verify its attestation
+                # (no issuer key configured yet, no trusted issuer
+                # known) EARNS its standing when it arrives again
+                # and the door verifies it. Upgrade only, ever: a
+                # later unverifiable arrival cannot strip standing
+                # the door once verified.
+                if standing:
+                    cur.execute(
+                        "UPDATE batch_admission SET standing = 1,"
+                        " issuer = ?, bound_at = ?"
+                        " WHERE batch_id = ? AND standing = 0",
+                        (attestation_issuer, attestation_bound_at,
+                         batch_id))
+                    self._db.commit()
                 return batch_id
             cur.execute(
                 "INSERT INTO batches(batch_id, origin, origin_node,"
@@ -733,6 +917,12 @@ class MetaStore:
                 "INSERT OR IGNORE INTO answer_cache(batch_id, origin_node,"
                 " received_at) VALUES (?, ?, ?)",
                 (batch_id, header_node, received))
+            cur.execute(
+                "INSERT OR IGNORE INTO batch_admission(batch_id,"
+                " origin_node, standing, issuer, bound_at, admitted_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (batch_id, header_node, 1 if standing else 0,
+                 attestation_issuer, attestation_bound_at, received))
             self._db.commit()
         return batch_id
 
@@ -766,10 +956,11 @@ class MetaStore:
             sql += (
                 " AND NOT EXISTS (SELECT 1 FROM claims x "
                 "WHERE x.batch_id = b.batch_id "
-                f"AND x.field NOT IN ({marks_link}) "
+                "AND (x.source = 'network' "
+                f"OR (x.field NOT IN ({marks_link}) "
                 f"AND (x.source NOT IN ({marks_src}) "
                 f"OR (x.field IN ({marks_field}) "
-                "AND x.source <> 'musicbrainz')))"
+                "AND x.source <> 'musicbrainz')))))"
             )
             params += list(_LINK_FIELDS)
             params += list(RESERVABLE_SOURCES)
@@ -815,17 +1006,39 @@ class MetaStore:
 
     # -- lookups the responder runs ------------------------------------------
 
-    def resolve_provider_ref(self, ref: str) -> list[str]:
+    def resolve_provider_ref(self, ref: str,
+                             kind: str | None = None) -> list[str]:
         """Subjects a "provider:external_id" ref resolves to, direct
-        id claims first, then link relations; deterministic order."""
+        id claims first, then link relations; deterministic order.
+
+        With `kind`, EVERY row matches on the SUBJECT's kind —
+        the entity resolution returns — whatever its via (gate
+        r2): a "deezer:399" that is an ARTIST's id must not
+        resolve inside a track-scoped lookup just because the
+        numbers collide (Deezer numbers its kinds separately),
+        and an album whose album_of points at artist 399 must not
+        answer a TRACK ask for deezer:399 either — the old
+        link_to exemption manufactured an album record under the
+        asked kind, and nothing downstream checked the matched
+        link against it. Traversal stays legal where it is
+        honest: the subject of an album_of row IS an album, so an
+        album ask still finds the album through the link's to-end
+        (the link's `to_kind` stays recorded on the row as a fact
+        about the far end; it just no longer exempts the row).
+        Rows written before subject kinds were recorded (NULL)
+        match any kind: the read stays backwards-compatible and
+        the kinds fill in as claims are rewritten."""
         with self._lock:
             rows = self._db.execute(
-                "SELECT subject, via FROM provider_index WHERE ref = ?",
-                (ref,)).fetchall()
+                "SELECT subject, via, kind, subject_kind "
+                "FROM provider_index WHERE ref = ?", (ref,)).fetchall()
+        if kind is not None:
+            rows = [row for row in rows
+                    if row[3] is None or row[3] == kind]
         rank = {"id": 0, "link_from": 1, "link_to": 2}
         out: list[str] = []
-        for subject, _via in sorted(rows, key=lambda r: (rank.get(r[1], 3),
-                                                         r[0])):
+        for subject, _via, _kind, _skind in sorted(
+                rows, key=lambda r: (rank.get(r[1], 3), r[0])):
             if subject not in out:
                 out.append(subject)
         return out
@@ -885,6 +1098,368 @@ class MetaStore:
                     return out
                 offset += page_size
 
+    # -- querier reads: cached claims with provenance (§6/§8/§9) -------
+
+    def cached_claims(self, subjects: list[str]) -> list[dict[str, Any]]:
+        """Cached claims for `subjects`, each row carrying its
+        provenance: the asserting origin key, its batch id (evidence
+        only — §6), the batch's origin age basis (the signed
+        asserted_at, capped at receipt when the batch landed), and
+        the §9 standing recorded at admission. Batches from origins
+        named on a held revocation list are filtered on the way out
+        (§9) — the belt to purge_revoked's braces, covering a list
+        that landed without a purge pass."""
+        if not subjects:
+            return []
+        marks = ",".join("?" for _ in subjects)
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT c.batch_id, b.origin_node, b.asserted_at,"
+                " a.standing, c.subject, c.kind, c.field, c.value_json,"
+                " c.source FROM claims c"
+                " JOIN batches b ON b.batch_id = c.batch_id"
+                " LEFT JOIN batch_admission a"
+                " ON a.batch_id = c.batch_id"
+                f" WHERE c.origin = 'cache' AND c.subject IN ({marks})"
+                " ORDER BY c.id", list(subjects)).fetchall()
+        out: list[dict[str, Any]] = []
+        for (batch_id, origin_node, asserted_at, standing, subject,
+             kind, field, value_json, source) in rows:
+            if self._origin_revoked(origin_node):
+                continue
+            out.append({
+                "batch_id": batch_id, "origin_node": origin_node,
+                "asserted_at": float(asserted_at),
+                "standing": bool(standing),
+                "subject": subject, "kind": kind, "field": field,
+                "value": json.loads(value_json), "source": source,
+            })
+        return out
+
+    def cached_slot_claims(self, track_subjects: list[str],
+                           ) -> list[dict[str, Any]]:
+        """Cached album_track claims placing any of these tracks —
+        the cache twin of album_track_claims_for_tracks (whose
+        subject is the album, so a subject lookup cannot find
+        them), with the same provenance shape as cached_claims."""
+        if not track_subjects:
+            return []
+        marks = ",".join("?" for _ in track_subjects)
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT c.batch_id, b.origin_node, b.asserted_at,"
+                " a.standing, c.subject, c.kind, c.field, c.value_json,"
+                " c.source FROM claims c"
+                " JOIN batches b ON b.batch_id = c.batch_id"
+                " LEFT JOIN batch_admission a"
+                " ON a.batch_id = c.batch_id"
+                " WHERE c.origin = 'cache' AND c.field = 'album_track'"
+                f" AND json_extract(c.value_json, '$.track')"
+                f" IN ({marks}) ORDER BY c.id",
+                list(track_subjects)).fetchall()
+        out: list[dict[str, Any]] = []
+        for (batch_id, origin_node, asserted_at, standing, subject,
+             kind, field, value_json, source) in rows:
+            if self._origin_revoked(origin_node):
+                continue
+            out.append({
+                "batch_id": batch_id, "origin_node": origin_node,
+                "asserted_at": float(asserted_at),
+                "standing": bool(standing),
+                "subject": subject, "kind": kind, "field": field,
+                "value": json.loads(value_json), "source": source,
+            })
+        return out
+
+    def admission_for(self, batch_ids: list[str]) -> dict[str, dict]:
+        """The §9 admission records for these batches, by batch id."""
+        if not batch_ids:
+            return {}
+        marks = ",".join("?" for _ in batch_ids)
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT batch_id, origin_node, standing, issuer,"
+                f" bound_at, admitted_at FROM batch_admission"
+                f" WHERE batch_id IN ({marks})", list(batch_ids)).fetchall()
+        return {
+            batch_id: {"origin_node": origin_node,
+                       "standing": bool(standing), "issuer": issuer,
+                       "bound_at": bound_at, "admitted_at": admitted_at}
+            for batch_id, origin_node, standing, issuer, bound_at,
+            admitted_at in rows
+        }
+
+    def prune_answer_cache(self, max_batches: int) -> int:
+        """Evict cached batches down to `max_batches` (§13 step 6:
+        eviction by reputation). The lowest-reputation origins'
+        batches go first, oldest origin age first within an origin;
+        a batch's admission row dies with it. Own batches are never
+        touched. Returns the batches dropped.
+
+        Verdicts are keyed by CLAIM IDENTITY, not by batch (SF-9):
+        a verdict dies in a prune only when its identity is gone
+        from EVERY retained batch — the same origin's re-minted or
+        re-served batch may still hold the very claim, and evicting
+        one copy must not strip the strong tier (and its expiry
+        exemption, and the sanity protection) from the copy that
+        stays. (purge_revoked is the different discipline: there
+        the identity itself is banned, so its verdicts go with it.)
+        """
+        with self._lock:
+            total = int(self._db.execute(
+                "SELECT COUNT(*) FROM batches WHERE origin = 'cache'"
+            ).fetchone()[0])
+            if total <= max_batches:
+                return 0
+            rows = self._db.execute(
+                "SELECT b.batch_id, b.origin_node, b.asserted_at,"
+                " COALESCE(r.checks_passed, 0)"
+                " - COALESCE(r.checks_failed, 0) AS score"
+                " FROM batches b LEFT JOIN reputation r"
+                " ON r.origin_node = b.origin_node"
+                " WHERE b.origin = 'cache'"
+                " ORDER BY score ASC, b.asserted_at ASC, b.batch_id ASC"
+            ).fetchall()
+            doomed = rows[:total - max_batches]
+            cur = self._db.cursor()
+            candidates: set[tuple] = set()
+            for batch_id, origin_node, _asserted, _score in doomed:
+                for subject, field, value_json in cur.execute(
+                        "SELECT subject, field, value_json FROM claims "
+                        "WHERE batch_id = ?", (batch_id,)):
+                    candidates.add(
+                        (origin_node, subject, field, value_json))
+            for batch_id, _origin_node, _asserted, _score in doomed:
+                self._delete_claims(cur, "batch_id = ?", (batch_id,))
+                cur.execute(
+                    "DELETE FROM answer_cache WHERE batch_id = ?",
+                    (batch_id,))
+                cur.execute(
+                    "DELETE FROM batch_admission WHERE batch_id = ?",
+                    (batch_id,))
+                cur.execute(
+                    "DELETE FROM batches WHERE batch_id = ?", (batch_id,))
+            for origin_node, subject, field, value_json in candidates:
+                held = cur.execute(
+                    "SELECT 1 FROM claims c JOIN batches b"
+                    " ON b.batch_id = c.batch_id"
+                    " WHERE b.origin_node = ? AND c.subject = ?"
+                    " AND c.field = ? AND c.value_json = ? LIMIT 1",
+                    (origin_node, subject, field, value_json)).fetchone()
+                if held is None:
+                    cur.execute(
+                        "DELETE FROM claim_verdicts WHERE origin_node = ?"
+                        " AND subject = ? AND field = ?"
+                        " AND value_key = ?",
+                        (origin_node, subject, field, value_json))
+            self._db.commit()
+            return len(doomed)
+
+    # -- legacy SoulID aliases (§6) --------------------------------------
+
+    def learn_legacy_alias(self, legacy: str, subject: str,
+                           learned_at: float | None = None) -> None:
+        """Record one VERIFIED legacy -> v2 mapping (the builder
+        verifies by recompute before calling; this method only
+        stores). First writer wins: a conflicting re-learn for the
+        same legacy id is ignored, never overwritten — a verified
+        mapping is a fact about the id, and two different verified
+        mappings for one legacy id cannot both be true."""
+        with self._lock:
+            self._db.execute(
+                "INSERT OR IGNORE INTO legacy_aliases(legacy, subject,"
+                " learned_at) VALUES (?, ?, ?)",
+                (legacy, subject,
+                 time.time() if learned_at is None else learned_at))
+            self._db.commit()
+
+    def legacy_subject(self, legacy: str) -> str | None:
+        """The v2 subject a legacy id aliases to, when this node
+        holds a verified mapping for it."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT subject FROM legacy_aliases WHERE legacy = ?",
+                (legacy,)).fetchone()
+        return row[0] if row else None
+
+    def legacy_alias_count(self) -> int:
+        with self._lock:
+            return int(self._db.execute(
+                "SELECT COUNT(*) FROM legacy_aliases").fetchone()[0])
+
+    # -- §7 verdicts, §9 reputation, §8 sanity triggers, fetch cache -----
+
+    def set_verdict(self, origin_node: str, subject: str, field: str,
+                    value: Any, tier: str, verified_at: float,
+                    detail: str | None = None) -> None:
+        """Record (or refresh) one claim identity's verdict tier.
+        Tiers are 'plausible' and 'strong-verified'; 'unverified' is
+        the ABSENCE of a row, never a row — a failed re-check
+        deletes the verdict (clear_verdict), it does not stamp a
+        negative one.
+
+        Verdicts are MONOTONIC (R2-SF-1): a lesser grade never
+        overwrites a stronger stored verdict — a re-check that
+        merely finds weaker evidence than last time (one provider
+        unreachable today, a thinner response) changes nothing.
+        Only a CONTRADICTION clears or downgrades, and that runs
+        through clear_verdict (the _fail path), never through here.
+        A same-or-better grade lands, refreshing verified_at to
+        the newer evidence time (never backwards)."""
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO claim_verdicts(origin_node, subject,"
+                " field, value_key, tier, verified_at, detail)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(origin_node, subject, field, value_key)"
+                " DO UPDATE SET tier = excluded.tier,"
+                " verified_at = MAX(claim_verdicts.verified_at,"
+                " excluded.verified_at),"
+                " detail = excluded.detail"
+                " WHERE (CASE excluded.tier"
+                "   WHEN 'strong-verified' THEN 2"
+                "   WHEN 'plausible' THEN 1 ELSE 0 END)"
+                " >= (CASE claim_verdicts.tier"
+                "   WHEN 'strong-verified' THEN 2"
+                "   WHEN 'plausible' THEN 1 ELSE 0 END)",
+                (origin_node, subject, field, value_key(value), tier,
+                 verified_at, detail))
+            self._db.commit()
+
+    def clear_verdict(self, origin_node: str, subject: str, field: str,
+                      value: Any) -> None:
+        with self._lock:
+            self._db.execute(
+                "DELETE FROM claim_verdicts WHERE origin_node = ?"
+                " AND subject = ? AND field = ? AND value_key = ?",
+                (origin_node, subject, field, value_key(value)))
+            self._db.commit()
+
+    def verdicts_for_subjects(self, subjects: list[str],
+                              ) -> dict[tuple, dict[str, Any]]:
+        """All verdicts for these subjects, keyed by claim identity
+        (origin_node, subject, field, value_key)."""
+        if not subjects:
+            return {}
+        marks = ",".join("?" for _ in subjects)
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT origin_node, subject, field, value_key, tier,"
+                f" verified_at, detail FROM claim_verdicts"
+                f" WHERE subject IN ({marks})", list(subjects)).fetchall()
+        return {
+            (origin_node, subject, field, vk): {
+                "tier": tier, "verified_at": verified_at,
+                "detail": detail}
+            for origin_node, subject, field, vk, tier, verified_at,
+            detail in rows
+        }
+
+    def record_check(self, origin_node: str, passed: bool,
+                     now: float | None = None) -> None:
+        """One §7 check outcome for one origin (§9 reputation)."""
+        column = "checks_passed" if passed else "checks_failed"
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO reputation(origin_node, checks_passed,"
+                " checks_failed, updated_at) VALUES (?, ?, ?, ?)"
+                " ON CONFLICT(origin_node) DO UPDATE SET"
+                f" {column} = {column} + 1,"
+                " updated_at = excluded.updated_at",
+                (origin_node, 1 if passed else 0,
+                 0 if passed else 1,
+                 time.time() if now is None else now))
+            self._db.commit()
+
+    def reputation_for(self, origin_node: str) -> dict[str, int]:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT checks_passed, checks_failed FROM reputation"
+                " WHERE origin_node = ?", (origin_node,)).fetchone()
+        if row is None:
+            return {"checks_passed": 0, "checks_failed": 0}
+        return {"checks_passed": int(row[0]), "checks_failed": int(row[1])}
+
+    def consume_sanity_trigger(self, origin_node: str, subject: str,
+                               field: str, now: float) -> bool:
+        """§8's bound as a ROLLING 24 h window (R2-SF-8): True
+        when this (origin, subject, field) may fire at `now` —
+        no trigger for the same triple in the last 24 hours.
+        A calendar day was the wrong shape twice over: it allowed
+        two triggers minutes apart across midnight, and blocked
+        one 23 hours after the last on the same long day. Rows
+        written before fired_at existed read as long-ago."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT MAX(fired_at) FROM sanity_triggers"
+                " WHERE origin_node = ? AND subject = ?"
+                " AND field = ?",
+                (origin_node, subject, field)).fetchone()
+            last = row[0] if row else None
+            if last is not None and now - float(last) < 24 * 3600:
+                return False
+            day = datetime.fromtimestamp(now, UTC).strftime("%Y-%m-%d")
+            self._db.execute(
+                "INSERT OR REPLACE INTO sanity_triggers(origin_node,"
+                " subject, field, day, fired_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (origin_node, subject, field, day, now))
+            self._db.commit()
+            return True
+
+    def fetch_cached(self, provider: str, cache_key: str,
+                     ) -> dict[str, Any] | None:
+        """One cached provider response: {fetched_at, not_found,
+        payload}. Freshness is the caller's call (§7.1's 90 days)."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT fetched_at, not_found, payload FROM fetch_cache"
+                " WHERE provider = ? AND cache_key = ?",
+                (provider, cache_key)).fetchone()
+        if row is None:
+            return None
+        return {
+            "fetched_at": float(row[0]), "not_found": bool(row[1]),
+            "payload": json.loads(row[2]) if row[2] is not None else None,
+        }
+
+    def fetch_store(self, provider: str, cache_key: str,
+                    fetched_at: float, not_found: bool,
+                    payload: Any) -> None:
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO fetch_cache(provider, cache_key,"
+                " fetched_at, not_found, payload) VALUES (?, ?, ?, ?, ?)"
+                " ON CONFLICT(provider, cache_key) DO UPDATE SET"
+                " fetched_at = excluded.fetched_at,"
+                " not_found = excluded.not_found,"
+                " payload = excluded.payload",
+                (provider, cache_key, fetched_at,
+                 1 if not_found else 0,
+                 json.dumps(payload, ensure_ascii=False)
+                 if payload is not None else None))
+            self._db.commit()
+
+    def verification_backlog(self, now: float,
+                             stale_after_s: float) -> dict[str, int]:
+        """Status counts: cached claims carrying no verdict at all,
+        and verdicts old enough that reliance needs a re-check (§6:
+        a check older than 90 days is re-verified before reliance)."""
+        with self._lock:
+            unverified = self._db.execute(
+                "SELECT COUNT(*) FROM claims c WHERE c.origin = 'cache'"
+                " AND NOT EXISTS (SELECT 1 FROM claim_verdicts v"
+                " WHERE v.origin_node ="
+                "   (SELECT origin_node FROM batches"
+                "    WHERE batch_id = c.batch_id)"
+                " AND v.subject = c.subject AND v.field = c.field"
+                " AND v.value_key = c.value_json)").fetchone()[0]
+            stale = self._db.execute(
+                "SELECT COUNT(*) FROM claim_verdicts"
+                " WHERE verified_at < ?", (now - stale_after_s,)).fetchone()[0]
+        return {"unverified_claims": int(unverified),
+                "stale_verdicts": int(stale)}
+
     # -- status ---------------------------------------------------------------
 
     def counts(self) -> dict[str, int]:
@@ -901,9 +1476,12 @@ class MetaStore:
             cache_claims = self._db.execute(
                 "SELECT COUNT(*) FROM claims WHERE origin = 'cache'"
             ).fetchone()[0]
+            aliases = self._db.execute(
+                "SELECT COUNT(*) FROM legacy_aliases").fetchone()[0]
         return {
             "own_claims": int(own_claims),
             "own_subjects": int(own_subjects),
             "cached_batches": int(cache_batches),
             "cached_claims": int(cache_claims),
+            "legacy_aliases": int(aliases),
         }

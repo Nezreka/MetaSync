@@ -153,6 +153,25 @@ def validate_attestation_shape(obj: object) -> dict[str, Any] | None:
     }
 
 
+def _signature_valid(parsed: dict[str, Any],
+                     issuer_public_key: Ed25519PublicKey) -> bool:
+    signature = _decode_b64url(parsed["sig"], 64)
+    if signature is None:
+        return False
+    try:
+        issuer_public_key.verify(
+            signature,
+            attestation_signing_text(
+                parsed["issuer"], parsed["node_key"], parsed["bound_at"],
+                parsed["issued_at"], parsed["expires"]),
+        )
+    except InvalidSignature:
+        return False
+    except Exception:  # noqa: BLE001 - any crypto failure drops it
+        return False
+    return True
+
+
 def verify_attestation(
     obj: object,
     issuer_public_key: Ed25519PublicKey | None,
@@ -170,18 +189,50 @@ def verify_attestation(
     own_raw = _decode_b64url(own_node_key_b64, 32)
     if own_raw is None or _decode_b64url(parsed["node_key"], 32) != own_raw:
         return None
-    signature = _decode_b64url(parsed["sig"], 64)
-    if signature is None:
+    if not _signature_valid(parsed, issuer_public_key):
         return None
-    try:
-        issuer_public_key.verify(
-            signature,
-            attestation_signing_text(
-                parsed["issuer"], parsed["node_key"], parsed["bound_at"],
-                parsed["issued_at"], parsed["expires"]),
-        )
-    except InvalidSignature:
+    return parsed
+
+
+def attestation_for_batch(obj: object,
+                          header_node: str) -> dict[str, Any] | None:
+    """Admission's (§9) first view of a batch header's embedded
+    attestation: shape-valid AND naming the batch's own signer
+    (check (b), compared on the raw key bytes) — but NOT signature-
+    verified. This helper establishes only that the embedded
+    statement is well-formed and about this signer; standing is
+    decided by verify_batch_attestation (MF-1: an asker cannot
+    hold every pool's key, and a pool whose key it does not hold
+    earns its batches zero support — shape and window alone are
+    fabricable for free, so they vouch for nothing). Returns the
+    normalized attestation, or None when the header carries none
+    or the embedded one fails shape/naming — the caller treats
+    both as "no attestation" (zero support)."""
+    parsed = validate_attestation_shape(obj)
+    if parsed is None:
         return None
-    except Exception:  # noqa: BLE001 - any crypto failure drops it
+    node_raw = _decode_b64url(header_node, 32)
+    if node_raw is None or _decode_b64url(parsed["node_key"], 32) != node_raw:
+        return None
+    return parsed
+
+
+def verify_batch_attestation(
+    obj: object,
+    issuer_public_key: Ed25519PublicKey | None,
+    header_node: str,
+) -> dict[str, Any] | None:
+    """Full verification of a batch-carried attestation: shape +
+    naming (attestation_for_batch) + the pool signature over the
+    canonical bytes. §9 admission grants standing ONLY through
+    this check, run against the key held for the attestation's
+    named issuer (in v1 the one configured issuer — this node's
+    own pool). An attestation that cannot be verified this way —
+    foreign issuer, no key, garbage signature — earns the batch
+    zero support, exactly like a missing attestation (MF-1)."""
+    parsed = attestation_for_batch(obj, header_node)
+    if parsed is None or issuer_public_key is None:
+        return None
+    if not _signature_valid(parsed, issuer_public_key):
         return None
     return parsed
