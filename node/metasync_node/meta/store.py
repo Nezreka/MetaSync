@@ -45,6 +45,7 @@ simply stops asserting).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -58,6 +59,10 @@ from . import claims as meta_claims
 from . import soulid as _soulid
 
 DB_FILENAME = "meta_claims.sqlite3"
+
+# kv key for the node's current binding attestation (§9): the value
+# every own batch minted from this store embeds in its header.
+_ATTESTATION_KV = "meta_attestation"
 
 # Claim sources a cached batch may carry if it is to be re-served
 # (§7.1 terms caution): MusicBrainz data is CC0 and file_tags values
@@ -114,7 +119,7 @@ CREATE TABLE IF NOT EXISTS batches (
     origin      TEXT NOT NULL,            -- 'own' | 'cache'
     origin_node TEXT NOT NULL,            -- asserting node's pubkey (b64url)
     subject     TEXT,                     -- own batches: their one subject
-    asserted_at REAL NOT NULL,            -- own: mint time; cache: receipt (§6)
+    asserted_at REAL NOT NULL,            -- the origin batch's signed asserted_at; cache rows cap it at receipt (§6)
     envelope    TEXT NOT NULL             -- canonical JSON of {batch, sig}
 );
 CREATE TABLE IF NOT EXISTS claims (
@@ -208,10 +213,33 @@ def provider_refs(claim: dict[str, Any]) -> list[tuple[str, str]]:
     return []
 
 
+def node_id_for_key(public_key_b64: str) -> str | None:
+    """The revocation lists' name for a key: SHA-256 hex of the raw
+    public key bytes (the same derivation the relay's tokens.py and
+    the node's identity use for node ids). None when the key string
+    does not decode — such a batch has already been refused by
+    verify_batch before any caller here sees it."""
+    try:
+        raw = meta_claims.b64url_decode(public_key_b64)
+    except Exception:  # noqa: BLE001 - undecodable is unnameable
+        return None
+    if len(raw) != 32:
+        return None
+    return hashlib.sha256(raw).hexdigest()
+
+
 class MetaStore:
     """Thread-safe (one connection, one lock) claims store."""
 
-    def __init__(self, state_dir: str | Path):
+    def __init__(self, state_dir: str | Path, *, revocations: Any = None):
+        # The §9/§10 revocation gate: the node's verified revocation
+        # lists (revocations.RevocationStore), wired by the service
+        # and shared with the relay/pool clients. Admission refuses a
+        # revoked origin's batches, every cache read filters them
+        # out, and purge_revoked drops them when a list lands. None
+        # (a store nobody wired) means no lists are held: nothing is
+        # revoked, which is the honest state of an unwired node.
+        self.revocations = revocations
         self.dir = Path(state_dir)
         self.dir.mkdir(parents=True, exist_ok=True)
         self.path = self.dir / DB_FILENAME
@@ -250,6 +278,63 @@ class MetaStore:
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (key, json.dumps(value, ensure_ascii=False)))
             self._db.commit()
+
+    # -- the node's current binding attestation (§9) ---------------------
+
+    def attestation(self) -> dict[str, Any] | None:
+        """The attestation own batches currently embed: the latest
+        one the pool handed the node (verified by the pool client
+        before it was noted here — attestation.py owns the shape,
+        and a stored value that no longer parses as one reads as
+        none). Kept in kv so the store, the builder, and the
+        responder all mint from the same current value.
+
+        Freshness is checked HERE, at the one read every mint path
+        shares (SF-3): a stored attestation whose validity window —
+        issued_at..expires (§9; bound_at is the binding moment and
+        plays no part in the window) — does not cover now reads as
+        NO attestation. Embedding an expired-window attestation
+        would mint batches that count zero support under §9 with no
+        way to tell from the node; treating it as absent is the
+        failure mode the design already handles, and a renewal
+        re-notes a live one through set_attestation."""
+        raw = self.kv_get(_ATTESTATION_KV)
+        if not isinstance(raw, dict):
+            return None
+        from ..attestation import validate_attestation_shape
+
+        parsed = validate_attestation_shape(raw)
+        if parsed is None:
+            return None
+        now = time.time()
+        if not (parsed["issued_at"] <= now < parsed["expires"]):
+            return None
+        return parsed
+
+    def set_attestation(self, attestation: dict[str, Any] | None) -> bool:
+        """Note the node's current attestation. Returns True when it
+        CHANGED (a renewal the stored batches have not caught up
+        with — the caller refreshes their embeddings). A malformed
+        value is refused (stored as nothing, no change reported):
+        minting must never embed unchecked parts."""
+        from ..attestation import validate_attestation_shape
+
+        normalized = validate_attestation_shape(attestation) \
+            if attestation is not None else None
+        if normalized == self.attestation():
+            return False
+        with self._lock:
+            if normalized is None:
+                self._db.execute(
+                    "DELETE FROM kv WHERE key = ?", (_ATTESTATION_KV,))
+            else:
+                self._db.execute(
+                    "INSERT INTO kv(key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (_ATTESTATION_KV,
+                     json.dumps(normalized, ensure_ascii=False)))
+            self._db.commit()
+        return True
 
     # -- claim insert/delete, with indexes kept in step -------------------
 
@@ -323,17 +408,19 @@ class MetaStore:
             [c for c in subject_claims if claim_reservable(c)],
             [c for c in subject_claims if not claim_reservable(c)],
         )
+        attestation = self.attestation()
         for part in partitions:
             if not part:
                 continue
-            batch = meta_claims.make_batch(pubkey_b64, part)
+            batch = meta_claims.make_batch(
+                pubkey_b64, part, attestation=attestation)
             envelope = meta_claims.sign_batch(private_key, batch)
             cur.execute(
                 "INSERT INTO batches(batch_id, origin, origin_node,"
                 " subject, asserted_at, envelope) "
                 "VALUES (?, 'own', ?, ?, ?, ?)",
                 (meta_claims.batch_digest(batch), pubkey_b64, subject,
-                 time.time(),
+                 batch["header"]["asserted_at"],
                  meta_claims.canonical_bytes(envelope).decode("utf-8")))
 
     # -- own claims ---------------------------------------------------------
@@ -412,6 +499,40 @@ class MetaStore:
 
         return sorted(envelopes, key=_rank)
 
+    def refresh_attestation_embeddings(self, pubkey_b64: str,
+                                       private_key: Any) -> int:
+        """Re-mint every own subject whose stored batches do not all
+        embed the CURRENT attestation (§6 re-minting: batches are
+        re-minted whenever the attestation renews, so what the node
+        serves carries a live attestation rather than a fossil). An
+        expired-window attestation embedded in a stored batch is
+        replaced by the current one, never kept alongside it. One
+        commit for the whole refresh; returns the number of subjects
+        re-minted. Subjects whose claims are gone have no batches
+        and are not visited — their next claim replacement re-mints
+        them with the then-current attestation anyway."""
+        current = self.attestation()
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT subject, envelope FROM batches "
+                "WHERE origin = 'own'").fetchall()
+            stale: set[str] = set()
+            for subject, raw in rows:
+                try:
+                    embedded = json.loads(raw)["batch"]["header"].get(
+                        "attestation")
+                except (ValueError, KeyError, AttributeError):
+                    embedded = None
+                if embedded != current:
+                    stale.add(subject)
+            if not stale:
+                return 0
+            cur = self._db.cursor()
+            for subject in sorted(stale):
+                self._remint_subject(cur, subject, pubkey_b64, private_key)
+            self._db.commit()
+            return len(stale)
+
     # -- full-walk sweep ----------------------------------------------------
 
     def walk_note_owner(self, walk_id: str, owner: str) -> None:
@@ -481,6 +602,77 @@ class MetaStore:
 
     # -- answer cache (frozen batches; written by step 5) -------------------
 
+    def _origin_revoked(self, header_node: str) -> bool:
+        """The §9 revocation check for one batch origin: the origin
+        key's node id against EVERY held list (the union). The
+        batch's embedded attestation names an issuer, but that
+        value is never verified at receipt — verify_batch checks
+        the origin's signature over the batch, not the pool's
+        signature over the attestation — so letting it select the
+        governing list would let a revoked origin escape by naming
+        a made-up issuer nobody holds a list for (gate re-pass
+        N1). In v1 the node trusts one configured issuer, so the
+        union over held lists is that issuer's verdict, and it
+        agrees with purge_revoked, which likewise drops by key
+        regardless of the issuer a batch claims. Issuer-scoped
+        checking returns only when admission verifies the
+        attestation against the configured issuer key and matches
+        its issuer id. An origin that cannot be named cannot be
+        checked — verify_batch has already proven the key decodes
+        before this runs."""
+        if self.revocations is None:
+            return False
+        node_id = node_id_for_key(header_node)
+        if node_id is None:
+            return False
+        return bool(self.revocations.is_revoked(node_id))
+
+    def _envelope_revoked(self, envelope: Any) -> bool:
+        """_origin_revoked for a stored envelope being read back: a
+        row too malformed to name its origin reads as unrevoked
+        here — the read paths already skip such rows as corrupt."""
+        if not isinstance(envelope, dict):
+            return False
+        batch = envelope.get("batch")
+        if not isinstance(batch, dict):
+            return False
+        header = batch.get("header")
+        if not isinstance(header, dict):
+            return False
+        node = header.get("node")
+        if not isinstance(node, str) or not node:
+            return False
+        return self._origin_revoked(node)
+
+    def purge_revoked(self, node_ids: set[str]) -> int:
+        """Drop every CACHED batch whose origin key is named in
+        `node_ids` (the revocation lists' hex node ids): §10 — when
+        a list lands, the node drops the named keys' batches from
+        its cache, so a revoked key's claims stop being re-served
+        and stop feeding merges, not merely stop being admitted.
+        Own batches are never touched (they are this node's own
+        library, not the cache). Returns the batches dropped."""
+        if not node_ids:
+            return 0
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT batch_id, origin_node FROM batches "
+                "WHERE origin = 'cache'").fetchall()
+            doomed = [batch_id for batch_id, origin_node in rows
+                      if node_id_for_key(origin_node) in node_ids]
+            if not doomed:
+                return 0
+            cur = self._db.cursor()
+            for batch_id in doomed:
+                self._delete_claims(cur, "batch_id = ?", (batch_id,))
+                cur.execute(
+                    "DELETE FROM answer_cache WHERE batch_id = ?",
+                    (batch_id,))
+                cur.execute(
+                    "DELETE FROM batches WHERE batch_id = ?", (batch_id,))
+            self._db.commit()
+            return len(doomed)
+
     def put_cached_batch(self, envelope: dict[str, Any],
                          received_at: float | None = None) -> str:
         """Store one received batch, frozen. Verifies the origin
@@ -488,7 +680,14 @@ class MetaStore:
         (ClaimError), never repaired. Idempotent per batch digest.
         The envelope shape is validated BEFORE any indexing into
         it: a malformed envelope is a ClaimError, never a bare
-        KeyError or TypeError."""
+        KeyError or TypeError.
+
+        A batch whose ORIGIN key is named on a held revocation list
+        is refused here too (§9: the revocation check runs at
+        admission, on every batch, direct or re-served) — a
+        forwarder re-serving an old copy of a revoked key's batch
+        cannot resurrect it, however valid its attestation window
+        still looks."""
         if not isinstance(envelope, dict):
             raise meta_claims.ClaimError("envelope must be an object")
         batch_obj = envelope.get("batch")
@@ -506,8 +705,17 @@ class MetaStore:
                 or not envelope["sig"]:
             raise meta_claims.ClaimError("envelope.sig missing")
         batch = meta_claims.verify_batch(header_node, envelope)
+        if self._origin_revoked(header_node):
+            raise meta_claims.ClaimError(
+                "origin key is named on a held revocation list: "
+                "batch refused at admission (§9)")
         batch_id = meta_claims.batch_digest(batch)
         received = time.time() if received_at is None else received_at
+        # §6: a cached batch ages from its ORIGIN's signed asserted_at,
+        # capped at the moment of receipt — a future-dated batch cannot
+        # extend its own life, and a forwarder re-serving an old batch
+        # can never refresh its age by handing it over again.
+        asserted = min(float(batch["header"]["asserted_at"]), received)
         with self._lock:
             cur = self._db.cursor()
             if cur.execute("SELECT 1 FROM batches WHERE batch_id = ?",
@@ -517,7 +725,7 @@ class MetaStore:
                 "INSERT INTO batches(batch_id, origin, origin_node,"
                 " subject, asserted_at, envelope) "
                 "VALUES (?, 'cache', ?, NULL, ?, ?)",
-                (batch_id, header_node, received,
+                (batch_id, header_node, asserted,
                  meta_claims.canonical_bytes(envelope).decode("utf-8")))
             for claim in batch["claims"]:
                 self._insert_claim(cur, "cache", None, batch_id, claim)
@@ -539,7 +747,9 @@ class MetaStore:
         file_tags/musicbrainz OR it asserts a §7.1-caution field —
         duration_ms, isrc, display_name — from a non-MusicBrainz
         source). A row whose stored envelope does not even parse is
-        skipped, never served."""
+        skipped, never served. A batch whose origin key is named on
+        a held revocation list is likewise skipped, on every read,
+        reservable or not (§9/§10)."""
         if not subjects:
             return []
         marks = ",".join("?" for _ in subjects)
@@ -570,9 +780,16 @@ class MetaStore:
         out: list[dict[str, Any]] = []
         for _id, envelope in rows:
             try:
-                out.append(json.loads(envelope))
+                parsed = json.loads(envelope)
             except (TypeError, ValueError):
                 continue  # corrupted row: skipped, never served
+            if self._envelope_revoked(parsed):
+                # §9/§10: a revoked origin's batches are never
+                # re-served — this filter is the belt to admission's
+                # braces, covering batches cached BEFORE their key
+                # was revoked and not yet purged.
+                continue
+            out.append(parsed)
         return out
 
     def album_track_claims_for_tracks(

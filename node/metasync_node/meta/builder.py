@@ -370,7 +370,9 @@ class LibraryBuilder:
     """
 
     def __init__(self, soulsync: Any, identity: Any, store: MetaStore,
-                 enabled_on: Callable[[], bool] | None = None):
+                 enabled_on: Callable[[], bool] | None = None,
+                 attestation_provider: Callable[[], dict | None]
+                 | None = None):
         self.soulsync = soulsync
         self.identity = identity
         self.store = store
@@ -379,6 +381,12 @@ class LibraryBuilder:
         # build at the next page, not at the next scheduled run.
         # None (manual runs, tests) means no live gate.
         self.enabled_on = enabled_on
+        # Live re-read of the node's current binding attestation
+        # (§9), in the same pattern: the pool hands it to the node
+        # at the token exchange, and a build that starts after a
+        # renewal must mint with the new one — and re-mint the
+        # subjects the renewal stranded (see run()'s prologue).
+        self.attestation_provider = attestation_provider
         self.totals = {"claims_built": 0, "items_skipped": 0,
                        "rows": 0, "items_seen": 0, "claims_swept": 0}
 
@@ -497,6 +505,27 @@ class LibraryBuilder:
     # -- the walk -----------------------------------------------------------
 
     def run(self, now_iso: str, force_full: bool = False) -> dict[str, Any]:
+        # Prologue: an attestation that arrived since the last build
+        # is noted in the store, and any subject whose stored batches
+        # still embed an older one is re-minted (§6: re-minting is
+        # what keeps a live library's answers standing-bearing).
+        # The walk's own remints then embed the current value as
+        # they go, because the store reads it at mint time.
+        if self.attestation_provider is not None:
+            # Failure-isolated (SF-2): a raising provider degrades to
+            # "no attestation this run" — it must never abort the
+            # walk itself, which is what an exception here would do
+            # (this prologue runs before the walk's own error
+            # handling converts failures into recorded status).
+            try:
+                attestation = self.attestation_provider()
+            except Exception:  # noqa: BLE001 - degrade, never break
+                attestation = None
+            if attestation is not None and \
+                    self.store.set_attestation(attestation):
+                self.store.refresh_attestation_embeddings(
+                    self.identity.public_key_b64url,
+                    self.identity.signing_private_key)
         state = self._state()
         if force_full:
             # A forced restart abandons whatever walk was mid-flight:

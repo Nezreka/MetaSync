@@ -865,10 +865,24 @@ publication gates. Each node decides, locally and visibly:
   binding age** of the asserting key, carried inside the batch
   itself.
   - **Issuance.** The pool signs a short-lived **binding
-    attestation** `{node_key, bound_at, expires}` for each bound
-    key — lifetime **7 days**, well under the 30-day standing
-    threshold, so the lifetime also bounds how far standing can
-    be forward-dated (§6's receipt cap does the rest). It is
+    attestation** `{issuer, node_key, bound_at, issued_at,
+    expires}` for each bound key. Two of its times do two
+    different jobs, and the shape keeps them apart on purpose:
+    the **lifetime is 7 days from issuance** — the validity
+    window is `issued_at`..`expires`, how long this one
+    attestation stays embeddable — while `bound_at` is the
+    moment the key was bound, fixed across renewals, and used
+    **only** by the standing rule below. (An earlier draft ran
+    the window from `bound_at`; that made standing unreachable,
+    since a 7-day window starting at the binding never contains
+    an assertion made 30 days after it.) Standing cannot be
+    forward-dated because neither of its inputs is the asserting
+    node's to choose: `bound_at` is the issuer's signed
+    statement, and `asserted_at` is capped by §6's receipt rule.
+    The `issuer` field names the signing pool — the same issuer
+    id the revocation lists carry (§10) — inside the signature,
+    so an asker holding several issuers' lists can pick the one
+    that governs this attestation. It is
     issued and renewed at the **token exchange** (§10):
     the exchange response carries the node's current attestation
     alongside its token, and a node fetches a fresh one before
@@ -888,7 +902,7 @@ publication gates. Each node decides, locally and visibly:
     attestation's pool signature verifies; its `node_key` equals
     the batch's `header.node`; the batch's `asserted_at`
     falls **inside the attestation's validity window**
-    (`bound_at`..`expires`) — that the batch was minted while
+    (`issued_at`..`expires`) — that the batch was minted while
     this attestation was live; and the batch's origin key —
     `header.node` — is **not named on the highest-sequence
     revocation list the asker holds for the attestation's
@@ -897,7 +911,17 @@ publication gates. Each node decides, locally and visibly:
     sweep run when a list arrives — so a forwarder re-serving
     an old copy of a revoked key's batch cannot resurrect it:
     the copy is refused whenever it shows up, however valid its
-    window still looks. The same check gates the depot at
+    window still looks. At admission the attestation itself is
+    not yet verified — verification is the first of the four
+    checks above, run where standing is judged — so the issuer
+    its header names cannot select the governing list there: a
+    revoked origin would name an issuer nobody holds a list for
+    and walk straight past the check. Admission and the
+    re-serve filter therefore use the union over every list the
+    node holds — in v1, with one configured issuer, that is the
+    issuer's verdict — and issuer-scoped admission returns only
+    once admission verifies the attestation against the
+    configured issuer key. The same check gates the depot at
     promotion time, enforced through §5's invalidation pushes
     and the reconnect reconcile: a depot field whose origin key
     is listed is dead for promotion, not merely dropped from
@@ -1023,18 +1047,23 @@ an aspiration.** It:
   lists from the node's **own** issuer, whose exchanges the node
   makes directly. A list from another trusted issuer (§11)
   reaches the node only via relays, and a relay can hold it back
-  indefinitely; admission (§9) therefore treats a batch whose
-  issuer the node holds no list for as unrevoked for now — v1
-  runs one official pool with one issuer, and a staleness bound
-  for foreign lists is a named precondition for federation
-  (§11), not a v1 mechanism.
+  indefinitely; admission (§9) therefore cannot let the issuer
+  a batch claims select its governing list — the claim is
+  unverified at receipt — and checks the union over held lists
+  instead, so a key named on no held list is unrevoked for now
+  — v1 runs one official pool with one issuer, and a staleness
+  bound for foreign lists is a named precondition for
+  federation (§11), not a v1 mechanism.
   The
   list carries a **monotonic sequence number** and `issued_at`;
   nodes keep the highest sequence they have seen from each
   issuer and reject
   anything older, so a relay — including one run by another
   party (§11) — can withhold a newer list but cannot roll one
-  back. Token expiry forces in-band re-authentication, which a
+  back. The high-water mark is **durable node state**, written
+  down across restarts: an in-memory-only mark would hand a
+  withholding relay the rollback the moment the node restarts
+  or its network is toggled off and on. Token expiry forces in-band re-authentication, which a
   revoked key fails — so a revocation reaches live sessions and,
   via §6's drops and §1's pushes, caches and depots;
 - needs **no database access**: the guest-list check happens at
@@ -1077,7 +1106,15 @@ At token expiry the connection **re-authenticates in band** — a
 fresh exchange token presented over the same connection — where
 the client supports it, so live sessions survive their tokens; a
 revoked key fails that re-authentication, so its session ends at
-its token's `exp` at the latest. Where in-band re-authentication
+its token's `exp` at the latest. The re-authentication's
+signature binds the relay's identity (like the hello's), so a
+re-auth captured at one relay cannot be replayed at another to
+keep a hijacked session alive, and the relay rate-limits
+re-authentication per connection: a healthy client re-auths
+about once per token lifetime, and a client spinning on a cached
+token (re-sending the token the relay already acknowledged)
+is refused and struck instead of costing the relay a signature
+verification per round trip. Where in-band re-authentication
 is not supported, the fallback is disconnect and reconnect, and
 the cost is stated plainly: queries in flight on a connection
 that closes **die with it**. Nothing is corrupted by that —
@@ -1093,10 +1130,20 @@ optimization, not a v1 need):
   so a captured hello cannot be replayed on a fresh connection, to
   a different relay, or under a different mode (the federation
   impersonation hole, §11). The relay's identity, for this
-  binding, is the **canonical origin it was dialed at** — the
-  `wss` scheme, host, and port the node connected to, lowercased,
-  no path — so both sides compute the identical string from the
-  connection itself, with no relay key to distribute. The relay
+  binding, is its **configured canonical origin**
+  (`RELAY_ORIGIN`) — the `wss` scheme, host, and port nodes dial
+  it at, lowercased, no path; the node computes the identical
+  string from the origin it dialed, so the two sides agree with
+  no relay key to distribute. A relay with **no configured
+  origin refuses v2 hellos**: the fallback of deriving the
+  identity from the request's `Host` / `X-Forwarded-Proto`
+  headers would compute it from values the connecting party
+  itself supplies, and a malicious relay could pass another
+  relay's challenge to a node, collect the hello signed for the
+  victim's identity as derived from its own headers, and replay
+  it at the victim to impersonate the node — the binding would
+  protect nothing. Failing closed costs a misconfigured relay
+  its v2 service (v1 is unaffected) and nothing else. The relay
   replies `welcome` with the current peer count (coarse: exact
   under 100, rounded above — the count is a presence hint, not a
   census) and the issuer-signed **revocation list** (§9), or
@@ -1131,7 +1178,14 @@ optimization, not a v1 need):
   asker's cache, enriching the next query even when they miss this
   one's display — and then the query is **closed** (the one
   definition, used by the admission rules below): answers for a
-  closed query are dropped, silently.
+  closed query are dropped, silently. The relay states its grace
+  in the `welcome`, and the asker holds the query open for that
+  same grace after `complete`: the two ends must agree, or the
+  relay goes on admitting (and metering) answers the asker has
+  already stopped collecting. A purged query's id is remembered
+  for a while after the purge, so an answer that arrives after
+  it is a silent late drop — never a strike: honest slowness is
+  not an abuse signal.
 - `revocations` — `{issuer, seq, issued_at, keys, sig}`: the
   issuer-signed revocation list (§9) — `sig` is the issuer's
   signature over the canonical message, verified before the
@@ -1168,7 +1222,12 @@ answer is cryptographically bound to the query it answers, so
 a ciphertext replayed under a different query does not open.
 Answering nodes encrypt their batches to that key and the relay
 forwards ciphertext; it still sees the asker↔answerer pairing,
-timing, and sizes, but never answer content (§12). The exact key
+timing, and sizes, but never answer content (§12). A query
+carrying a reply key is answered **sealed or not at all** — no
+hop may substitute or accept plaintext for it: an answerer that
+cannot seal refuses (its `done` still lands), the relay never
+forwards a plaintext answer for a sealed query, and the asker
+drops any that somehow arrives. The exact key
 encodings and HPKE byte format are pinned in the §10 conformance
 corpus, so a second implementation seals and opens
 byte-identically. (Queries are not sealed: broadcast means every

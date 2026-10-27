@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import time
 import unittest
 from pathlib import Path
 
@@ -210,6 +211,37 @@ class TestBatchSignVerify(unittest.TestCase):
         env = C.sign_batch(PRIV, batch)
         with self.assertRaises(C.ClaimError):
             C.verify_batch("!!!not-base64!!!", env)
+
+    def test_asserted_at_is_minted_signed_and_required(self):
+        # MF-3 / §6: the header carries the node's signed assertion
+        # time — cache ages and §9's attestation window/standing all
+        # run from it, so it must be present, integral, and covered
+        # by the signature.
+        batch = C.make_batch(PUB, [id_claim()], asserted_at=1_700_000_000)
+        self.assertEqual(batch["header"]["asserted_at"], 1_700_000_000)
+        env = C.sign_batch(PRIV, batch)
+        out = C.verify_batch(PUB, env)
+        self.assertEqual(out["header"]["asserted_at"], 1_700_000_000)
+        # Tampering with it breaks the signature (it is signed data,
+        # not a hint the receiver may repair).
+        env["batch"]["header"]["asserted_at"] = 1_800_000_000
+        with self.assertRaises(C.ClaimError):
+            C.verify_batch(PUB, env)
+        # A batch with no asserted_at at all is refused even when
+        # re-signed by the key holder: the shape itself is invalid.
+        batch = C.make_batch(PUB, [id_claim()], asserted_at=1_700_000_000)
+        del batch["header"]["asserted_at"]
+        with self.assertRaises(C.ClaimError):
+            C.verify_batch(PUB, C.sign_batch(PRIV, batch))
+        # Non-integer assertion times are refused at minting.
+        for bad in (1_700_000_000.5, "1700000000", -1, True):
+            with self.assertRaises(C.ClaimError, msg=repr(bad)):
+                C.make_batch(PUB, [id_claim()], asserted_at=bad)
+        # The default is the node's clock now.
+        before = int(time.time())
+        batch = C.make_batch(PUB, [id_claim()])
+        after = int(time.time())
+        self.assertTrue(before <= batch["header"]["asserted_at"] <= after)
 
 
 if __name__ == "__main__":

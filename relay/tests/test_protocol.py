@@ -61,7 +61,6 @@ def test_hello_parses(node_a):
         {"challenge": encode_base64url(b"\x02" * 31)},
         {"challenge": "not!base64"},
         {"signature": encode_base64url(b"\x01" * 63)},
-        {"surprise": 1},
     ],
 )
 def test_hello_rejects_bad_shapes(node_a, overrides):
@@ -136,7 +135,6 @@ def _text_query_with_subjects() -> str:
         _text_query_with_subjects(),
         _query(query_id="zz" * 16),
         _query(query_id="abcd"),
-        _query(extra="nope"),
     ],
 )
 def test_query_rejects_bad_shapes(raw):
@@ -167,10 +165,31 @@ def test_answer_rejects_non_object_batch(batch):
 def test_done_and_bye_parse():
     assert isinstance(parse_message(json.dumps({"type": "done", "query_id": QID})), Done)
     assert isinstance(parse_message(json.dumps({"type": "bye"})), Bye)
-    with pytest.raises(ProtocolError):
-        parse_message(json.dumps({"type": "bye", "extra": 1}))
-    with pytest.raises(ProtocolError):
-        parse_message(json.dumps({"type": "done", "query_id": QID, "extra": 1}))
+
+
+def test_unknown_fields_are_ignored_not_refused(node_a):
+    # Section 10's forward-compatibility rule: a field this relay
+    # predates is ignored on ANY message, and the parsed message is
+    # identical to the one without it. (Fields known to the protocol
+    # keep their strict checks — the bad-shape tests above — and a
+    # field belonging to the other query MODE stays refused: see
+    # test_query_rejects_bad_shapes.)
+    hello = json.loads(_hello(node_a))
+    assert parse_message(json.dumps({**hello, "surprise": 1})) == parse_message(
+        json.dumps(hello)
+    )
+    assert parse_message(_query(future_field={"x": [1, 2]})) == parse_message(_query())
+    assert parse_message(
+        json.dumps({"type": "done", "query_id": QID, "extra": 1})
+    ) == Done(query_id=QID)
+    assert isinstance(parse_message(json.dumps({"type": "bye", "extra": 1})), Bye)
+    batch = {"claims": []}
+    with_extra = parse_message(
+        json.dumps({"type": "answer", "query_id": QID, "batch": batch, "extra": "x"})
+    )
+    assert with_extra == parse_message(
+        json.dumps({"type": "answer", "query_id": QID, "batch": batch})
+    )
 
 
 def test_unknown_type_and_non_objects_rejected():

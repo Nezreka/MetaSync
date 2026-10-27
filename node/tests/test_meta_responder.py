@@ -704,6 +704,50 @@ class StoreInternalsTest(unittest.TestCase):
             with self.assertRaises(C.ClaimError, msg=repr(bad)):
                 self.store.put_cached_batch(bad)
 
+    def _cached_asserted_at(self, batch_id):
+        row = self.store._db.execute(
+            "SELECT asserted_at FROM batches WHERE batch_id = ?",
+            (batch_id,)).fetchone()
+        return None if row is None else row[0]
+
+    def test_cached_batch_ages_from_the_origins_asserted_at(self):
+        # MF-3 / §6: a re-served old batch keeps its ORIGINAL age
+        # basis in the receiving cache — receipt time must not
+        # refresh it, or retracted claims would never age out.
+        origin = load_or_create_identity(self.tmp.name + "-origin")
+        sid = S.generate_soul_id("artist", "Old Batch Artist")
+        claims = [
+            {"subject": sid, "kind": "artist", "field": "name",
+             "value": ["Old Batch Artist"], "source": "file_tags",
+             "soulid_version": "kinded_v2"},
+        ]
+        origin_time = 1_600_000_000  # the origin asserted this long ago
+        batch = C.make_batch(origin.public_key_b64url, claims,
+                             asserted_at=origin_time)
+        envelope = C.sign_batch(origin.signing_private_key, batch)
+        batch_id = self.store.put_cached_batch(
+            envelope, received_at=1_700_000_000.0)
+        self.assertEqual(self._cached_asserted_at(batch_id),
+                         float(origin_time))
+
+    def test_cached_batch_future_asserted_at_is_capped_at_receipt(self):
+        # §6: a future-dated batch cannot extend its own life — the
+        # cache records min(asserted_at, receipt).
+        origin = load_or_create_identity(self.tmp.name + "-origin2")
+        sid = S.generate_soul_id("artist", "Future Batch Artist")
+        claims = [
+            {"subject": sid, "kind": "artist", "field": "name",
+             "value": ["Future Batch Artist"], "source": "file_tags",
+             "soulid_version": "kinded_v2"},
+        ]
+        batch = C.make_batch(origin.public_key_b64url, claims,
+                             asserted_at=1_900_000_000)  # far future
+        envelope = C.sign_batch(origin.signing_private_key, batch)
+        batch_id = self.store.put_cached_batch(
+            envelope, received_at=1_700_000_000.0)
+        self.assertEqual(self._cached_asserted_at(batch_id),
+                         1_700_000_000.0)
+
     def test_full_mode_skips_corrupt_cache_rows(self):
         origin = load_or_create_identity(self.tmp.name + "-origin")
         sid = S.generate_soul_id("artist", "Cached Artist")
@@ -932,8 +976,8 @@ class RelayRoundTripTest(unittest.TestCase):
                               mode_provider=lambda: "own_library")
 
         def connect(identity):
-            server.store.bind(KEY_ID, identity.node_id,
-                              identity.public_key_bytes)
+            # Protocol v2: no binding step — the relay verifies the
+            # token offline; binding lives at the token exchange.
             token = issue_token(self.pool_private, KEY_ID,
                                 identity.node_id, FULL_SCOPES)
             client = RelayClient(

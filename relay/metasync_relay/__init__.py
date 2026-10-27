@@ -2,10 +2,12 @@
 
 The relay holds persistent connections from nodes, forwards queries to
 connected nodes, and routes their answers back to the asker by query ID.
-It stores nothing: presence lives in memory only, and its single database
-touch is a read-only connect-time peek at the portal_keys guest list.
+It stores nothing and touches no database: presence lives in memory
+only, and access tokens are verified offline against the issuer key —
+the guest-list check lives at the token exchange (section 10).
 """
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 1  # the lowest protocol version this relay speaks
+PROTOCOL_VERSION_MAX = 2
 
-__all__ = ["PROTOCOL_VERSION"]
+__all__ = ["PROTOCOL_VERSION", "PROTOCOL_VERSION_MAX"]

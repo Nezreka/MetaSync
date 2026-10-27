@@ -34,6 +34,7 @@ from urllib.parse import urlparse
 
 import requests
 
+from .attestation import verify_attestation
 from .identity import NodeIdentity
 
 INDEX_KINDS = ("trending", "most-wanted", "breakouts")
@@ -109,6 +110,8 @@ class PoolClient:
         auth_state: dict[str, Any] | None = None,
         persist: Callable[[], None] | None = None,
         allow_legacy: bool = False,
+        issuer_key_provider: Callable[[], Any] | None = None,
+        revocation_sink: Callable[[Any], None] | None = None,
     ):
         self.pool_id = str(pool.get("id") or "pool")
         self.name = str(pool.get("name") or self.pool_id)
@@ -123,6 +126,21 @@ class PoolClient:
         # The direct-key fallback is for a development pool on this
         # machine only (or an operator who explicitly allowed it).
         self.legacy_allowed = allow_legacy or is_loopback_url(self.base)
+        # Supplies the token issuer's Ed25519 public key, for
+        # verifying the binding attestation an exchange response may
+        # carry (§9). None (or a provider returning None) means no
+        # attestation can ever verify here, so none is ever stored.
+        self._issuer_key_provider = issuer_key_provider
+        # Receives the exchange response's revocation list (§10),
+        # raw: verification against the issuer key and application
+        # at sequence live in the sink (the service's shared
+        # revocation store), exactly as attestation verification
+        # lives behind the key provider. NOTE: the portal side
+        # emitting `revocations` in exchange responses is the known
+        # portal follow-up (attestation issuance + revocation-list
+        # endpoint pair); the node consumes the field whenever a
+        # pool sends it, and its absence changes nothing.
+        self._revocation_sink = revocation_sink
 
     # -- role gate ---------------------------------------------------------
     def _require(self, operation: str) -> None:
@@ -158,6 +176,55 @@ class PoolClient:
     def auth_status(self) -> dict[str, Any]:
         """Non-secret except for the access token, which callers must not render."""
         return dict(self.auth_state)
+
+    def _note_attestation(self, body: dict[str, Any]) -> None:
+        """Store the exchange response's binding attestation (§9),
+        when it carries one AND it verifies: pool signature against
+        the issuer key, and node_key naming THIS node's key. An
+        unverifiable or foreign attestation is dropped — never
+        stored, never embedded — and never replaces a previously
+        verified one: a glitched or tampered response must not be
+        able to strip the node's standing. Absence (an older pool)
+        likewise leaves the stored attestation alone; its own
+        window is what ages it out of usefulness."""
+        if "attestation" not in body or self.identity is None:
+            return
+        # Failure-isolated (SF-2): attestation is optional garnish on
+        # the exchange. A raising issuer-key lookup must degrade to
+        # "no attestation noted", never propagate out of exchange()
+        # after the token was stored and read as a token failure.
+        try:
+            issuer_key = self._issuer_key_provider() \
+                if self._issuer_key_provider is not None else None
+            verified = verify_attestation(
+                body.get("attestation"), issuer_key,
+                self.identity.public_key_b64url)
+        except Exception:  # noqa: BLE001 - see above: degrade, never break
+            return
+        if verified is not None:
+            self._update_auth(attestation=verified)
+
+    def _note_revocations(self, body: dict[str, Any]) -> None:
+        """Hand the exchange response's revocation list (§10) to the
+        revocation sink, when the response carries one. This is the
+        delivery channel a withholding relay cannot sit on — the
+        exchange is the issuer's own endpoint — and it is what
+        bounds a withheld revocation's delay to one token lifetime.
+        Failure-isolated like _note_attestation: a raising sink
+        degrades to 'no list noted', never a broken exchange."""
+        if "revocations" not in body or self._revocation_sink is None:
+            return
+        try:
+            self._revocation_sink(body.get("revocations"))
+        except Exception:  # noqa: BLE001 - degrade, never break
+            return
+
+    def current_attestation(self) -> dict[str, Any] | None:
+        """The verified binding attestation this client last stored
+        from an exchange, if any (auth_state survives restarts, so
+        this is the node's current attestation for the pool)."""
+        stored = self.auth_state.get("attestation")
+        return stored if isinstance(stored, dict) else None
 
     def _token_fresh(self, skew_s: float = 30.0) -> bool:
         if not self.auth_state.get("access_token"):
@@ -350,6 +417,8 @@ class PoolClient:
             last_exchange_error=None,
             status_note="Exchange complete; routine calls use the short-lived access token.",
         )
+        self._note_attestation(body)
+        self._note_revocations(body)
         return body
 
     def _ensure_auth(self) -> str:
