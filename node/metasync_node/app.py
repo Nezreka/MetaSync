@@ -24,6 +24,7 @@ from .service import NodeService, PairingError, PairingRateLimited, check_pool_u
 MACHINE_POST_PATHS = frozenset({
     "/local/pair/request", "/local/pair/claim",
     "/local/handoff/pool-key", "/local/disconnect",
+    "/local/meta/preview",
 })
 
 LOGIN_MAX_FAILURES = 5
@@ -283,6 +284,17 @@ def create_app(service: NodeService) -> Flask:
     @local_key_required
     def local_status():
         return service.local_status()
+
+    @app.post("/local/meta/preview")
+    @local_key_required
+    def local_meta_preview():
+        # "What your node would answer": the responder's exact code
+        # path over the local claims store, run locally — nothing is
+        # sent anywhere. Body: a query dict, or {"query": {...}}.
+        body = _json_body()
+        query = body.get("query") if isinstance(body.get("query"), dict) \
+            else body
+        return service.preview_answers(query)
 
     @app.get("/local/charts")
     @local_key_required

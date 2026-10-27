@@ -23,6 +23,10 @@ from urllib.parse import urlparse
 
 from .config import Config
 from .identity import NodeIdentity, load_or_create_identity, token_for_week
+from .meta.builder import BuildStopped, LibraryBuilder
+from .meta.responder import Responder
+from .meta.store import DB_FILENAME as META_DB_FILENAME
+from .meta.store import MetaStore
 from .musicbrainz import MusicBrainzResolver
 from .playlists import build_canonical_playlists
 from .pool import PoolBindingPending, PoolClient, PoolError, PoolNotAvailable, is_loopback_url
@@ -34,6 +38,11 @@ from .weekutil import closed_week_start, iso_week_string
 
 # How many complete weekly library snapshots the churn rule keeps.
 _SNAPSHOT_WEEKS = 3
+
+# A claims-store build is due again this long after the last
+# completed one (the export walk is incremental; this cadence is
+# what bounds how stale the node's answers can get).
+_META_REBUILD_INTERVAL_H = 20
 
 
 def _env_flag(raw: str) -> bool:
@@ -93,6 +102,9 @@ class NodeService:
             if "METASYNC_SHARE_LISTENING" in env:
                 settings["share_listening"] = _env_flag(env["METASYNC_SHARE_LISTENING"])
                 changed = True
+            if "METASYNC_META_ANSWERING" in env:
+                settings["meta_answering"] = _env_flag(env["METASYNC_META_ANSWERING"])
+                changed = True
         if changed:
             self.store.save_settings()
         self.allow_insecure_pools = bool(env and _env_flag(env.get("METASYNC_ALLOW_INSECURE_POOLS", "")))
@@ -123,6 +135,18 @@ class NodeService:
         # the network on. None means "never started on this process".
         self._relay_client: RelayClient | None = None
         self._relay_lock = threading.Lock()
+        # The metadata claims store + responder (DESIGN-METADATA.md
+        # section 5), created lazily: a node that never turns the
+        # metadata network on never opens the store file.
+        self._meta_store: MetaStore | None = None
+        self._meta_responder: Responder | None = None
+        # Lazy construction of the store/responder happens under
+        # this lock (a scheduler tick and a UI request must not race
+        # two stores into being). It is NOT _meta_lock: that one is
+        # held across whole builds, which themselves construct.
+        self._meta_construct_lock = threading.RLock()
+        self._meta_lock = threading.Lock()
+        self._meta_build_thread: threading.Thread | None = None
         # A job record persisted as "running" across a restart is a corpse:
         # its thread died with the old process. Close it out honestly.
         stale_job = self.store.state.get("report_job") or {}
@@ -1043,6 +1067,18 @@ class NodeService:
             with self._relay_lock:
                 if self._relay_client is stop_client:
                     self._relay_client = None
+        # Answering is its own opt-in, separate from the network
+        # switch and from every SIN switch: the query handler is
+        # registered only while BOTH meta_network and meta_answering
+        # are on, and removed the moment either turns off. The
+        # responder re-reads the node mode per query, so a mode
+        # change needs no rewiring here.
+        with self._relay_lock:
+            client = self._relay_client
+        if client is not None:
+            want_handler = want and self.meta_answering()
+            client.set_query_handler(
+                self._meta_query_handler if want_handler else None)
         return self.relay_status()
 
     def stop_relay_client(self) -> None:
@@ -1060,6 +1096,7 @@ class NodeService:
         if client is None:
             return {
                 "enabled": enabled,
+                "answering": self.meta_answering(),
                 "connected": False,
                 "peers": None,
                 "mode": self._meta_node_mode(),
@@ -1068,7 +1105,161 @@ class NodeService:
             }
         status = client.status()
         status["enabled"] = enabled
+        status["answering"] = self.meta_answering()
         return status
+
+    # -- metadata responder (claims store, DESIGN-METADATA.md section 5) --
+    def meta_answering(self) -> bool:
+        """The answering opt-in: settings meta_answering, default off,
+        separate from meta_network and from every SIN switch."""
+        return bool(self.store.settings.get("meta_answering", False))
+
+    def meta_store(self) -> MetaStore:
+        if self._meta_store is None:
+            with self._meta_construct_lock:
+                if self._meta_store is None:
+                    self._meta_store = MetaStore(self.store.dir)
+        return self._meta_store
+
+    def _meta_responder_obj(self) -> Responder:
+        if self._meta_responder is None:
+            with self._meta_construct_lock:
+                if self._meta_responder is None:
+                    self._meta_responder = Responder(
+                        self.meta_store(), self.identity,
+                        mode_provider=self._meta_node_mode)
+        return self._meta_responder
+
+    def _meta_store_created(self) -> bool:
+        """The claims store exists (constructed in this process, or
+        its file is already on disk). Status/due paths use this to
+        stay store-free on nodes that never built one: opening the
+        store would CREATE meta_claims.sqlite3 on a node with the
+        whole metadata feature off."""
+        return self._meta_store is not None or \
+            (self.store.dir / META_DB_FILENAME).exists()
+
+    def _meta_query_handler(self, query: dict[str, Any]) -> list[dict[str, Any]]:
+        return self._meta_responder_obj().handle(query)
+
+    def _meta_builder(self, live_gate: bool = False) -> LibraryBuilder:
+        # The live gate (stop at the next page if answering is
+        # switched off mid-walk) applies to scheduler-started builds.
+        # A manual rebuild is the user's explicit request and runs
+        # regardless of the switch.
+        return LibraryBuilder(
+            self.soulsync(), self.identity, self.meta_store(),
+            enabled_on=self.meta_answering if live_gate else None)
+
+    def meta_status(self) -> dict[str, Any]:
+        if not self._meta_store_created():
+            # No store yet: report the empty shape WITHOUT opening
+            # one. A status read must not create the file on a node
+            # that has the feature off (sync_meta_store's not-due
+            # path lands here on every scheduler tick).
+            return {
+                "answering": self.meta_answering(),
+                "mode": self._meta_node_mode(),
+                "store": {"own_claims": 0, "own_subjects": 0,
+                          "cached_batches": 0, "cached_claims": 0},
+                "build": {"last_status": None, "last_detail": None,
+                          "last_run_at": None, "last_completed_at": None,
+                          "last_full_completed_at": None,
+                          "last_totals": {}, "walk_entity": "",
+                          "full": True},
+            }
+        builder = LibraryBuilder(None, self.identity, self.meta_store())
+        return {
+            "answering": self.meta_answering(),
+            "mode": self._meta_node_mode(),
+            "store": self.meta_store().counts(),
+            "build": builder.status(),
+        }
+
+    def preview_answers(self, query: Any) -> dict[str, Any]:
+        """Exactly what the responder would answer for this query —
+        the same code path the relay handler runs, for the node's
+        own UI/API ("what your node would answer")."""
+        batches = self._meta_responder_obj().handle(
+            query if isinstance(query, dict) else {})
+        return {
+            "ok": True,
+            "mode": self._meta_node_mode(),
+            "answering": self.meta_answering(),
+            "batches": batches,
+        }
+
+    def rebuild_meta_store(self, now: datetime | None = None,
+                           force_full: bool = False,
+                           live_gate: bool = False) -> dict[str, Any]:
+        """One claims-store build over the SoulSync export. Outcomes
+        are recorded in the store and returned; a stopped build
+        (export missing, answering switched off mid-run) is a
+        status, not an exception."""
+        if not self._meta_lock.acquire(blocking=False):
+            return {"status": "already_running"}
+        try:
+            now = now or self.clock()
+            try:
+                builder = self._meta_builder(live_gate=live_gate)
+            except SoulSyncError as err:
+                return {"status": "soulsync_unavailable",
+                        "detail": str(err)}
+            try:
+                # A rebuild also satisfies a due full walk: the
+                # cadence lives in the builder's state, and a manual
+                # rebuild is as good a moment as a scheduled one.
+                totals = builder.run(
+                    now.isoformat(),
+                    force_full=force_full or builder.full_walk_due(now))
+                builder.record_outcome("completed")
+                return {"status": "completed", **totals}
+            except BuildStopped as stop:
+                builder.record_outcome(stop.reason, stop.detail or None)
+                return {"status": stop.reason, "detail": stop.detail}
+        finally:
+            self._meta_lock.release()
+
+    def meta_rebuild_due(self, now: datetime) -> bool:
+        """Due when answering is on and the last completed build is
+        older than the rebuild interval (or never ran) — or a full
+        walk is due on its own cadence, however fresh the last
+        incremental completion is (incrementals never see
+        deletions, so they cannot substitute for the sweep)."""
+        if not self.meta_answering():
+            return False
+        if not self._meta_store_created():
+            return True  # never built; no store read needed
+        builder = LibraryBuilder(None, self.identity, self.meta_store())
+        if builder.full_walk_due(now):
+            return True
+        last = _parse_time(builder.status().get("last_completed_at"))
+        if last is None:
+            return True
+        return now - last >= timedelta(hours=_META_REBUILD_INTERVAL_H)
+
+    def sync_meta_store(self) -> dict[str, Any]:
+        """Scheduler leg: start a claims-store build on a background
+        thread when one is due. The build must never block the
+        scheduler (a full walk of a large library takes minutes)."""
+        if not self.meta_rebuild_due(self.clock()):
+            return self.meta_status()
+        thread = self._meta_build_thread
+        if thread is not None and thread.is_alive():
+            return self.meta_status()
+        thread = threading.Thread(
+            target=self._run_meta_build, daemon=True,
+            name="metasync-meta-build")
+        self._meta_build_thread = thread
+        thread.start()
+        return self.meta_status()
+
+    def _run_meta_build(self) -> None:
+        try:
+            self.rebuild_meta_store(live_gate=True)
+        except Exception as err:  # noqa: BLE001 — a background build must never die silently.
+            self.store.record_error("meta_build", err)
+            self.store.save_state()
 
     # -- status ---------------------------------------------------------------
     def status(self) -> dict[str, Any]:

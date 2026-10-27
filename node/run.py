@@ -45,6 +45,14 @@ def scheduler_loop(service: NodeService, stop: threading.Event) -> None:
             service.store.record_error("relay", err)
             service.store.save_state()
         try:
+            # The claims-store build follows the answering switch:
+            # due-checked every tick, run on its own thread so a long
+            # library walk never stalls the scheduler.
+            service.sync_meta_store()
+        except Exception as err:  # noqa: BLE001 - the meta leg must never kill the scheduler
+            service.store.record_error("meta_store", err)
+            service.store.save_state()
+        try:
             now = datetime.now(timezone.utc)
             # Once per closed week, after this node's slot, with a back-off
             # after a failure (service.report_due) — never every tick, and

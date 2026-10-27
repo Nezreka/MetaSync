@@ -686,3 +686,85 @@ This section covers only the node's connection to it.
   (its claims stores) and how it verifies and merges what comes back
   are the responder and search steps that follow; query content itself
   is covered there and in DESIGN-METADATA.md §12.
+
+## 18. The metadata responder (node side)
+
+What the node answers from, and the rules it answers under
+(DESIGN-METADATA.md §5/§6/§9; code in `node/metasync_node/meta/`).
+
+- **The local claims store** is one SQLite file,
+  `meta_claims.sqlite3`, in the node's state dir — nothing about it
+  leaves the machine. It holds: the node's **own-library claims**,
+  built from its SoulSync's metadata export by `meta/builder.py`
+  (PR #12's claim construction: provider-id claims only on a
+  resolved match status, scalars sourced by `canonical_source`
+  else `file_tags`, durations passed through as milliseconds,
+  album_track variants `mb:<release_id>` only when the MusicBrainz
+  match resolved, never an album MBID minted from a release id —
+  the release-group MBID is claimed from the export's own
+  `musicbrainz_release_group_id` field when present and resolved —
+  plus `provider_link` claims: an album's resolved provider ids
+  naming each other (`same_entity`) and, per provider shared with
+  its artist, the artist's id on it (`album_of`));
+  the **answer cache** of other nodes' batches, stored frozen with
+  origin signatures intact (written by the querier step; the
+  responder only reads); and two derived indexes — a provider index
+  (`provider:external_id` -> subject, from provider-id claims and
+  both ends of provider_link claims) and a name index (normalized
+  name tokens -> subject, in the SoulID normalizer's family).
+  Builds walk the export incrementally (cursor + `since` = walk
+  start − 1 h, per-owner replacement, so re-exports never
+  duplicate); the −1 h assumes the node's and SoulSync's clocks
+  agree to well within an hour — the overlap only buys protection
+  against small skew, and a clock off by more than that can miss
+  rows until the next full walk. Each export page lands in one
+  commit (its seen-owners and claim replacements together), so a
+  crash leaves a page wholly written or wholly unwritten. A
+  completed full walk drops claims whose rows left the library —
+  guarded: a walk that saw zero rows while the store holds claims,
+  or a sweep that would drop over half the store's own claims, is
+  refused as a stopped build and deletes nothing. Incremental
+  walks cannot see deletions at all, so a full walk is also due
+  every 7 days regardless of incremental freshness. The scheduler
+  rebuilds when due (answering on, last build ≥ 20 h old, or a
+  full walk due); `NodeService.rebuild_meta_store()` is the
+  manual trigger. Track slot lookups (`album_track` claims by the
+  track inside their JSON value) run on a partial expression
+  index over `json_extract(value_json, '$.track')`, not a scan.
+- **Answering is its own opt-in.** Settings `meta_answering`,
+  **default off**, separate from `meta_network` and from every SIN
+  switch. The relay query handler is registered only while both
+  `meta_network` and `meta_answering` are on; turning either off
+  deregisters it on the next scheduler tick, no restart.
+- **Modes** (`meta_node_mode`, read live per query): `leech` never
+  answers (the handler refuses even if a query arrives);
+  `own_library` (default) answers from the node's own claims only;
+  `full` also **re-serves** answer-cache batches — but only batches
+  whose every claim passes the §7.1 re-serve rule (one predicate,
+  `claim_reservable` in `meta/store.py`, shared by the cache filter
+  and the own-batch split): bare provider-id and `provider_link`
+  claims always pass (§7.1 names bare ID links as what travels,
+  whatever source stamped them), while catalogue values must be
+  `file_tags`- or `musicbrainz`-sourced. The caution is field-level
+  too: a `duration_ms`, `isrc`, or `display_name` claim not sourced
+  from MusicBrainz blocks its batch even when its source is
+  `file_tags` — those fields are answered from a node's own
+  library but not forwarded. Re-served batches keep the origin
+  node's signature and ride in this node's signed forwarding
+  envelope; answers from the node's own library are minted fresh
+  per query in the same split — up to two signed batches per
+  subject (re-servable partition first, own-only second), capped
+  at 50 batches per answer.
+- **Query shapes.** Exact by SoulID; exact by provider ref
+  (`deezer:3135556` as a subject, or a `provider_ids` list; the
+  provider name matches case-insensitively and surrounding
+  whitespace is stripped, the ID itself stays exact) resolved
+  through the provider index — the answer carries the very
+  provider-id/link claim that matched, so the asker can verify the
+  mapping locally; text by terms, matched over the name index
+  (exact token, prefix, or one edit away), best matches first, at
+  most 25 subjects. An exact track answer also carries the
+  album_track claim that places it.
+- **Preview.** `POST /local/meta/preview` (local API key) runs the
+  responder's exact code path locally and returns what the node
+  would answer for a query body — nothing is sent anywhere.
