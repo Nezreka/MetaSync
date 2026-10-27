@@ -23,11 +23,15 @@ from urllib.parse import urlparse
 
 from .config import Config
 from .identity import NodeIdentity, load_or_create_identity, token_for_week
+from .meta import merge as meta_merge
 from .meta.builder import BuildStopped, LibraryBuilder
+from .meta.querier import Querier
 from .meta.responder import Responder
+from .meta.verify import DeezerFetcher, MusicBrainzFetcher, SpotifyFetcher
+from .meta.verify import Verifier
 from .meta.store import DB_FILENAME as META_DB_FILENAME
 from .meta.store import MetaStore
-from .musicbrainz import MusicBrainzResolver
+from .musicbrainz import MusicBrainzResolver, Pacer
 from .playlists import build_canonical_playlists
 from .pool import PoolBindingPending, PoolClient, PoolError, PoolNotAvailable, is_loopback_url
 from .relay import RelayClient, RelayError, normalize_mode
@@ -119,11 +123,18 @@ class NodeService:
             del mb_cache[key]
         if stale:
             self.store.save_state()
+        # ONE MusicBrainz pacer for the whole node (R2-SF-6):
+        # the resolver and the §7 verifier's fetcher share it, so
+        # the node's aggregate MusicBrainz rate honors the
+        # ~1 req/s etiquette instead of doubling it per client.
+        self._musicbrainz_pacer = Pacer(
+            config.musicbrainz_min_interval_s)
         self.resolver = resolver or MusicBrainzResolver(
             config.musicbrainz_base_url,
             config.musicbrainz_user_agent,
             min_interval_s=config.musicbrainz_min_interval_s,
             cache=mb_cache,
+            pacer=self._musicbrainz_pacer,
         )
         # The clock the background job and the scheduler read; tests pin it.
         self.clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
@@ -146,6 +157,7 @@ class NodeService:
         # metadata network on never opens the store file.
         self._meta_store: MetaStore | None = None
         self._meta_responder: Responder | None = None
+        self._meta_querier: Querier | None = None
         # Lazy construction of the store/responder happens under
         # this lock (a scheduler tick and a UI request must not race
         # two stores into being). It is NOT _meta_lock: that one is
@@ -1243,55 +1255,65 @@ class NodeService:
         return self._meta_store
 
     def _attestation_source(self) -> tuple[str | None, dict[str, Any] | None]:
-        """(pool id, attestation) for the first joined pool carrying
-        a verified binding attestation, else (None, None). A pool
-        whose client raises is skipped (SF-2 doctrine): attestation
-        trouble degrades to 'no attestation', never to a broken
-        caller."""
-        for pool in self.pools():
-            try:
-                attestation = self.pool_client(pool).current_attestation()
-            except Exception:  # noqa: BLE001 - degrade, never break
-                attestation = None
-            if attestation is not None:
-                return str(pool.get("id") or "pool"), attestation
-        return None, None
+        """(pool id, attestation) for the pool the relay session
+        belongs to — the FIRST joined pool, the one _relay_token
+        exchanges with (step 6's per-pool selection: the
+        responder/builder embed the SESSION pool's attestation,
+        because an attestation is one pool's signed statement and
+        askers verify it against that pool's issuer; another
+        pool's attestation embedded on this session would count
+        zero support there, which is worse than embedding none).
+        A pool client that raises degrades to 'no attestation'
+        (SF-2 doctrine), never to a broken caller."""
+        pools = self.pools()
+        if not pools:
+            return None, None
+        pool = pools[0]
+        try:
+            attestation = self.pool_client(pool).current_attestation()
+        except Exception:  # noqa: BLE001 - degrade, never break
+            attestation = None
+        return str(pool.get("id") or "pool"), attestation
 
     def _current_attestation(self) -> dict[str, Any] | None:
-        """The node's current binding attestation (§9): the verified
-        one a pool's exchange last handed over, stored on that pool
-        client's auth state. The first joined pool carrying one
-        wins — a node binds its key per pool, and v1 runs one
-        official pool. None when no exchange has delivered one."""
+        """The node's current binding attestation (§9) for the
+        relay session's pool: the verified one that pool's exchange
+        last handed over, stored on its client's auth state. None
+        when that pool's exchanges have delivered none — another
+        pool's attestation is never substituted (per-pool
+        selection, step 6)."""
         return self._attestation_source()[1]
 
     def _attestation_pool_note(self) -> str | None:
-        """SF-4 visibility for the first-pool-wins simplification
-        above: the relay session's token always comes from the FIRST
-        enabled pool (_relay_token), so when the attestation being
-        embedded came from a DIFFERENT pool, askers on the session's
-        pool verify it against the wrong issuer and this node's
-        answers count zero support there — silently, without this
-        note. The real fix (choose the attestation for the pool the
-        session belongs to) belongs to step 6; for now the mismatch
-        is at least visible in relay_status. None when there is
+        """Visibility for the one multi-pool state that still costs
+        support: the session pool has delivered NO attestation
+        while another joined pool carries one. The node embeds
+        none (per-pool selection), so its answers count zero
+        support until the SESSION pool's exchange delivers its
+        own — a state worth naming in relay_status rather than
+        letting it pass as a healthy node. None when there is
         nothing to warn about."""
         pools = self.pools()
         if len(pools) < 2:
             return None
-        source_id, attestation = self._attestation_source()
-        if attestation is None or source_id is None:
+        session_id, attestation = self._attestation_source()
+        if attestation is not None or session_id is None:
             return None
-        session_id = str(pools[0].get("id") or "pool")
-        if source_id == session_id:
-            return None
-        return (
-            f"the embedded binding attestation is from pool "
-            f"{source_id}, but the relay session runs on pool "
-            f"{session_id}: answers count zero support on the "
-            f"session's pool until that pool's exchange delivers an "
-            f"attestation (per-pool attestation selection is step 6)"
-        )
+        for pool in pools[1:]:
+            try:
+                other = self.pool_client(pool).current_attestation()
+            except Exception:  # noqa: BLE001 - degrade, never break
+                other = None
+            if other is not None:
+                return (
+                    f"pool {pool.get('id') or 'pool'} carries a "
+                    f"binding attestation, but the relay session "
+                    f"runs on pool {session_id}, which has delivered "
+                    f"none: attestations are per-pool, so this "
+                    f"node's answers count zero support until the "
+                    f"session pool's exchange delivers its own"
+                )
+        return None
 
     def _meta_responder_obj(self) -> Responder:
         if self._meta_responder is None:
@@ -1335,12 +1357,19 @@ class NodeService:
                 "answering": self.meta_answering(),
                 "mode": self._meta_node_mode(),
                 "store": {"own_claims": 0, "own_subjects": 0,
-                          "cached_batches": 0, "cached_claims": 0},
+                          "cached_batches": 0, "cached_claims": 0,
+                          "legacy_aliases": 0},
                 "build": {"last_status": None, "last_detail": None,
                           "last_run_at": None, "last_completed_at": None,
                           "last_full_completed_at": None,
                           "last_totals": {}, "walk_entity": "",
                           "full": True},
+                "querier": {"cached_batches": 0, "cached_claims": 0,
+                            "legacy_aliases": 0,
+                            "revocations":
+                                self._revocation_store().summary(),
+                            "verification": {"unverified_claims": 0,
+                                             "stale_verdicts": 0}},
             }
         builder = LibraryBuilder(None, self.identity, self.meta_store())
         return {
@@ -1348,6 +1377,7 @@ class NodeService:
             "mode": self._meta_node_mode(),
             "store": self.meta_store().counts(),
             "build": builder.status(),
+            "querier": self._meta_querier_obj().status(),
         }
 
     def preview_answers(self, query: Any) -> dict[str, Any]:
@@ -1362,6 +1392,117 @@ class NodeService:
             "answering": self.meta_answering(),
             "batches": batches,
         }
+
+    # -- metadata querier (asking, DESIGN-METADATA.md section 6) ---------
+
+    def _meta_fetchers(self) -> dict[str, Any]:
+        """§7's fetcher set: MusicBrainz (the node's configured
+        base URL, pacing and user agent — verification traffic is
+        the node's own, under the same etiquette as every other
+        MusicBrainz call it makes), Deezer's public lookup, and
+        Spotify as the explicit not-configured stub (the
+        credential route is §13 step 6's open sub-decision)."""
+        return {
+            "musicbrainz": MusicBrainzFetcher(
+                self.config.musicbrainz_user_agent,
+                base_url=self.config.musicbrainz_base_url,
+                min_interval_s=self.config.musicbrainz_min_interval_s,
+                pacer=self._musicbrainz_pacer),
+            "deezer": DeezerFetcher(),
+            "spotify": SpotifyFetcher(),
+        }
+
+    def _relay_client_or_none(self) -> RelayClient | None:
+        with self._relay_lock:
+            return self._relay_client
+
+    def _own_attestation_issuer(self) -> str | None:
+        """The issuer id of this node's own current attestation —
+        the TRUSTED issuer for §9 admission: the configured issuer
+        key speaks for this issuer and no other, and a batch
+        attestation earns standing only when its signature
+        verifies under that pair (MF-1). None — this node holds
+        no attestation of its own yet — means nothing can verify,
+        so every batch admits at zero support."""
+        attestation = self._current_attestation()
+        if attestation is None:
+            return None
+        issuer = attestation.get("issuer")
+        return issuer if isinstance(issuer, str) and issuer else None
+
+    def _meta_querier_obj(self) -> Querier:
+        if self._meta_querier is None:
+            with self._meta_construct_lock:
+                if self._meta_querier is None:
+                    store = self.meta_store()
+                    self._meta_querier = Querier(
+                        store, self.identity,
+                        relay_provider=self._relay_client_or_none,
+                        verifier=Verifier(store, self._meta_fetchers()),
+                        responder=self._meta_responder_obj(),
+                        issuer_key_provider=self._meta_issuer_key,
+                        own_issuer_provider=self._own_attestation_issuer)
+        return self._meta_querier
+
+    def meta_query(self, payload: Any) -> dict[str, Any]:
+        """One ask through the querier (POST /local/meta/query):
+        {kind, mode: exact|text, subjects|terms, network?}. Bad
+        asks are an error dict, never an exception. Asking does
+        NOT require the answering opt-in — asking and answering
+        are separate consents (§5); the relay client only exists
+        while meta_network is on, and without it the querier
+        answers from local data + cache alone."""
+        if not isinstance(payload, dict):
+            return {"ok": False, "error": "query body must be an object"}
+        kind = payload.get("kind")
+        if kind not in ("artist", "album", "track"):
+            return {"ok": False,
+                    "error": "kind must be artist, album or track"}
+        mode = payload.get("mode") or "exact"
+        network = payload.get("network") is not False
+        querier = self._meta_querier_obj()
+        if mode == "exact":
+            subjects = payload.get("subjects")
+            if not isinstance(subjects, list) or not subjects:
+                return {"ok": False,
+                        "error": "exact queries need a non-empty "
+                                 "subjects list"}
+            out = querier.query_exact(
+                kind, [str(s) for s in subjects], network=network)
+        elif mode == "text":
+            terms = payload.get("terms")
+            if not isinstance(terms, list) or not terms:
+                return {"ok": False,
+                        "error": "text queries need a non-empty "
+                                 "terms list"}
+            out = querier.query_text(
+                kind, [str(t) for t in terms], network=network)
+        else:
+            return {"ok": False, "error": "mode must be exact or text"}
+        # R1-SF-3/R2-SF-9: SoulSync-facing surfaces get the
+        # COARSE PROJECTION (meta/merge.py's project_for_depot —
+        # the step-8 depot contract): bucketed support, no origin
+        # keys, no batch ids, no exact counts. The full record
+        # stays internal (step 9's view reads the querier). The
+        # admission tallies (admitted/dropped) are exact counts of
+        # answering batches — they stay on the node-internal
+        # status surface ONLY (gate MF-3) and are never spread
+        # into this response.
+        return {"ok": True,
+                "asked_network": out["asked_network"],
+                "unresolved": out["unresolved"],
+                "records": [meta_merge.project_for_depot(record)
+                            for record in out["records"]]}
+
+    def meta_record(self, entry: str) -> dict[str, Any] | None:
+        """One subject's merged view from local data + cache (GET
+        /local/meta/record/<subject>): no relay traffic, ever.
+        None when this node knows nothing about the entry.
+        Served as the coarse depot projection, like meta_query."""
+        record = self._meta_querier_obj().record(entry)
+        if record is None:
+            return None
+        return meta_merge.project_for_depot(record)
 
     def rebuild_meta_store(self, now: datetime | None = None,
                            force_full: bool = False,

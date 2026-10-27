@@ -22,6 +22,7 @@ import json
 import re
 import secrets
 import time
+from typing import Any
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
@@ -41,6 +42,14 @@ SOULID_VERSION = _soulid.SOULID_VERSION
 # subject (§6: legacy subjects are alias entries, never v2 subjects).
 _SUBJECT_RE = re.compile(r"soul_[0-9a-f]{16}")
 
+
+def is_subject_id(value: Any) -> bool:
+    """True when `value` is a kinded_v2 SoulID subject string —
+    the shape test the querier and responder use to tell a v2
+    subject from a legacy id or a provider ref riding as one."""
+    return isinstance(value, str) and _SUBJECT_RE.fullmatch(value) \
+        is not None
+
 KINDS = ("artist", "album", "track")
 
 # Fields a claim may assert in v1. Provider-id fields are named
@@ -56,10 +65,14 @@ ALL_FIELDS = PROVIDER_ID_FIELDS + MBID_FIELDS + SCALAR_FIELDS + SPECIAL_FIELDS
 
 # `source` enum (§6/G1). "user_edit" is RESERVED: the SoulSync export
 # cannot mark user edits in v1 (G2), so nothing may emit it yet —
-# validate_claim rejects it even though it is in the enum.
+# validate_claim rejects it even though it is in the enum. "network"
+# is the §2.4 mark for a value that arrived over the metadata
+# network and was promoted into SoulSync's own data: it counts zero
+# support however it travels (§9), and the re-serve rule never
+# forwards it (meta/store.py's claim_reservable).
 SOURCES = (
     "musicbrainz", "spotify", "deezer", "tidal", "itunes", "discogs",
-    "hydrabase", "file_tags", "user_edit",
+    "hydrabase", "file_tags", "user_edit", "network",
 )
 RESERVED_SOURCES = ("user_edit",)
 

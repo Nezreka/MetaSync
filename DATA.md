@@ -710,7 +710,19 @@ What the node answers from, and the rules it answers under
   origin signatures intact (written by the querier step; the
   responder only reads); and two derived indexes — a provider index
   (`provider:external_id` -> subject, from provider-id claims and
-  both ends of provider_link claims) and a name index (normalized
+  both ends of provider_link claims — each row records BOTH the
+  kind of the entity the ref names AND the kind of the subject
+  the row belongs to, and resolution with a known kind matches
+  on the subject's kind for every row type: providers number
+  artists, albums and tracks separately, so an artist's Deezer
+  id claim never resolves an album or track subject through a
+  numeric collision — and a link's to-end does not pull its
+  subject into another kind's ask either (an album answers an
+  ALBUM ask through its album_of link, where that traversal is
+  the honest case; a track ask for the artist's number must not
+  manufacture an album record). Rows indexed before subject
+  kinds were recorded read as kind-unknown and match any kind)
+  and a name index (normalized
   name tokens -> subject, in the SoulID normalizer's family).
   Builds walk the export incrementally (cursor + `since` = walk
   start − 1 h, per-owner replacement, so re-exports never
@@ -768,3 +780,337 @@ What the node answers from, and the rules it answers under
 - **Preview.** `POST /local/meta/preview` (local API key) runs the
   responder's exact code path locally and returns what the node
   would answer for a query body — nothing is sent anywhere.
+
+## 19. The metadata querier (node side)
+
+What the node asks, what it lets in, and how answers become one
+merged view (DESIGN-METADATA.md §5–§9; code in
+`node/metasync_node/meta/querier.py`, `admission.py`, `merge.py`,
+`verify.py`).
+
+- **Cache-first asking.** An exact query resolves each entry
+  locally first — a SoulID as itself, a provider ref
+  (`deezer:3135556`) through the provider index, a legacy SoulID
+  ONLY through a verified alias (below). Subjects with any LIVE
+  local claims (own library or answer cache) are answered
+  locally; the relay is asked only for the rest — and "live" is
+  §6's aging rule: a subject whose only cached claims are
+  EXPIRED counts as missing and is re-asked, on both the exact
+  and the text path (a text query whose local resolution is all
+  expired goes to the network like an empty one). A provider ref
+  nothing local resolves rides to the relay verbatim, as an
+  opaque subject. A second identical query therefore sends zero
+  relay queries. Asking needs no opt-in beyond the
+  relay connection itself (`meta_network`); without a client,
+  queries answer from local data + cache alone and say so
+  (`asked_network: false`).
+- **Legacy aliases.** The export serves `soul_id` +
+  `soul_id_legacy` per row; the builder learns the mapping into
+  the store's `legacy_aliases` table ONLY when it verifies — the
+  v2 id recomputed from the row's own name parts must equal the
+  served `soul_id`. A legacy id is an alias entry, never a claim
+  subject: the querier translates it before asking, and the
+  responder answers a legacy-subject query from its own alias
+  table the same way, silently when it holds no verified mapping.
+- **Admission (§9) is the only door in.** Every received batch,
+  direct or re-served (judged by its inner origin batch), passes
+  four checks: (a) batch signature + digest + every claim valid;
+  (b) an embedded attestation, when present, names the batch's
+  signer — malformed or foreign-named attestations drop the
+  batch; (c) `asserted_at` inside the attestation's
+  issued_at..expires window; (d) the origin key not named on ANY
+  held revocation list (the union — the issuer a batch claims is
+  unverified at receipt). Failures of (a), (b), (d) drop the
+  batch. STANDING is cryptographic: passing (a)–(c), attested age
+  (`min(asserted_at, receipt) − bound_at`) ≥ 30 days, AND the
+  attestation's signature VERIFYING against the issuer key this
+  node holds for the issuer the attestation names (v1: the one
+  configured `meta_issuer_public_key`, speaking for the trusted
+  issuer id learned from this node's own attestation). Standing
+  is recorded in the `batch_admission` table, in the same commit
+  as the batch. Every case that cannot verify — an attestation
+  from an issuer whose key this node does not hold, no key
+  configured, this node holding no attestation of its own, a
+  garbage signature, a young binding, a window miss, no
+  attestation at all — is admitted at ZERO SUPPORT, exactly
+  alike: shape, naming and window alone vouch for nothing,
+  because fabricating all three costs a fresh key nothing.
+  Standing is not frozen at first admission: a re-arrival of the
+  same batch may UPGRADE the recorded verdict once it verifies
+  here (never downgrade — a later unverifiable arrival cannot
+  strip standing the door once verified). When a new
+  revocation list is applied (relay welcome/push or pool
+  exchange), the named keys' cached batches, admission rows, and
+  verdicts are purged immediately; merged views are computed per
+  read, so the purge IS the invalidation.
+- **The merged record** (version 1 — consumers key off
+  `version`) is what step 8's depot and step 9's view consume:
+  `{version, subject, kind, name, fields, expired_claims,
+  found}`. `found` is computed AFTER expiry filtering — a
+  subject whose cached claims all expired reports `found: false`
+  with no fields (its expired shell still surfaces the count in
+  `expired_claims`). Each field holds `values` — one entry per
+  distinct asserted value: `{value, tier, support,
+  support_label, reports, local, origins, batches, sources}`
+  plus `verified_at` (and `verification_stale` past 90 days) on
+  verified entries — and `local_value` / `local_values` /
+  `disputed`. SUPPORT is the count of distinct asserting ORIGIN
+  keys with standing, excluding this node's own key and
+  excluding `network`-sourced claims (zero support always);
+  re-served copies count once. REPORTS is the count of distinct
+  asserting origins holding a strong-verified verdict for the
+  value — the multiplicity the duration consensus is weighted
+  by. TIER is the best §7 verdict among the value's claim
+  identities: `unverified` / `plausible` / `strong-verified`. The
+  `support_label` bucket (`strong-verified` / `3+ nodes` /
+  `1-2 nodes` / `unverified`) is the only form of the count a
+  user surface may show, and origin keys never reach a user
+  surface — both rules bind step 8/9, the record itself carries
+  the provenance the depot's per-field index is keyed by (claim
+  identity: origin key, subject, field, value; batch ids are
+  evidence only). Local (own-library) values are marked `local`
+  and named as the field's `local_value`; the merge never
+  overwrites local data. `local` comes ONLY from the live
+  own-library claims: a re-served copy of THIS node's own batch
+  arriving through the cache merges as a network row (origin =
+  this node's key, listed in `origins`, never local, never
+  support) — otherwise a value this node once asserted and has
+  since corrected would keep winning its field as "local"
+  forever. Artist records carry a `disambiguation` block
+  whenever §8's ladder has candidate evidence: `{settled, via,
+  promotion, survivors, settled_at}` — which artist id a
+  fetched link (or a shared strong MBID, or the local-link
+  count) settled on, and when the settling evidence was
+  verified. Field rules: provider ids, MBIDs and
+  ISRCs are sets (every value kept; multiple strong/floor MBIDs
+  flag the field `multiple`); year merges MusicBrainz-sourced
+  values only (other network years are listed under `held`; the
+  node's own year is its local value); genres union, ranked by
+  tier then support, always `never_auto_fill`; durations merge
+  per album_track variant context — a variant `consensus_ms` is
+  the median of its STRONG reports WEIGHTED BY REPORT
+  MULTIPLICITY (each value counted once per distinct origin
+  holding a strong verdict for it — two origins reporting
+  284000 outvote one reporting 290000; the distinct-value
+  median would invent a number nobody reported), with >2 s
+  outliers dropped, and a bare `consensus_ms` exists only when
+  every variant context agrees within ±2 s; album_track
+  variants never collapse (`variants` carries each variant's
+  fingerprint, slots, and whether it settled), a variant-less
+  tracklist keys by its (disc count, track count) shape —
+  never one shared empty group — and a variant's fingerprint
+  is §7's (disc, position, normalized title) hash, computed
+  from the tracks' own name claims, so it compares directly
+  against a fetched tracklist's. Unverified cached claims
+  expire out of the view 90 days after their origin's
+  `asserted_at` (counted in `expired_claims`); strong-verified
+  claims do not expire on the timer. The merge is deterministic
+  and reputation-free; display ordering is a separate
+  presentation pass that PRESERVES tier precedence
+  (strong-verified, then plausible, then supported-unverified)
+  and lets reputation reorder only within the unverified,
+  unsupported tail.
+- **The depot projection (step 8's contract).** The full merged
+  record above is the node's INTERNAL contract — step 9's view
+  reads it from the querier directly. What the SoulSync-facing
+  routes serve (`POST /local/meta/query`, `GET
+  /local/meta/record/<entry>`) is a COARSE PROJECTION of it
+  (`project_for_depot`): per subject, `{version, subject, kind,
+  name, found, fields}` where each field carries its chosen
+  value (the display-ordered head), the field's `local_value`,
+  and one entry per distinct value reduced to `{value, tier,
+  local, support, support_label}` — support as a BUCKET
+  (`none` / `1-2` / `3+` — §9's buckets exactly; 1 and 2 are
+  never distinguishable on this surface), never a count;
+  album_track variants project per-track the same way (bucketed
+  support, tier, local, the §7 fingerprint). Three projection
+  rules bind what SoulSync may conclude: a field's head
+  (`value` / `tier` / `local`) LEADS WITH THE LOCAL VALUE when
+  one exists, regardless of tier ranking (display order still
+  governs the values list beneath); a strong verdict older
+  than the 90-day reliance window (`verification_stale`)
+  projects as tier `unverified` — the internal record keeps
+  the verdict and the flag for re-check, but the depot's
+  promotion floor reads projected tiers, so stale evidence
+  cannot promote; and `held` network years are NOT projected
+  at all — only local or MusicBrainz-sourced year values reach
+  SoulSync (§8). The projection
+  NEVER carries origin keys, batch ids, exact support counts or
+  report counts: §9 shows buckets to users, and SoulSync is a
+  user surface. The disambiguation settlement rides the
+  projection (provider ids are public identifiers, not
+  provenance).
+- **Verification (§7)** runs AFTER answers land — streamed
+  results are unverified first, verdicts upgrade the cache as
+  checks complete. Scheduling is RELIANCE-GATED: only subjects
+  an exact ask returned — plus the album subjects an artist
+  ask's disambiguation consulted (its closure) — are ever
+  scheduled. `record()` is a pure local read and schedules
+  nothing; subjects a text query merely resolved are bystanders
+  and are not verified until an ask relies on them. Fetchers: MusicBrainz (public API, the node's
+  configured pacing/user agent) and Deezer (public lookup, no
+  auth); Spotify is an explicit not-configured stub (its
+  credential route is an open sub-decision in the design).
+  STRONG requires a cross-match where both sides come from
+  provider responses — two providers agreeing on an ISRC, a
+  MusicBrainz response linking to the very Deezer id in hand, a
+  shared MBID — with titles/artists agreeing with the name
+  claim; duration within ±2 s only ever supports, and a duration
+  goes strong only riding a key-material cross-match. A single
+  response's agreement is PLAUSIBLE (name+duration class) and
+  never promotes. A fetched provider link (a link claim carrying
+  a strong verdict) settles same-name-artist disambiguation with
+  ONE album — but only when the album is one of the USER's: the
+  link row is the user's own, or it sits on an album in the
+  user's own library. A fetched link on a stranger's album
+  proves the link exists, not that it is about this user's
+  artist. `album_of` links earn that strong verdict from the
+  album response itself: the response carries its own artist id
+  (the Deezer album's artist object; the MusicBrainz release's
+  first artist-credit), and a claim matching both ends of it was
+  asserted by the provider. Unverified links settle display only, and only with
+  ≥3 distinct local albums behind one candidate; a shared
+  strong-verified MBID settles outright — "shared" meaning
+  shared with the user's own non-`network` data, never merely
+  agreed among network rows. Verification tries
+  EVERY claimed id of the relevant kind until one
+  identity-matches (the first id that merely resolves may be a
+  namesake), and MusicBrainz recordings carry their FULL ISRC
+  set — cross-matches and contradiction checks run against the
+  set, so a claim asserting a genuine second ISRC of the same
+  recording grades instead of failing. Track ids and ISRCs are
+  SETS, and a set member the cross-matched pair does not carry
+  is NOT a contradiction (a live/remaster/edit twin's true id
+  is simply not this pair's): it earns no verdict and no failed
+  check; only the recording MBID — canonical identity, not a
+  set member — keeps the contradiction path. A tracklist variant
+  naming a MusicBrainz release (`mb:<release_id>`) is graded
+  against THAT release's tracklist ALONE, fetched by name — no
+  fallback to the release-group pick or the Deezer edition,
+  which are different pressings; variant-less claims grade
+  against the album responses' tracklists. Named-variant claims
+  fingerprint PER ASSERTING ORIGIN, exactly like variant-less
+  ones: two origins asserting the same variant and agreeing
+  both verify, and one origin's extra or wrong slot poisons
+  only its own fingerprint. Verdicts live in
+  `claim_verdicts`, keyed by claim identity, never by batch id.
+  A verdict's `verified_at` is the EVIDENCE time — when the
+  provider responses the grading rests on were fetched — not
+  the grading moment, so the staleness window measures the age
+  of the evidence. Verdict writes are monotonic: a lesser grade
+  never overwrites a stronger verdict, a provider being
+  unreachable changes nothing, and only a CONTRADICTION (the
+  entity's identity established, the value different) clears a
+  verdict, through the failed-check path. Fetcher etiquette:
+  every response is cached 90 days in
+  `fetch_cache`; first checks read through the cache, but the
+  §6 reliance re-check and the §8 sanity re-check run FORCED
+  past it — a re-check that replays cached responses could
+  never overturn anything, and fresh verdicts computed from
+  fresh responses can and do overturn stored ones. A composite
+  album fetch whose tracklist call fails is NOT cached as a
+  success (the fetch fails outright rather than pose as an
+  album with no tracks); Deezer album tracklists paginate
+  past 100 tracks, and when the album body still reports more
+  tracks than were collected the payload records
+  `tracks_truncated`. All of the node's MusicBrainz traffic —
+  the §7 fetcher and the musicbrainz.py resolver alike — runs
+  through ONE shared pacer, so the node's aggregate rate
+  honors the ~1 req/s etiquette instead of doubling it per
+  client;
+  one provider's 404 is unreachable, not absence — absence is
+  §7.1's rule, and it is implemented: a PREVIOUSLY VERIFIED id
+  whose primary lookup is not-found, with a second independent
+  (provider, method) path agreeing not-found and no response in
+  the run asserting the value, loses its verdict and records a
+  FAILED check for its origin (absence is evidence, recorded as
+  such — without it a strong verdict for a deleted entity would
+  stay strong forever, since verdicts exempt claims from the
+  90-day expiry); another node's cached claims are never
+  deleted over it. A claim the providers contradict (with
+  the entity's identity established) clears its verdict and
+  records a FAILED check for its origin. Verification itself
+  is BOUNDED work: at most 200 network fetches per run and 40
+  per subject (fetch-cache hits are free), scheduled
+  best-evidence-first — subjects holding claims from standing
+  origins first, then by the best §9 reputation among their
+  asserting origins. A lookup that FAILS is negative-cached
+  for one hour (in the verifier's memory — the fetch store
+  holds responses only, per the honesty rule above), so a dark
+  provider is not re-asked on every ask. Claims are read
+  through §6's expiry predicate: an expired, unverdicted claim
+  is NEVER verified (a verdict would resurrect it), and only
+  fields §7 can grade at all (ids, duration, year, links,
+  album_track slots) hold a subject in the verification queue —
+  name, genres and display_name never receive verdicts and
+  never schedule work. `checks_passed` — the sanity gate's
+  currency — is credited on STRONG grades only: copying one
+  public id and having it confirmed at the plausible level
+  earns no trigger power.
+- **Reputation (§9) is local and small**: per origin key, counts
+  of §7 checks passed/failed (`reputation` table). It never
+  gates support or admission. It decides display ordering among
+  unverifiable values, cache eviction order under size pressure
+  (the answer cache prunes to 2,000 batches, lowest-reputation
+  origins' oldest first — and a pruned batch takes its verdicts
+  with it ONLY when the claim identity is gone from every
+  retained batch: verdicts are keyed by identity, so the same
+  origin's re-minted batch keeps the verdict its predecessor
+  earned), and the sanity-rule gate: a disputed
+  field may trigger one re-verification per origin per field per
+  24 h (`sanity_triggers`), and an origin with no passed check on
+  record can never trigger one. The sanity rule itself is
+  scoped to §8: it fires only for a field holding a prior
+  STRONG-VERIFIED value, only against NETWORK claims
+  challenging it (a dispute among unverified claims has no
+  verified truth to check against, and a challenge to the
+  LOCAL value alone is not the network's business), per
+  challenging origin, inside a ROLLING 24 h window (not a
+  calendar day — the day boundary allowed two triggers
+  minutes apart across midnight); album_track variant
+  conflicts can trigger it too.
+- **Surface.** `POST /local/meta/query` (local API key) takes
+  `{kind, mode: exact|text, subjects|terms, network?}` and
+  returns the merged records — as the coarse depot projection
+  above — plus `asked_network` and any `unresolved` entries.
+  The admission tallies (how many answering batches were
+  admitted or dropped) are exact counts and stay on the
+  node-internal status surface only; they never ride this
+  response. `GET
+  /local/meta/record/<entry>` returns one subject's merged view
+  from local data + cache, in the same projection — no relay
+  traffic, ever; the entry
+  may be a SoulID, a provider ref, or a legacy alias.
+  `meta_status` gains a `querier` block: cache size, legacy
+  alias count, revocation lists held (issuers, sequences, key
+  counts), and the verification backlog (unverified cached
+  claims, stale verdicts).
+- **Per-pool attestation selection.** A node binds its key per
+  pool, and the relay session runs on the FIRST joined pool (the
+  one whose token the session exchanges with). The responder and
+  builder therefore embed THAT pool's attestation; another
+  pool's is never substituted. When the session pool has
+  delivered none while another pool carries one, relay status
+  says so — the node's answers count zero support until the
+  session pool's own exchange delivers an attestation.
+- **The `network` source.** The §6 source enum includes
+  `network` (the §2.4 mark for depot-promoted values re-emitted
+  by SoulSync). A `network`-sourced claim validates, displays,
+  and can be strong-verified by this node's own checks — but it
+  counts zero support however it travels, and the re-serve rule
+  refuses it outright, bare ID links included: a promoted value
+  must never launder back into network truth.
+- **Known open edge — attestation window vs clock skew
+  (design question, no code).** §9 specifies no clock-skew
+  tolerance on the attestation window: a batch earns standing
+  only when its `asserted_at` falls inside the attestation's
+  `issued_at..expires`, with the receipt time capping the age
+  side. The lower edge is the sharp one: an honest origin whose
+  clock runs slow can keep asserting batches BEFORE its
+  attestation's `issued_at`, and every one of them earns zero
+  support until its clock or its next attestation catches up.
+  The failure is one-directional — skew can only ever COST an
+  origin support, never grant it — which is why it ships as a
+  known edge rather than a hole; whether §9 should admit a
+  small lower-edge tolerance (and what it would do to the
+  window's meaning) is an open design question.

@@ -321,6 +321,38 @@ def track_claims(item: dict[str, Any],
     return out
 
 
+def verified_legacy_alias(item: dict[str, Any],
+                          entity: str) -> tuple[str, str] | None:
+    """The row's verified legacy -> v2 mapping (§6), or None.
+
+    The export serves both ids for a row (`soul_id` +
+    `soul_id_legacy`, DESIGN §5.1); the mapping is only worth
+    learning when it is VERIFIED — the v2 id recomputed from the
+    row's own name parts (the same parts its name claim carries)
+    must equal the served `soul_id`. Anything else — no legacy id,
+    a legacy id equal to the v2 id, name parts that do not
+    recompute — teaches the node nothing."""
+    legacy = item.get("soul_id_legacy")
+    if not isinstance(legacy, str) or not legacy.strip():
+        return None
+    legacy = legacy.strip()
+    if not _usable(item) or legacy == item["soul_id"]:
+        return None
+    if entity == "artist":
+        name = str(item.get("name") or "")
+        parts = [name] if name.strip() else None
+    else:
+        artist = str(item.get("artist_name") or "")
+        title = str(item.get("title") or "")
+        parts = [artist, title] if artist.strip() and title.strip() \
+            else None
+    if parts is None:
+        return None
+    if meta_soulid.generate_soul_id(entity, *parts) != item["soul_id"]:
+        return None
+    return legacy, item["soul_id"]
+
+
 def claims_for(entity: str, item: dict[str, Any],
                album_variants: dict[str, str],
                album_sources: dict[str, str],
@@ -470,6 +502,13 @@ class LibraryBuilder:
         except meta_claims.ClaimError:
             self.totals["items_skipped"] += 1
             return owner, None
+        # §6: a row serving both ids teaches the alias table — but
+        # only a VERIFIED mapping (the v2 id recomputes from the
+        # row's name parts), and only for a row whose claims this
+        # build actually stands behind.
+        alias = verified_legacy_alias(item, entity)
+        if alias is not None:
+            self.store.learn_legacy_alias(alias[0], alias[1])
         self.totals["claims_built"] += len(claims)
         self.totals["rows"] += 1
         # The variant/source maps are recorded only for an album that

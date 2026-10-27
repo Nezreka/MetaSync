@@ -1015,3 +1015,189 @@ class RelayRoundTripTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProviderIndexKindTest(unittest.TestCase):
+    """Gate minor: provider refs carry the kind of the entity
+    they name, and kind-scoped resolution matches within kind —
+    a Deezer artist id must never resolve an album or track
+    subject through a numeric collision."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.identity = NodeIdentity(key="ee" * 32)
+        self.store = MetaStore(self.tmp.name)
+        self.artist = S.generate_soul_id("artist", "Radiohead")
+        self.album = S.generate_soul_id(
+            "album", "Radiohead", "OK Computer")
+        self.track = S.generate_soul_id(
+            "track", "Radiohead", "Airbag")
+
+        def claim(subject, kind, field, value, source):
+            return {"subject": subject, "kind": kind,
+                    "field": field, "value": value, "source": source,
+                    "soulid_version": C.SOULID_VERSION}
+
+        # One Deezer number, three kinds of entity.
+        self.store.replace_owner_claims(
+            "seed:kinds", [
+                claim(self.artist, "artist", "name", ["Radiohead"],
+                      "file_tags"),
+                claim(self.artist, "artist", "deezer_id", "399",
+                      "deezer"),
+                claim(self.album, "album", "name",
+                      ["Radiohead", "OK Computer"], "file_tags"),
+                claim(self.album, "album", "deezer_id", "399",
+                      "deezer"),
+                claim(self.track, "track", "name",
+                      ["Radiohead", "Airbag"], "file_tags"),
+                claim(self.track, "track", "deezer_id", "399",
+                      "deezer"),
+            ], self.identity.public_key_b64url,
+            self.identity.signing_private_key)
+
+    def test_unfiltered_resolution_is_unchanged(self):
+        self.assertEqual(
+            set(self.store.resolve_provider_ref("deezer:399")),
+            {self.artist, self.album, self.track})
+
+    def test_resolution_matches_within_kind(self):
+        self.assertEqual(
+            self.store.resolve_provider_ref("deezer:399", "artist"),
+            [self.artist])
+        self.assertEqual(
+            self.store.resolve_provider_ref("deezer:399", "album"),
+            [self.album])
+        self.assertEqual(
+            self.store.resolve_provider_ref("deezer:399", "track"),
+            [self.track])
+
+    def test_responder_resolution_is_kind_scoped_by_the_query(self):
+        responder = Responder(self.store, self.identity,
+                              mode_provider=lambda: "leech")
+        self.assertEqual(
+            responder._resolve_exact(
+                {"kind": "track", "subjects": ["deezer:399"]}),
+            [self.track])
+        self.assertEqual(
+            responder._resolve_exact(
+                {"kind": "artist", "subjects": ["deezer:399"]}),
+            [self.artist])
+
+    def test_link_resolution_follows_the_subjects_kind(self):
+        # Gate r2: EVERY index row matches on the SUBJECT's kind,
+        # a link's to-end included. The album answers an ALBUM ask
+        # through its album_of link — that traversal is the honest
+        # case, the subject IS an album in an album ask — but a
+        # track or artist ask for the artist's number must not
+        # pull the album in: the old link_to exemption did, and
+        # manufactured an album record under the asked kind.
+        def claim(subject, kind, field, value, source):
+            return {"subject": subject, "kind": kind,
+                    "field": field, "value": value, "source": source,
+                    "soulid_version": C.SOULID_VERSION}
+
+        self.store.replace_owner_claims(
+            "seed:links", [
+                claim(self.album, "album", "provider_link",
+                      {"provider": "deezer", "from_id": "3135556",
+                       "to_kind": "artist", "to_id": "777",
+                       "relation": "album_of"}, "deezer"),
+            ], self.identity.public_key_b64url,
+            self.identity.signing_private_key)
+        self.assertEqual(
+            self.store.resolve_provider_ref("deezer:777", "album"),
+            [self.album])
+        self.assertEqual(
+            self.store.resolve_provider_ref("deezer:777", "track"),
+            [])
+        self.assertEqual(
+            self.store.resolve_provider_ref("deezer:777", "artist"),
+            [])
+        self.assertEqual(
+            self.store.resolve_provider_ref("deezer:777"),
+            [self.album])
+
+    def test_album_of_target_does_not_answer_other_kinds(self):
+        # The regression in its exact shape: deezer:399 is the
+        # artist's number (id claims on all three kinds in setUp)
+        # and the album's album_of points at it. A track ask for
+        # deezer:399 resolves the TRACK through its own id claim
+        # — never the album through the link's to-end.
+        def claim(subject, kind, field, value, source):
+            return {"subject": subject, "kind": kind,
+                    "field": field, "value": value, "source": source,
+                    "soulid_version": C.SOULID_VERSION}
+
+        self.store.replace_owner_claims(
+            "seed:links", [
+                claim(self.album, "album", "provider_link",
+                      {"provider": "deezer", "from_id": "3135556",
+                       "to_kind": "artist", "to_id": "399",
+                       "relation": "album_of"}, "deezer"),
+            ], self.identity.public_key_b64url,
+            self.identity.signing_private_key)
+        self.assertEqual(
+            self.store.resolve_provider_ref("deezer:399", "track"),
+            [self.track])
+        self.assertEqual(
+            self.store.resolve_provider_ref("deezer:399", "album"),
+            [self.album])
+        self.assertEqual(
+            self.store.resolve_provider_ref("deezer:399", "artist"),
+            [self.artist])
+
+
+class PruneVerdictPreservationTest(unittest.TestCase):
+    """Gate SF-9: cache pruning deletes a verdict only when its
+    claim identity is gone from EVERY retained batch — the same
+    origin's re-minted batch keeps the verdict."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.store = MetaStore(self.tmp.name)
+        self.origin = NodeIdentity(key="aa" * 32)
+        self.track = S.generate_soul_id("track", "Radiohead",
+                                        "Airbag")
+        self.now = 1_800_000_000.0
+
+    def _batch(self, asserted_at):
+        claims = [
+            {"subject": self.track, "kind": "track", "field": "name",
+             "value": ["Radiohead", "Airbag"], "source": "file_tags",
+             "soulid_version": C.SOULID_VERSION},
+            {"subject": self.track, "kind": "track", "field": "isrc",
+             "value": "GBAYE9700182", "source": "file_tags",
+             "soulid_version": C.SOULID_VERSION},
+        ]
+        batch = C.make_batch(self.origin.public_key_b64url, claims,
+                             asserted_at=int(asserted_at))
+        return C.sign_batch(self.origin.signing_private_key, batch)
+
+    def _verdict(self):
+        from metasync_node.meta.store import value_key
+        verdicts = self.store.verdicts_for_subjects([self.track])
+        return verdicts.get((self.origin.public_key_b64url,
+                             self.track, "isrc",
+                             value_key("GBAYE9700182")))
+
+    def test_verdict_survives_while_identity_is_retained(self):
+        self.store.put_cached_batch(self._batch(self.now - 3600),
+                                    received_at=self.now - 3600)
+        self.store.put_cached_batch(self._batch(self.now - 60),
+                                    received_at=self.now - 60)
+        self.store.set_verdict(
+            self.origin.public_key_b64url, self.track, "isrc",
+            "GBAYE9700182", "strong-verified", self.now - 30,
+            "verified")
+        dropped = self.store.prune_answer_cache(1)
+        self.assertEqual(dropped, 1)
+        # One batch is gone; the identity is still held by the
+        # retained (re-minted) batch, so the verdict survives.
+        self.assertIsNotNone(self._verdict())
+        dropped = self.store.prune_answer_cache(0)
+        self.assertEqual(dropped, 1)
+        # Now the identity is gone entirely: the verdict goes.
+        self.assertIsNone(self._verdict())

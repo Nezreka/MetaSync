@@ -215,15 +215,42 @@ class Responder:
                 ref = _normalize_provider_ref(entry)
                 if ref is not None:
                     refs.append(ref)
+        # §6: a legacy subject resolves ONLY through a verified
+        # alias this node learned from its own export — it is
+        # translated to the v2 subject it names (the answer carries
+        # the v2 subject's claims; a legacy id is never itself a
+        # claim subject). No verified mapping: the entry stays as
+        # given and simply matches nothing — silence, not a guess.
+        translated: list[str] = []
+        for subject in subjects:
+            if meta_claims.is_subject_id(subject):
+                translated.append(subject)
+                continue
+            mapped = self.store.legacy_subject(subject)
+            translated.append(mapped if mapped is not None else subject)
         # Input cap, in design order: plain subjects take the budget
-        # first, provider refs get what remains.
+        # first, provider refs get what remains. Refs resolve
+        # WITHIN the query's kind when it names one (gate minor,
+        # tightened by gate r2): providers number artists, albums
+        # and tracks separately, so an artist's id must never
+        # resolve an album or track subject through a numeric
+        # collision — and the store matches on the SUBJECT's kind
+        # for every index row, a provider_link's to-end included:
+        # an album answers an album ask through its album_of link,
+        # never a track ask for the artist's number.
+        kind = query.get("kind")
+        kind = kind if kind in meta_claims.KINDS else None
         ordered: list[str] = []
-        for subject in subjects[:MAX_QUERY_SUBJECTS]:
+        for subject in translated[:MAX_QUERY_SUBJECTS]:
             if subject not in ordered:
                 ordered.append(subject)
         remaining = MAX_QUERY_SUBJECTS - len(ordered)
         for ref in refs[:remaining]:
-            for subject in self.store.resolve_provider_ref(ref):
+            if kind is not None:
+                found = self.store.resolve_provider_ref(ref, kind)
+            else:
+                found = self.store.resolve_provider_ref(ref)
+            for subject in found:
                 if subject not in ordered:
                     ordered.append(subject)
         return ordered
