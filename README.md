@@ -23,7 +23,6 @@ described below.
 | [`node/`](node/) | **MetaSync itself** — the program you run next to your SoulSync (Python, own web UI on port 8790, Docker or bare metal). It reads your SoulSync locally, computes the weekly signals, sends them to the pools you joined, and offers the network's charts to your SoulSync, which shows them as playlists you can open. |
 | [`src/sin`](src/sin) | The SIN pool server (the backend behind the portal's pool URL). Takes reports, folds them into counts, and builds the charts. |
 | [`portal/`](portal/) | The website — [metasync.ssync.net](https://metasync.ssync.net) — where you sign in, create your pool key, and approve your node. |
-| [`src/metasync`](src/metasync) | A second, future network (a shared *metadata* service keyed by SoulID). Scaffold only — not part of the beta, and not used by SIN. |
 
 ## Join the beta
 
