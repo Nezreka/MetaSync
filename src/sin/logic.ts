@@ -979,6 +979,7 @@ export const USER_TOKEN_SCOPES = [
   "index:read",
   "playlists:read",
   "whoami:read",
+  "meta:read",
 ] as const;
 
 /** Scopes the official MetaSync receives when it exchanges its admin

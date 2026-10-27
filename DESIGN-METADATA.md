@@ -583,7 +583,10 @@ construction where only policy exists.
 **Messages** (JSON over the connection; a binary framing is a later
 optimization, not a v1 need):
 
-- `hello` — node key, protocol version, node mode (§9). Relay
+- `hello` — node key, protocol version, node mode (§9). Before it,
+  the relay issues a per-connection **challenge** (a random nonce,
+  single-use); the hello's node signature must bind that nonce, so
+  a captured hello cannot be replayed on a fresh connection. Relay
   replies `welcome` with the current peer count (coarse: exact
   under 100, rounded above — the count is a presence hint, not a
   census) or `refused` with a reason class.
