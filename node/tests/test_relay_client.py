@@ -1395,5 +1395,60 @@ class TestProtocolV2(RelayClientCase):
         self.assertLess(time.monotonic() - started, 10.0)
 
 
+class TestDefaultRelayUrl(unittest.TestCase):
+    """Step 7: the production relay URL ships as the node's default.
+    A settings dict with no meta_relay_url at all dials
+    wss://relay.ssync.net; an explicitly stored value — including
+    an explicitly blanked one — always wins."""
+
+    def _service(self) -> NodeService:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        identity = NodeIdentity(key=secrets.token_hex(32))
+        store = Store(tmp.name)
+        config = Config(state_dir=tmp.name, musicbrainz_min_interval_s=0.0, http_timeout_s=5)
+        return NodeService(
+            config,
+            store=store,
+            identity=identity,
+            pool_clients={},
+            env={},
+        )
+
+    def test_unset_setting_gets_the_shipped_default(self):
+        service = self._service()
+        self.assertNotIn("meta_relay_url", service.store.settings)
+        self.assertEqual(service._meta_relay_url(), "wss://relay.ssync.net")
+        self.assertEqual(
+            service.relay_status()["relay_url"], "wss://relay.ssync.net"
+        )
+
+    def test_explicit_setting_wins(self):
+        service = self._service()
+        service.store.settings["meta_relay_url"] = "wss://relay.example:8791"
+        self.assertEqual(service._meta_relay_url(), "wss://relay.example:8791")
+
+    def test_explicitly_blanked_setting_stays_blank(self):
+        service = self._service()
+        service.store.settings["meta_relay_url"] = ""
+        self.assertEqual(service._meta_relay_url(), "")
+
+    def test_null_setting_resolves_to_no_dial(self):
+        # A stored null (a settings round-trip dropped the value)
+        # is not a deliberate blanking, but it must fail closed:
+        # no URL, and with the network switch on the service still
+        # starts no client — it must NOT fall back to the default.
+        service = self._service()
+        service.store.settings["meta_relay_url"] = None
+        self.assertEqual(service._meta_relay_url(), "")
+        service.store.settings["meta_network"] = True
+        status = service.sync_relay_client()
+        # ("enabled" in the status mirrors the meta_network switch
+        # itself; the pin here is that no client ever starts.)
+        self.assertIsNone(service._relay_client)
+        self.assertFalse(status["connected"])
+        self.assertEqual(status["relay_url"], "")
+
+
 if __name__ == "__main__":
     unittest.main()

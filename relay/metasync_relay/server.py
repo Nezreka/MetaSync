@@ -1198,6 +1198,19 @@ async def start_server(relay: Relay, host: str, port: int):
             "the only revocation gate for this relay",
             extra={"error_class": "revocations_unconfigured"},
         )
+    elif not relay.revocations.url:
+        # Issuer set, feed URL absent: the feed object exists, so
+        # the warning above stays silent — but a feed with no URL
+        # never fetches, so the relay holds an empty list and its
+        # hello/reauth revocation checks enforce nothing. That
+        # state gets its own loud line (the production config sits
+        # here until the portal revocation endpoint ships).
+        log.warning(
+            "revocation_feed_unconfigured: an issuer id is set but "
+            "no RELAY_REVOCATIONS_URL; the relay holds an empty "
+            "revocation list and fetches nothing",
+            extra={"error_class": "revocation_feed_unconfigured"},
+        )
     server = await _ws_serve(
         relay.handle_connection,
         host,

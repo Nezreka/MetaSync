@@ -136,6 +136,7 @@ is missing or malformed, and says which one (never its value).
 | `RELAY_GRACE_SECONDS` | no | `10` | Post-window grace for late answers |
 | `RELAY_SEND_TIMEOUT_SECONDS` | no | `5` | Per-send timeout on connection send queues |
 | `RELAY_SEND_QUEUE_MESSAGES` | no | `128` | Per-connection send queue depth |
+| `RELAY_SEND_QUEUE_BYTES` | no | `16777216` | Per-connection send queue byte cap (16MB; the burst headroom the Fly VM is sized for — see the `[[vm]]` comment in fly.toml) |
 | `RELAY_MAX_VIOLATIONS` | no | `10` | Live violations before the relay closes a connection |
 | `RELAY_VIOLATION_DECAY_SECONDS` | no | `3600` | How long a strike stays live |
 | `RELAY_REAUTH_GRACE_SECONDS` | no | `30` | Grace after token expiry for a re-auth to land |
@@ -161,6 +162,393 @@ It must run somewhere always-on with a public address: nodes in homes
 cannot accept inbound connections, which is the entire reason the
 relay exists. It cannot be a Neon function, because those sleep
 between requests and the relay holds connections open.
+
+## Deploying on Fly.io
+
+The production relay is ONE always-on Fly.io machine, configured by
+`fly.toml` in this directory. Everything below is run from `relay/`.
+The account is Boulder's. Deployment is one command, always with
+the same flag — `fly deploy --ha=false` — and the FIRST deploy
+adds a count check (step 3), because Fly's defaults create
+machines in ways this app cannot tolerate. Why `--ha=false` rides
+every deploy, not just the first, is in "Day to day".
+
+Why one machine, and why Fly's defaults had to be overridden, is
+commented line by line in `fly.toml`. The short version: presence
+and every node's socket live in this process's memory, so the
+machine never sleeps (`auto_stop_machines = "off"`,
+`min_machines_running = 1`), the connection limits are set in the
+thousands (Fly's unset default soft limit is 20), and the machine
+count is held at 1 — two machines would split the network in
+half with no way to join the halves. Note that fly.toml cannot
+pin the count itself: Fly decides it at deploy time, which is
+why step 3 below exists.
+
+### From account-ready to live
+
+1. `fly auth login`, then create the app:
+   `fly apps create metasync-relay`
+   (if the name is taken, choose another and update `app =` in
+   fly.toml — the name is not part of the protocol).
+2. Set the one required secret — the pool (issuer) PUBLIC key, the
+   public half of the SIN function's `SIN_TOKEN_PRIVATE_KEY`, in
+   the same formats the node accepts for `meta_issuer_public_key`
+   (base64url of the raw 32 bytes, or PEM):
+   `fly secrets set RELAY_POOL_PUBLIC_KEY=<public key>`
+   Get the value from SIN itself: `GET /v1/auth/public-key` on the
+   SIN function returns `{"public_key": <base64url>}` — that
+   response is the source for this secret AND for a node's
+   `meta_issuer_public_key` (step 5). Do not transcribe the key
+   from anywhere else.
+   The relay refuses to start without it; that is deliberate.
+3. First deploy — with the machine count pinned, BEFORE the
+   domain step. Fly's default for an HTTP/TCP-service app is
+   high availability: TWO machines on the first deploy, and
+   fly.toml has no way to pin the count — it is decided here,
+   at deploy time. Two machines would each hold half the
+   network's WebSockets with no join between the halves, and
+   with auto-stop off a spare created now would live forever.
+   So:
+   - `fly deploy --ha=false`
+   - Confirm exactly one machine exists and is up BEFORE going
+     on: `fly scale show` (count 1) and `fly status` (one
+     machine, started). If anything ever shows more, run
+     `fly scale count 1` immediately; see the one-machine rule
+     in fly.toml.
+   Deploying before the certificate exists is harmless: the
+   machine boots with the final origin already in its config
+   (step 4 explains why that value matters), but nothing can
+   dial that origin until DNS points at Fly — and a smoke test
+   is only meaningful once the count is known to be 1.
+4. Custom domain. The relay's identity (`RELAY_ORIGIN` in
+   fly.toml) is bound into every v2 hello signature, and nodes
+   sign for the origin they dialed — so the production origin
+   is the custom domain from the very first boot (it already
+   is: the step 3 deploy carried it), and the `<app>.fly.dev`
+   hostname is never a working v2 address once this is set
+   (its hellos sign for the wrong origin and are refused).
+   - `fly certs add relay.ssync.net`
+   - In Cloudflare DNS for ssync.net, add the records Fly prints:
+     the `relay` CNAME to `<app>.fly.dev` with the proxy OFF
+     (DNS only — a proxied record breaks Fly's certificate
+     validation and the WebSocket path), plus the ACME challenge
+     record if Fly asks for one.
+   - Wait until `fly certs show relay.ssync.net` reports the
+     certificate issued.
+5. Smoke test with a real node. Two preconditions, both easy to
+   miss:
+   - The node must have JOINED the pool with its pool key AND had
+     its binding APPROVED in the portal. An unapproved node gets
+     a 202 `binding_pending` from the token exchange and no token
+     at all — it can never reach the relay, and no relay-side
+     debugging will show why.
+   - The step 4 certificate must report issued and DNS must be
+     live. The node release carrying the shipped default URL is
+     only useful once that is true: the default IS the custom
+     domain, so before cert + DNS the default points nowhere.
+   Then: leave the node's `meta_relay_url` unset (it now defaults
+   to `wss://relay.ssync.net`), set `meta_issuer_public_key` from
+   `GET /v1/auth/public-key` (step 2), turn `meta_network` on,
+   and read the node's relay status (`connected`, `peers`,
+   `last_error`):
+   - **Success:** `connected: true` with `peers` a whole number
+     (0 is fine — you may be the only node). The node refuses any
+     welcome that is not v2, so a connected session IS a v2
+     session; status carries no version field.
+   - **`connected: false`, `last_error: "token: …"`:** the node
+     never reached the relay — it could not get an access token
+     from the pool, so it never dialed. The common case is the
+     binding: `"token: waiting for approval in the portal — no
+     access token has been issued"` means the exchange answered
+     202 `binding_pending`. Approve the binding in the portal
+     (compare the fingerprint the node's status shows), then do
+     nothing: the node retries the exchange on its own, with
+     backoff that tops out at a minute, and connects once the
+     token lands. `"token: pool access token does not carry
+     the meta:read scope"` means the pool issued the node a
+     token without the metadata scope — the node checks the
+     scope itself before it ever dials, so this never reaches
+     the relay; it is a pool-side issuance problem, and the
+     node's pool status shows what the exchange last returned.
+     Any other `token: …` suffix is an exchange-side failure
+     (pool unreachable, pool key rejected); the node's pool
+     status carries which.
+   - **`connected: false`, `last_error: "refused: auth"`:** the
+     relay checked the hello and refused it. Every cause lands
+     in this one reason class, and `fly logs` cannot separate
+     them — a refusal logs only `error_class=auth`. The causes,
+     each with the check that actually narrows it down:
+     - **Wrong origin:** the node dialed a name other than the
+       one in `RELAY_ORIGIN` (the v2 hello is signed for the
+       origin the node dialed; see the fly.dev section below).
+       Check the node's effective relay URL.
+     - **Clock skew:** the hello carries the node's timestamp,
+       and more than five minutes from the relay's clock
+       refuses. Check the node host's clock — it is the first
+       check because it is the one cause visible from the node
+       alone.
+     - **Revoked key:** the issuer's signed revocation list
+       names this node. Check the key's state in the portal.
+       (Not yet a possible cause on the Fly deployment: no
+       `RELAY_REVOCATIONS_URL` is configured there, so the
+       list the relay checks is empty.)
+     - **A token the relay cannot verify:** issued by a
+       different pool than the relay's `RELAY_POOL_PUBLIC_KEY`,
+       or expired. Confirm the relay secret came from
+       `GET /v1/auth/public-key` on the same pool the node
+       belongs to (step 2). The node re-exchanges as its token
+       ages, so a pure expiry refusal clears on its own.
+     - **Issued for a different node key than the node
+       presents:** a pool-side issuance problem; the node's
+       pool status shows what the exchange last returned.
+     - **A relay with no `RELAY_ORIGIN`:** a relay run
+       without one refuses every v2 hello as auth — it will
+       not derive its identity from request headers. fly.toml
+       sets it, so this cannot happen on Fly, only on a plain
+       `docker run` that forgot the variable; check the
+       relay's environment.
+     A token missing the `meta:read` scope never gets here
+     either — the node checks the scope before dialing and
+     reports it as `token: …` above. (The relay refuses a
+     wrong-scope token too, but only if the exchange's
+     response disagreed with the signed token.)
+     An unbound or unapproved node never gets here — it holds
+     no token, and shows as `token: …` above.
+   - **`last_error: "refused: version"`:** the relay answered but
+     did not negotiate v2 — it is running pre-v2 code. Upgrade
+     the relay; the node will not degrade to v1.
+   - **`last_error: "connect: …"`:** the session never got
+     established. The suffix separates the sub-cases:
+     - An OS or TLS error as the suffix: the WebSocket never
+       opened — DNS, TLS (certificate not issued yet), or the
+       machine/proxy down. Check `fly status` and
+       `fly certs show`.
+     - A bare `"connect: "` (empty suffix): the socket opened
+       but no welcome arrived within 30 seconds — something
+       accepted the connection and then said nothing. Check
+       `fly logs` for the relay's periodic counters line: its
+       absence means the relay process is not the thing
+       answering on that port.
+     - `"connect: relay did not open with a challenge"`:
+       something answered that does not speak the relay
+       protocol — it never even sent the opening challenge.
+       Same first check as the not-welcome case below: what
+       the dialed name actually resolves to.
+     - `"connect: relay hello reply was …, not welcome"`:
+       something answered that does not speak the relay
+       protocol — the wrong service is on the address, or a
+       proxy is mangling the upgrade. Check what the dialed
+       name actually resolves to.
+     A transport drop AFTER a session was established also
+     lands here, with the drop's error as the suffix. The node
+     reconnects on its own, so a drop that does not repeat is
+     noise, not a smoke-test failure.
+   - `meta_issuer_public_key` has NO effect on connecting: a
+     wrong or missing one drops attestations and revocation
+     lists on the node side, but the session still connects. If
+     the session is up, that setting is not your problem.
+
+### If a node was ever pointed at the fly.dev name
+
+A stored `meta_relay_url` wins over the shipped default —
+forever. A node whose settings once carried
+`wss://<app>.fly.dev` (from an early test, say) keeps dialing it:
+it signs its v2 hello for the fly.dev origin, the relay's
+identity is `wss://relay.ssync.net`, and the hello is refused.
+The node looks healthy in every other way; it just never gets a
+v2 session. There is no UI field for this setting, so the fix
+is by hand — and order matters: STOP the node first, then edit,
+then start it. (A running node rewrites `settings.json` from its
+in-memory settings whenever it saves, silently overwriting a
+hand edit.) With the node stopped, in its state directory edit
+`settings.json` — either delete the `meta_relay_url` key (the
+node falls back to the shipped default, `wss://relay.ssync.net`)
+or set it to `wss://relay.ssync.net` — then start the node.
+
+### Day to day
+
+- **Logs:** `fly logs`. By the no-storage rule these carry
+  connection counts, error classes, and the aggregate counters
+  line (queries routed, answers forwarded, bytes, active
+  connections, share of queries answered) — never node ids, never
+  content. If a log line ever shows more, that is a bug.
+- **Restarts and deploys:** deploy with plain
+  `fly deploy --ha=false`. Fly's default strategy (rolling)
+  updates the existing machine IN PLACE: the process restarts on
+  the same machine, presence empties, every socket drops, and
+  nodes reconnect on their own (step 3 transport) — a brief
+  blip, not an outage. Rolling creates no second machine; the
+  strategies that ADD machines are `bluegreen` and `canary`,
+  and neither is ever used here (two machines is a split
+  network, each serving only its own nodes). Two rules ride
+  every deploy:
+  - `--ha=false` is on EVERY deploy command, not just the
+    first. It only matters when a deploy creates machines — and
+    if this machine is ever lost (destroyed, host failure), the
+    next deploy starts from zero, where the high-availability
+    default would create TWO.
+  - **Escape hatch:** `fly deploy --ha=false --strategy
+    immediate` skips flyctl's wait for the machine to report
+    started. That wait is the ONLY difference between the two
+    strategies here: with one machine updated in place and
+    health checks deliberately unconfigured (the relay has no
+    HTTP surface to check — see fly.toml), neither strategy
+    keeps the old release running while the new one proves
+    itself; the old process is gone before anything could
+    check its replacement. A broken release goes live under
+    rolling too — recovery is the rollback below, not the
+    deploy strategy. Use immediate only when a normal deploy
+    is stuck, never as the habit.
+- **Rollback:** `fly releases` lists deploy images; redeploy the
+  previous one with
+  `fly deploy --ha=false --image <previous image ref>`
+  (or check out the previous relay/ state and
+  `fly deploy --ha=false`).
+- **Cost shape:** the machine is most of the bill (a few dollars
+  a month); at the design's message sizes, bandwidth is noise.
+  The machine is sized `shared-cpu-1x` with 1GB — not for idle
+  presence, which is nearly free, but for the relay's own
+  send-queue caps at burst time (see the `[[vm]]` comment in
+  fly.toml).
+
+## Portal follow-up: attestation issuance and the revocation feed
+
+Two portal-side pieces pair with this deployment. They are NOT
+built yet — as of this writing there is no attestation or
+revocation code anywhere in `src/sin/` or the portal — but both
+consumers are finished and waiting, and this section pins the
+contract so the follow-up build has no open questions. Nothing in
+the relay or the node needs to change when these ship.
+
+### One issuer, one key, one id
+
+In v1 the pool is the only issuer: the SIN function signs access
+tokens, binding attestations, and revocation lists with ONE
+Ed25519 key — the one already in its environment as
+`SIN_TOKEN_PRIVATE_KEY` (see `loadPoolTokenPrivateKey` in
+`src/sin/logic.ts`). No new secret is needed. Its public half is
+what nodes hold as `meta_issuer_public_key` and what the relay
+takes as `RELAY_POOL_PUBLIC_KEY` (and, unset,
+`RELAY_ISSUER_PUBLIC_KEY` falls back to it). SIN already serves
+that public half: `GET /v1/auth/public-key` returns
+`{"public_key": <base64url>}` — it is the source for both the
+relay secret and the node's setting (runbook step 2).
+
+The `issuer` string is the same in every signed object. No code
+pins its value today (the conformance vectors use a synthetic
+`"issuer-1"`). fly.toml adopts `RELAY_ISSUER_ID = "metasync"`;
+the portal build must sign with exactly that string, and it must
+never change afterwards — attestations and lists naming any other
+issuer are dropped by verifiers holding this one.
+
+### Attestation issuance (at the token exchange)
+
+The node already consumes this: on every successful exchange it
+looks for an `attestation` field in the response, verifies it
+against the issuer key (shape, signature, and that it names THIS
+node's key), and stores it for embedding in batch headers
+(`node/metasync_node/pool.py`, `_note_attestation`; the pinned
+format is `node/metasync_node/attestation.py`). An absent or
+unverifiable attestation is dropped silently — a pool that does
+not emit the field changes nothing for nodes, which is why this
+can ship after the relay does. It gates STANDING (§9), not
+connectivity.
+
+The portal change, in `POST /v1/auth/exchange`
+(`src/sin/index.ts`), on the existing 200 success response only
+(never on the 202 binding-pending or any error response):
+
+- Add `attestation` alongside the current fields
+  (`access_token`, `token_type`, `expires_at`, `scopes`,
+  `key_prefix`, `node_id`), only for a BOUND key:
+  - Exchanges authenticated with ENV credentials (the admin and
+    shared tokens) have no portal row and no `bound_at`: they
+    receive NO attestation, and that path never earns standing —
+    the operator's own admin node included. Do not define an
+    attestation for that case; standing is a property of a
+    portal-bound key with a binding time, and env credentials
+    have neither.
+  - `issuer`: the issuer id above.
+  - `node_key`: base64url (unpadded) of the raw 32-byte Ed25519
+    public key the key is bound to. REBUILD it from the decoded
+    raw bytes — decode `bound_node_public_key` to the 32 bytes
+    and re-encode canonically — never copy the stored column
+    verbatim: that column holds the `X-Node-Public-Key` header
+    string exactly as the node sent it at binding time,
+    un-normalised, and the node checks `node_key` against its
+    own key byte for byte.
+  - `bound_at`: integer Unix epoch seconds DERIVED FROM
+    `portal_keys.bound_at` (migration 0004) — the row stores a
+    timestamptz, so the issuer converts it; the value on the
+    wire is an int, never a timestamp string. This is not a
+    style point: the node demands an int epoch here and
+    silently drops an attestation carrying any other shape
+    (`node/metasync_node/attestation.py`). It never moves
+    across renewals — standing is computed from it — so always
+    derive it from the row, never substitute the current time.
+  - `issued_at`: now, Unix seconds. `expires`: `issued_at` +
+    7 days (§9's lifetime; nodes accept windows up to 14 days).
+  - `sig`: base64url (unpadded) Ed25519 signature, with the pool
+    key, over exactly these bytes (six lines, each
+    newline-terminated including the last):
+    `metasync-attestation\n<issuer>\n<node_key>\n<bound_at>\n<issued_at>\n<expires>\n`
+    `node/tests/test_meta_conformance.py` pins these bytes
+    literally; the TypeScript issuer must reproduce them byte for
+    byte and pin the same vectors in its own tests.
+- Optionally, the same response may carry `revocations`: the
+  current signed list object defined below. The node applies it
+  to its shared revocation store at its sequence
+  (`_note_revocations`). This is the design's primary delivery
+  channel (§10: the exchange is the issuer's own endpoint, which
+  bounds a withheld revocation's delay to one token lifetime).
+
+### The revocation feed (the relay's copy)
+
+The relay ALREADY fetches this (`RevocationFeed` in
+`revocations.py`): a plain HTTPS GET with `Accept:
+application/json`, a 10-second timeout, and a 4 MiB body cap,
+every `RELAY_REVOCATIONS_INTERVAL_SECONDS` (default 300). The
+node's enforcement mirrors the same shape. What is missing is
+only an endpoint that serves the list.
+
+- Path: the relay fetches whatever `RELAY_REVOCATIONS_URL`
+  names, so the path is the follow-up's choice. Proposed:
+  `GET /v1/meta/revocations` on the SIN function; when it ships,
+  set `RELAY_REVOCATIONS_URL` to its full URL and redeploy.
+- Response: 200 JSON, the BARE list object — no envelope:
+  `{issuer, seq, issued_at, keys, sig}`.
+  - `issuer`: the issuer id above. The relay is configured with
+    it (`RELAY_ISSUER_ID`) and drops lists naming anyone else.
+  - `seq`: per-issuer sequence, strictly increasing. The portal
+    must PERSIST the counter and increment it on every change to
+    the list; relays and nodes apply a list only when its `seq`
+    exceeds the highest they have seen, so a reused or regressed
+    sequence is silently ignored by design.
+  - `issued_at`: Unix seconds the list was issued.
+  - `keys`: the revoked node ids — each the lowercase hex
+    SHA-256 of a node's public key (64 hex chars). Key status
+    only: unbound and deleted keys belong on the list too
+    (§10), never account information.
+  - `sig`: base64url (unpadded) Ed25519 signature, with the pool
+    key, over the canonical text (context line, issuer, seq,
+    issued_at, then the sorted de-duplicated keys, one per
+    line, newline-terminated): pinned byte for byte in
+    `relay/metasync_relay/revocations.py` (`list_signing_text`),
+    mirrored in `node/metasync_node/revocations.py`, with shared
+    conformance vectors on both sides.
+- A list that fails verification is treated as NO list (the
+  holder keeps whatever it already had). An empty `keys` array
+  is a valid, signable list.
+
+### Known gap this does not close
+
+Standing only works for a node whose `meta_issuer_public_key`
+setting holds the pool public key — without it the node drops
+attestations and lists (the relay still enforces its own verified
+copy at hello). Today that setting is manual. Shipping a default
+for it, or delivering the key through the pool connection, is a
+node-side decision still owed before the closed beta leans on
+standing; it is not part of the portal build above.
 
 ## Tests
 

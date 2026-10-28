@@ -1,0 +1,141 @@
+# MetaSync metadata relay — the production switchboard
+# (DESIGN-METADATA.md section 10, build step 7). The app root is
+# this directory: run flyctl from relay/. Deploy steps live in
+# README.md, "Deploying on Fly.io".
+#
+# THE ONE-MACHINE RULE: this app runs EXACTLY ONE machine, forever,
+# until the design says otherwise. The relay holds every connected
+# node's WebSocket and the whole presence table in process memory.
+# Two machines each see only the nodes connected to them: a question
+# landing on one never reaches owners connected to the other, and
+# nothing joins the two halves. Do not `fly scale count` above 1,
+# do not add regions, do not "temporarily" run a second machine for
+# capacity. If the network ever outgrows one machine, the fix is
+# the design's routing redesign (section 11), not a second machine.
+#
+# fly.toml CANNOT pin the machine count: Fly decides how many
+# machines a deploy creates, and its default for an HTTP/TCP
+# service app is TWO (high availability). The count is fixed at
+# deploy time — the runbook's first deploy passes --ha=false and
+# verifies count 1 before anything goes live. What this file pins
+# is the one machine's behaviour (never sleeps, always restarted);
+# the count itself lives in the runbook, not here.
+
+# The app NAME is not part of the protocol — the relay's identity
+# is RELAY_ORIGIN below, which nodes bind into their signatures.
+# If this name is taken at `fly apps create` time, pick another
+# and change it here; nothing else depends on it.
+app = "metasync-relay"
+primary_region = "iad" # US East (Northern Virginia). A plain choice:
+  # the relay never touches the database, so there is no stack to
+  # sit beside — what matters is one stable region, pinned forever
+  # by the one-machine rule (do not add regions).
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  # The relay's canonical public identity. Protocol v2 binds this
+  # origin into every hello signature (gate M5: with no origin set
+  # the relay refuses v2 rather than deriving an identity from
+  # client-supplied headers). Nodes sign for the origin they
+  # DIALED, and both sides canonicalize to scheme://host:port with
+  # the port always explicit — so this value and a node dialing
+  # wss://relay.ssync.net agree on "wss://relay.ssync.net:443".
+  # Consequence: set this to the FINAL custom domain from the very
+  # first deploy (see the runbook's ordering). Nodes dialing the
+  # <app>.fly.dev hostname sign for the fly.dev origin and their v2
+  # hellos will be refused — the fly.dev name is not a fallback
+  # address once this is set.
+  RELAY_ORIGIN = "wss://relay.ssync.net"
+  # The pool's issuer id. Must match, byte for byte, the `issuer`
+  # the portal signs into attestations and revocation lists, or
+  # the relay drops the revocation feed as foreign. No code in
+  # either repo pins this value yet (the conformance vectors use a
+  # synthetic one): the value here is the one to adopt when the
+  # portal endpoints are built, and once anything has signed with
+  # it, it must never change — changing it orphans every
+  # outstanding attestation and revocation list.
+  RELAY_ISSUER_ID = "metasync"
+  # RELAY_REVOCATIONS_URL is deliberately ABSENT. The relay fetches
+  # the issuer-signed revocation list from that URL when set (see
+  # "Portal follow-up" in README.md); the endpoint does not exist
+  # yet. An unset URL is the honest empty-list mode — do not point
+  # it at a 404 and call the feed wired. When the endpoint ships,
+  # uncomment and deploy:
+  # RELAY_REVOCATIONS_URL = "https://<sin-function-host>/v1/meta/revocations"
+  #
+  # RELAY_POOL_PUBLIC_KEY (required — the relay refuses to start
+  # without it) is set with `fly secrets set`, per the runbook.
+  # It is a PUBLIC key; secrets are used so that all relay config
+  # is placed deliberately at deploy time, not because it is
+  # sensitive.
+
+[http_service]
+  internal_port = 8791 # RELAY_PORT in the image
+  force_https = true # nodes dial wss:// only; plain ws redirects
+  # A slept machine disconnects EVERY node: presence and all
+  # sockets live in this one process's memory. Auto-stop stays
+  # off, and exactly one machine stays running, always.
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    # WebSockets are connections, not requests. Fly's defaults
+    # (soft_limit 20 when unset) are tuned for request/response
+    # apps and would strangle a switchboard that exists to hold
+    # thousands of idle sockets. The two limits do different
+    # things. soft_limit only deprioritizes this machine when
+    # others could take the connection — with the count pinned
+    # at 1 there are no others, so crossing it changes nothing.
+    # hard_limit is the concurrency ceiling at Fly's edge: at the
+    # limit new connections queue, and are errored only once
+    # queueing gives up — not an instant refusal. It is set far
+    # above any plausible load (the design's one-machine era ends
+    # in a routing redesign long before thousands of simultaneous
+    # sockets), but it is a ceiling, not a marker.
+    type = "connections"
+    soft_limit = 4000
+    hard_limit = 6000
+
+  # NO Fly service checks, deliberately. Checks under
+  # http_service are HTTP checks, and the relay has no HTTP
+  # surface at all — pure WebSocket by design — so a check would
+  # GET / and be answered 426 (upgrade required) forever: it
+  # could never pass, and a failing check can gate deploys and
+  # routing. Liveness instead comes from the [[restart]] policy
+  # below plus the nodes themselves (they reconnect with backoff
+  # and their status shows connected/peers), and the relay's
+  # health story is its aggregate counters log line (every
+  # RELAY_COUNTERS_LOG_SECONDS) in `fly logs`.
+
+# Restart the machine whenever the process exits, without a retry
+# cap: presence lives in this process's memory, so a dead process
+# nobody restarts is the whole network down until a human notices.
+# A restart empties presence and every socket drops — nodes
+# reconnect on their own, which is the designed recovery.
+[[restart]]
+  policy = "always"
+
+[[vm]]
+  # IDLE math: thousands of idle WebSockets are light — a few
+  # hundred bytes of message traffic per question and a small
+  # presence record per connection; idle presence alone would
+  # fit in a fraction of this.
+  # WORST-CASE math, and the reason for 1GB: the relay's own caps
+  # allow a per-connection send queue of 16MB (RELAY_SEND_QUEUE_
+  # BYTES) and up to 8MB of answers in flight per query. A few
+  # dozen askers stalled mid-burst — sockets open, not reading —
+  # can pin hundreds of MB in send queues before the per-send
+  # timeouts (5s) clear them. 512MB left no room for that on top
+  # of the process itself; 1GB covers the beta-scale version of
+  # it (tens of nodes) for a trivial cost step. It does not make
+  # the pathological case impossible — a hundred fully-stalled
+  # queues would still exceed it — the send timeout and the
+  # per-query caps are what bound that, and a restart in the
+  # worst case empties presence and nodes reconnect. If the
+  # network outgrows this, memory is the first knob — never a
+  # second machine (see the rule above).
+  size = "shared-cpu-1x"
+  memory = "1gb"

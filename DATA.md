@@ -667,14 +667,20 @@ This section covers only the node's connection to it.
   connected nodes and routes their answers back by query ID. The relay
   **stores nothing** — no claims, no queries, no answers. Presence
   (which node keys are connected) lives in its memory only and is gone
-  when it restarts; its only database touch is a read-only check at
-  connect time that the node's pool key is valid and bound.
+  when it restarts. It has no database access at all: at connect
+  time it verifies the node's pool exchange token offline against
+  the pool's public key, and checks the issuer's signed revocation
+  list. Whether the node's key is valid and bound was checked by
+  the portal when it issued that token, not by the relay.
 - **The switch.** The node connects only when the user turns the
   metadata network on: settings `meta_network`, **default off**, plus
-  a relay URL in `meta_relay_url`. With the switch off the node never
-  dials the relay. The connection authenticates with the pool exchange
-  token (which now carries the `meta:read` scope) plus a signature by
-  the node key binding a per-connection challenge from the relay, so a
+  a relay URL in `meta_relay_url`. With no URL stored, the node dials
+  the shipped default destination, `wss://relay.ssync.net`; a stored
+  URL wins over the default, and a stored empty or null value means
+  dial nowhere. With the switch off the node never dials the relay.
+  The connection authenticates with the pool exchange token (which
+  now carries the `meta:read` scope) plus a signature by the node
+  key binding a per-connection challenge from the relay, so a
   captured hello cannot be replayed.
 - **The mode.** `meta_node_mode` says how the node answers other
   nodes' queries: `full` (own library plus re-served cache),
