@@ -9,15 +9,23 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Force world-readable modes on the copy: build-context files can
-# arrive with restrictive modes (660 from the build machine's
-# checkout) and a plain COPY preserves them, locking the relay user
-# out of its own code (first fly deploy, oct 28 2026: PermissionError
-# on __init__.py). The code stays root-owned; the relay user only
-# reads it.
-COPY --chmod=a+rX metasync_relay/ ./metasync_relay/
-
 RUN useradd --uid 10001 --no-create-home relay
+
+# Fix the copied modes with a plain chmod, as root. Build-context
+# files can arrive with restrictive modes (660 from the build
+# machine's checkout) and COPY preserves them, locking the relay
+# user out of its own code (first fly deploy, oct 28 2026:
+# PermissionError on __init__.py). The COPY --chmod flag did not
+# take effect on fly's remote builder (same crash), so the mode
+# fix is a real chmod run step. The code stays root-owned; the
+# relay user only reads it. The last line proves it at build time:
+# the build fails unless the relay user can really read the
+# package (a bare import is not enough — an unreadable directory
+# still imports as an empty namespace package, so assert __file__).
+COPY metasync_relay/ ./metasync_relay/
+RUN chmod -R a+rX /app/metasync_relay
+RUN cd /app && su relay -s /bin/sh -c "python3 -c 'import metasync_relay; assert metasync_relay.__file__, \"unreadable\"'"
+
 USER relay
 
 EXPOSE 8791
