@@ -289,16 +289,25 @@ def _merge_album_track(groups: dict[str, list[dict[str, Any]]],
             for e in ordered)
         fingerprint = hashlib.sha256(
             sequence.encode("utf-8")).hexdigest()[:16]
+        tracks = []
+        for e in ordered:
+            track = {"track": e["value"]["track"],
+                     "disc": e["value"]["disc"],
+                     "position": e["value"]["position"],
+                     "tier": e["tier"], "support": e["support"],
+                     "local": e["local"]}
+            if e.get("verification_stale"):
+                # §6 staleness rides the slot as it rides a
+                # value entry — consumers that tally verdicts
+                # (step 9's view) count a stale strong slot as
+                # stale, never as fresh strong. The depot
+                # projection builds its slot dicts key by key
+                # and does not read this, so no surface widens.
+                track["verification_stale"] = True
+            tracks.append(track)
         variants[variant] = {
             "fingerprint": fingerprint,
-            "tracks": [
-                {"track": e["value"]["track"],
-                 "disc": e["value"]["disc"],
-                 "position": e["value"]["position"],
-                 "tier": e["tier"], "support": e["support"],
-                 "local": e["local"]}
-                for e in ordered
-            ],
+            "tracks": tracks,
             "settled": all(
                 e["tier"] == TIER_STRONG or e["support"] >= SUPPORT_FLOOR
                 or e["local"] for e in ordered),

@@ -1131,3 +1131,259 @@ merged view (DESIGN-METADATA.md §5–§9; code in
   known edge rather than a hole; whether §9 should admit a
   small lower-edge tolerance (and what it would do to the
   window's meaning) is an open design question.
+
+## 20. The enrichment view (node side)
+
+What the node's operator can see of the merged record, and the
+one place the full record is rendered whole
+(DESIGN-METADATA.md §13 step 9; code in
+`node/metasync_node/meta/enrichment.py`,
+`NodeService.meta_enrichment`, the login-gated `GET
+/enrichment` page).
+
+- **The full record read, the coarse exposure rendered.**
+  The service hands the presenter the full merged record,
+  read from the querier directly — the presenter's gap
+  classification is computed from the record's origin lists,
+  so it needs the whole record internally. But §19's two
+  rules bind step 9 as they bind step 8, and the page honors
+  them: the `support_label` bucket is the only form of a
+  count shown, and origin keys never reach the page — not on
+  the SoulSync-facing routes, and not on the node's own page
+  either. Per value, the page shows exactly what the coarse
+  projection (`merge.project_for_depot`) exposes: the value,
+  its tier, `verified_at` (and the stale flag), its local
+  flag, its sources, and support as the bucket alone. Exact
+  support counts, per-value report counts, origin keys and
+  batch ids are stripped in the presenter
+  (`enrichment._value_view`); what stripping cannot govern
+  — the merge's own arithmetic showing through the results
+  being rendered — is named as one cluster under
+  **Merge-inherited orderings** below. The page's route
+  builds the template context from those views plus a
+  fixed set of
+  lookup facts (ok/error, whether the network was asked,
+  the unresolved entries, the backlog pair below, each
+  counter as presence only) —
+  the service's result dict, the full records, the own key
+  string and the rest of the querier status never cross
+  into the context at all (pinned by a
+  `flask.template_rendered` test that walks the context).
+  Per-slot support in the `album_track` variants is
+  bucketed the same way. What the page adds beyond the
+  projection is the node's own analysis of its own record —
+  the gap classification, the `duration_ms` consensus and
+  per-variant values, `year`'s held values (rendered in
+  value order alone — the page shows no tier or count for
+  them, so their order may carry nothing), the §8
+  disambiguation block (settled candidate, via, promotion
+  flag, survivors, settle time), the per-record verification
+  tally, and the fact (never the count) that §6 aging
+  dropped some network claims: the record's expired count
+  is exactly other nodes' claims — the node's own never
+  expire — so the page renders it as a boolean. It sits
+  behind the node's admin login, on the operator's own
+  machine, over data already in the node's local store, and
+  serves nothing onward.
+- **Two scopes, honestly different.** The form (kind,
+  by-name or by-exact-ID, scope) picks one. Asking is never
+  the default: a missing or unrecognized scope means "only
+  what this node knows", because a bare `/enrichment?q=...`
+  link must not set an ask in motion under the operator's
+  session (the UI cookie is SameSite=Lax, so a cross-site
+  top-level navigation carries it) — scope "ask the
+  network" runs only when the operator picks it in the
+  form. It runs the querier's existing ask
+  paths — `query_text` / `query_exact`, the same cache-first
+  fan-out SoulSync's asks use: the querier asks the relay for
+  subjects local data cannot answer, answers may be ADMITTED
+  into the cache, and verification of what the view relies on
+  is scheduled (§19's reliance rule) — an ask-scope lookup is
+  not side-effect-free, and the page's copy says so. Scope
+  "only what this node knows" is a PURE READ of what the node
+  already holds, and deliberately does not ride the ask paths
+  (an exact ask schedules verification even with
+  `network=False`; a text ask fires §8 sanity triggers):
+  exact rides `Querier.record()` — own claims + answer-cache
+  assembly that schedules nothing and never touches the
+  relay — and text is built from the same parts (the
+  responder's local name-index resolution, then `record()`'s
+  assembly per subject). A local lookup admits nothing,
+  fetches nothing, schedules nothing. Entries that resolve to
+  nothing are listed as unresolved; a subject whose claims
+  all expired renders its `found: false` shell.
+- **Display-only, stated precisely.** The page is a GET form
+  — there is no POST route to guard, the page itself writes
+  nothing, and nothing on it promotes: promotion is the
+  depot's business under §8's floors (§19, and SoulSync step
+  8), never this page's. (What an ASK-scope lookup sets in
+  motion is the ask's own machinery, above — not a write path
+  of the page.) The presenter (`enrichment.record_view`) is a
+  pure function of the record: it computes the page's one
+  interpretation, the GAP classification — per field, whether
+  the values are the library's alone, the network's alone (a
+  gap enrichment could one day close), or both, read off the
+  record's own local flags and origin lists (`album_track`'s
+  locality is read from its slots, which carry no origins to
+  split further) — plus two refinements so the summary cannot
+  overclaim: a field whose only non-local assertions are this
+  node's OWN key (its batches, re-served back) classifies as
+  this node's, not the network's, and a `year` whose only
+  network presence is §8-held values classifies "held" (held,
+  not served) rather than as if the network had nothing. The
+  per-record verification tally counts values and
+  `album_track` slots alike and PARTITIONS them — fresh
+  strong, fresh plausible, unverified, stale — so the four
+  numbers add up to what was counted: a stale verdict,
+  strong or plausible, value or slot, counts in "stale"
+  alone, never also inside its tier's number, and the
+  strong headline is fresh strong verdicts only. (Slots
+  carry their §6 staleness through the merge for this; the
+  depot projection builds its slot dicts key by key and
+  does not pick the flag up.) A variant-less slot entry,
+  which the merge duplicates under every asserting origin's
+  shape key, counts once. Nothing
+  computed here feeds back into the merge, the store, or the
+  querier.
+- **Verification state, two levels.** The tiles above a
+  result are the verification half of the querier's §19
+  status block at lookup time (the unverified backlog,
+  stale verdicts), with §9 applied to both numbers: each
+  tile renders PRESENCE only — "none" / "some" — never
+  the count, and not the bucket either. An earlier draft
+  of this section called the unverified queue "this
+  node's own work queue"; it is mostly not. Newly admitted
+  claims land in it unverdicted — verification runs on a
+  background pool and has not finished when the page
+  renders — so the exact number is mostly OTHER nodes'
+  just-admitted claims, and its difference between two
+  renders around an ask is exactly how many new
+  origin-and-claim pairs the ask admitted: for a single
+  field, a support count §9 hides. The bucket leaked
+  too, at its lower boundary: a drained queue reads
+  "none", an ask admits claims behind two values that
+  each show bucket "1-2", and a queue then at "1-2"
+  pins each value at exactly one origin. The
+  stale-verdicts tile went exact in an earlier fold on
+  the claim that admissions never move it, only time
+  and re-checks do. That claim is false twice over. An
+  ask on a record whose strong verdicts have gone stale
+  schedules forced re-checks of that record, one per
+  origin holding a stale verdict; when they land, the
+  rows refresh (same-or-better) or clear
+  (contradiction), and the count drops by exactly that
+  many origins — separating 1 from 2 inside the "1-2"
+  bucket and counting a "3+" outright. And admissions
+  move it from the other side: admitting a batch prunes
+  the answer cache, and an evicted batch takes its
+  verdicts with it. The honest summary is that both
+  counters move for reasons correlated with other
+  nodes' claims — which is exactly why the page shows
+  presence only: the operator can still see whether
+  any backlog exists at all, which is all the tiles are
+  for. The status block's cache-size
+  counters (cached batches, cached claims) are
+  deliberately NOT tiled: an exact global counter rendered
+  beside a lookup hands back, by subtraction between two
+  page loads, how many batches that lookup admitted — the
+  per-lookup number the service keeps out of its own
+  result. Per value, the tier and its evidence time render
+  as recorded — with one projection discipline kept: a
+  strong verdict gone stale wears the projection's demoted
+  label (unverified, with the support label the demotion
+  computes) beside its stale flag, the same words the
+  depot surface uses, while the tally counts it as stale
+  under its true tier. Tracklist slots demote the same way
+  on this page (the demoted tier, its pill, the stale flag
+  kept) — which the projection does NOT do, and the
+  asymmetry is a named known inconsistency: the depot
+  projection does not demote stale strong slots —
+  `merge._project_field` serves such a slot to the depot
+  as strong, and a variant's settled-ness counts it —
+  while the view demotes it for display. Only the view
+  changed; projection behavior is unchanged pending a
+  depot decision on whether the depot surface should
+  demote slots too.
+- **Merge-inherited orderings — one cluster, ticketed,
+  pending a merge-level decision.** Four disclosures
+  share one root: the merge computes with EXACT support
+  and report counts, and a surface rendering its results
+  inherits that arithmetic unless it re-derives what it
+  shows. None of the four is this view's own addition,
+  and the view adds no exposure of its own beyond them;
+  fixing any of them at the root means BUCKET-RANKED
+  merge and projection — slot winners, value order and
+  the consensus all change — which is a design decision
+  above this branch, not a view fix. (a) VALUE ORDER:
+  the merge orders a field's values by exact support
+  (`_entry_sort_key`, kept by `apply_display_order`
+  inside its classes), so of two same-tier values in
+  bucket "1-2", the one rendered above a
+  value-identity-earlier rival is exactly the 2. This
+  page closes its own half: the presenter re-sorts by
+  (tier, bucket, value identity) and takes its header
+  name from a local value, else the first re-sorted
+  name. `project_for_depot` still serves the merge's
+  order to SoulSync, so the depot surface carries the
+  disclosure until the merge-level decision. (b) SLOT
+  WINNERS: `_merge_album_track` ranks a slot's
+  candidates by (tier, exact support), then lowest
+  track id, and only the winner is rendered — the view
+  cannot re-rank a loser it never receives. A winner
+  whose track id is HIGHER than a same-tier,
+  same-bucket rival's (visible under another variant,
+  or on an earlier render) discloses support(winner) >
+  support(rival): inside "1-2", exactly 2 against 1.
+  (c) SHAPE FAN-OUT: each origin contributes exactly
+  one shape key, and a variant-less slot entry is filed
+  under the shape of EVERY origin asserting it — an
+  entry appearing under k distinct `shape:` variants
+  has at least k asserting origins, so k = 2 inside
+  bucket "1-2" pins support at exactly 2, modulo the
+  own-key, standing and network-source caveats the page
+  cannot rule out (slots carry no own flag). (d)
+  DURATION CONSENSUS: the consensus is a median over
+  REPORTS — only strong values count at all, each
+  repeated once per distinct origin holding a strong
+  verdict for it — and reports include this node's own
+  key and origins without standing, which support
+  excludes, so the split disclosed is of reports, not
+  of support. The leak, precisely: a tie renders the
+  midpoint (284500 for 1:1 or 2:2 alike), while a
+  consensus picking one value means its report count is
+  strictly greater than its rival's; `by_variant` adds
+  one more median — one more equation — per variant.
+  (This replaces the earlier, looser wording of this
+  item — "strong reports heavier", "two reports against
+  one".) SoulSync's depot surface serves the same
+  consensus and the same per-variant values.
+- **A timing-only residual.** `verified_at` renders to
+  the minute. Polling local renders while a
+  verification drain lands — verdict stamps advancing
+  across minute boundaries, the stale tile flipping to
+  "none" — gives a rough lower bound on how many
+  origins were rechecked in that window. It is not
+  exact and recovers no count; it is named here so the
+  bound is a known one.
+- **Provenance shape.** Live own-library rows carry no origin
+  in the merge (origin is the asserting batch's signer; the
+  library itself is not one), so a purely local value's
+  provenance reads "your library" plus its sources. Values
+  the answer cache asserts show bucket and sources only —
+  whose batches asserted them is the record's internal
+  business, never the page's. The one exception is a boolean:
+  a value whose only non-local assertions are this node's
+  OWN key (its batches, re-served back) is marked "this node
+  — re-served", the operator's own identity as a flag; no key
+  string, not even our own, appears on the page (such values
+  count in origins internally, never in support — §19).
+- **Escaping.** Every string the page renders passes through
+  the template engine's autoescaping; crowd values are data
+  and render as text, never markup (pinned by a test whose
+  network genre value is a script tag).
+- **Store-free landing.** On a node whose claims store was
+  never created, the page says so and creates nothing:
+  `meta_enrichment` returns the empty marker without opening
+  the store, and the page's chrome checks existence without
+  touching it — the §19 `meta_status` doctrine, applied to a
+  browser surface.

@@ -782,3 +782,23 @@ pre {
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; animation: none !important; }
 }
+
+/* ── Enrichment view (step 9) ────────────────────────────── */
+.enr-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  align-items: flex-end;
+}
+.enr-group { display: flex; flex-direction: column; gap: 6px; }
+.enr-group label { font-size: 13px; font-weight: 600; color: var(--muted); }
+.enr-grow { flex: 1 1 240px; }
+.enr-grow input[type="text"] { width: 100%; }
+
+.enr-field { padding: 16px 0 4px; border-top: 1px solid var(--border); margin-top: 18px; }
+.enr-field-name { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0 0 6px; font-family: var(--mono); font-size: 15px; }
+.enr-value { padding: 10px 0; border-bottom: 1px solid var(--border); }
+.enr-value:last-child { border-bottom: 0; }
+.enr-value-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.enr-value-text { font-size: 14.5px; overflow-wrap: anywhere; }
+.enr-meta { color: var(--muted); font-size: 13.5px; margin: 6px 0 0; }
