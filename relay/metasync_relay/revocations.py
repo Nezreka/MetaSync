@@ -26,6 +26,7 @@ never roll one back.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass
 
@@ -33,6 +34,8 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from .tokens import decode_base64url
+
+log = logging.getLogger("metasync_relay")
 
 SIGNING_CONTEXT = "metasync-revocations"
 _NODE_ID_SHAPE = re.compile(r"^[0-9a-f]{64}$")
@@ -149,18 +152,51 @@ class RevocationFeed:
         with urllib.request.urlopen(request, timeout=10) as response:
             return response.read(4 * 1024 * 1024)
 
+    def _adopt(self, parsed: RevocationList) -> bool:
+        """Take a verified list when its sequence is newer than the
+        held one. Sequence-gated per issuer."""
+        if self.current is not None and parsed.seq <= self.current.seq:
+            return False
+        self.current = parsed
+        return True
+
     def refresh(self) -> bool:
         """Fetch and apply a newer list. Returns True when the held
-        list changed. Any failure — network, shape, signature, stale
-        sequence — keeps the current list and returns False."""
+        list changed. Any failure — network, shape, signature —
+        keeps the current list and returns False, and is logged:
+        a silently failing feed is indistinguishable from an
+        empty one, and only the failing one is an operator
+        problem. A stale sequence is NOT a failure (the feed's
+        steady state is the same list re-served) and stays
+        silent. The log lines carry the failure kind and the
+        configured URL (public config) — never a response body.
+        """
         if not self.url:
             return False
         try:
             raw = self._fetch(self.url)
             obj = json.loads(raw.decode("utf-8"))
-        except Exception:  # noqa: BLE001 - a bad feed is an unchanged feed
+        except Exception as exc:  # noqa: BLE001 - a bad feed is an unchanged feed
+            log.warning(
+                "revocation_feed_fetch_failed: GET %s failed "
+                "(%s: %s); keeping the current list",
+                self.url,
+                type(exc).__name__,
+                exc,
+                extra={"error_class": "revocation_feed_fetch_failed"},
+            )
             return False
-        return self.apply(obj)
+        parsed = parse_revocation_list(obj, self._key, self.issuer or None)
+        if parsed is None:
+            log.warning(
+                "revocation_feed_invalid: the list served at %s "
+                "did not verify (shape, issuer, or signature); "
+                "keeping the current list",
+                self.url,
+                extra={"error_class": "revocation_feed_invalid"},
+            )
+            return False
+        return self._adopt(parsed)
 
     def apply(self, obj: object) -> bool:
         """Verify and apply one list object (from the feed, or handed
@@ -168,10 +204,7 @@ class RevocationFeed:
         parsed = parse_revocation_list(obj, self._key, self.issuer or None)
         if parsed is None:
             return False
-        if self.current is not None and parsed.seq <= self.current.seq:
-            return False
-        self.current = parsed
-        return True
+        return self._adopt(parsed)
 
 
 def signed_list_message(issuer: str, seq: int, issued_at: int, keys,

@@ -50,21 +50,29 @@ primary_region = "iad" # US East (Northern Virginia). A plain choice:
   RELAY_ORIGIN = "wss://relay.metasync.ssync.net"
   # The pool's issuer id. Must match, byte for byte, the `issuer`
   # the portal signs into attestations and revocation lists, or
-  # the relay drops the revocation feed as foreign. No code in
-  # either repo pins this value yet (the conformance vectors use a
-  # synthetic one): the value here is the one to adopt when the
-  # portal endpoints are built, and once anything has signed with
-  # it, it must never change — changing it orphans every
+  # the relay drops the revocation feed as foreign. The portal
+  # signs with exactly this value (META_ISSUER_ID in src/sin/),
+  # and live attestations and revocation lists already carry it,
+  # so it must never change — changing it orphans every
   # outstanding attestation and revocation list.
   RELAY_ISSUER_ID = "metasync"
-  # RELAY_REVOCATIONS_URL is deliberately ABSENT. The relay fetches
-  # the issuer-signed revocation list from that URL when set (see
-  # "Portal follow-up" in README.md); the endpoint does not exist
-  # yet. An unset URL is the honest empty-list mode — do not point
-  # it at a 404 and call the feed wired. When the endpoint ships,
-  # uncomment and deploy:
-  # RELAY_REVOCATIONS_URL = "https://<sin-function-host>/v1/meta/revocations"
-  #
+  # The revocation feed: the SIN function serves the issuer-
+  # signed revocation list at this URL (see "Portal follow-up"
+  # in README.md), and the relay fetches it on the
+  # RELAY_REVOCATIONS_INTERVAL_SECONDS interval (default 300s).
+  # The value is the FULL endpoint URL: the relay's fetcher
+  # GETs the configured string verbatim, with no base-joining.
+  # It is plain config, not a secret — every response is
+  # signature-verified against the issuer key
+  # (RELAY_ISSUER_PUBLIC_KEY when set, otherwise
+  # RELAY_POOL_PUBLIC_KEY) and the issuer id above before
+  # anything is applied, so a wrong or hostile body is simply
+  # dropped. The endpoint is live (portal PR #28, migration
+  # 0012 applied), so the URL is set here, in the repo: a
+  # redeploy from this file keeps the feed wired, instead of
+  # the wiring living only in a dashboard-side setting that
+  # the next deploy from this file would silently lose.
+  RELAY_REVOCATIONS_URL = "https://br-tiny-mode-b55fkv5s-sin.compute.c-7.us-east-2.aws.neon.tech/v1/meta/revocations"
   # RELAY_POOL_PUBLIC_KEY (required — the relay refuses to start
   # without it) is set with `fly secrets set`, per the runbook.
   # It is a PUBLIC key; secrets are used so that all relay config

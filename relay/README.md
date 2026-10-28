@@ -123,7 +123,7 @@ is missing or malformed, and says which one (never its value).
 | `RELAY_POOL_PUBLIC_KEY` | yes | none | Issuer Ed25519 public key: base64url of the raw 32 bytes, or PEM (verifies access tokens offline; also the default issuer key) |
 | `RELAY_ISSUER_PUBLIC_KEY` | no | the pool key | Issuer key for revocation lists, when different from the token key |
 | `RELAY_ISSUER_ID` | no | none | Issuer id (with the key, enables the revocation feed) |
-| `RELAY_REVOCATIONS_URL` | no | none | Where to fetch the signed revocation list |
+| `RELAY_REVOCATIONS_URL` | no | none | Where to fetch the signed revocation list — the full endpoint URL (the fetcher GETs it verbatim); fly.toml sets it to the live SIN function's `/v1/meta/revocations` |
 | `RELAY_REVOCATIONS_INTERVAL_SECONDS` | no | `300` | Revocation fetch interval |
 | `RELAY_ORIGIN` | for v2 | none | Canonical relay identity `scheme://host:port` bound into v2 hellos — **required for protocol v2**: without it the relay refuses v2 hellos rather than deriving its identity from client-supplied Host / X-Forwarded-Proto headers (that derivation is the federation impersonation hole); v1-only operation may omit it |
 | `RELAY_HOST` | no | `127.0.0.1` | Bind address (the Dockerfile sets `0.0.0.0`) |
@@ -290,9 +290,9 @@ why step 3 below exists.
        alone.
      - **Revoked key:** the issuer's signed revocation list
        names this node. Check the key's state in the portal.
-       (Not yet a possible cause on the Fly deployment: no
-       `RELAY_REVOCATIONS_URL` is configured there, so the
-       list the relay checks is empty.)
+       (A possible cause on the Fly deployment too: fly.toml
+       sets `RELAY_REVOCATIONS_URL`, so the relay checks the
+       issuer's live list, refreshed on the fetch interval.)
      - **A token the relay cannot verify:** issued by a
        different pool than the relay's `RELAY_POOL_PUBLIC_KEY`,
        or expired. Confirm the relay secret came from
@@ -415,14 +415,16 @@ or set it to `wss://relay.metasync.ssync.net` — then start the node.
 
 ## Portal follow-up: attestation issuance and the revocation feed
 
-Two portal-side pieces pair with this deployment. Both are now
+Two portal-side pieces pair with this deployment. Both are
 BUILT in `src/sin/` (attestation issuance in `logic.ts`, the
-exchange carriage and the revocation feed in `index.ts`), pending
-deploy: migration `0012_meta_revocations.sql` must be applied
-first, and the relay gains `RELAY_REVOCATIONS_URL` (below) at its
-next deploy. Both consumers were finished and waiting, and this
-section pins the contract the build followed. Nothing in the
-relay or the node needs to change when these ship.
+exchange carriage and the revocation feed in `index.ts`) and
+DEPLOYED: migration `0012_meta_revocations.sql` is applied and
+the SIN function serves the feed live. fly.toml sets
+`RELAY_REVOCATIONS_URL` to that endpoint, so the relay picks
+the feed up at its next deploy. Both consumers were finished
+and waiting, and this section pins the contract the build
+followed. Nothing in the relay or the node needed to change
+when these shipped.
 
 ### One issuer, one key, one id
 
@@ -438,12 +440,13 @@ that public half: `GET /v1/auth/public-key` returns
 `{"public_key": <base64url>}` — it is the source for both the
 relay secret and the node's setting (runbook step 2).
 
-The `issuer` string is the same in every signed object. No code
-pins its value today (the conformance vectors use a synthetic
-`"issuer-1"`). fly.toml adopts `RELAY_ISSUER_ID = "metasync"`;
-the portal build must sign with exactly that string, and it must
-never change afterwards — attestations and lists naming any other
-issuer are dropped by verifiers holding this one.
+The `issuer` string is the same in every signed object. The
+portal signs with exactly `"metasync"` (`META_ISSUER_ID` in
+`src/sin/`); the endpoints are built and deployed, and the live
+lists carry it. fly.toml sets `RELAY_ISSUER_ID = "metasync"` to
+match, and it must never change afterwards — attestations and
+lists naming any other issuer are dropped by verifiers holding
+this one.
 
 ### Attestation issuance (at the token exchange)
 

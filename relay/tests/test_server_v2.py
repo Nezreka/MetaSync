@@ -676,6 +676,68 @@ def test_revocation_bad_signature_ignored(pool_private, pool_public, node_a):
     asyncio.run(scenario())
 
 
+def test_revocation_feed_failure_logs_and_keeps_current_list(caplog):
+    """A feed that starts failing must say so in the log. Silently
+    swallowing the failure leaves the relay holding a stale list
+    with no trace of why it stopped advancing — indistinguishable
+    from an honestly empty feed. A stale sequence, the feed's
+    steady state, is not a failure and stays silent."""
+    import logging
+
+    issuer_private = Ed25519PrivateKey.generate()
+    issuer_public: Ed25519PublicKey = issuer_private.public_key()
+    payload = _signed_revocation_list(issuer_private, 3, ["a" * 64])
+    failing = {"on": False}
+
+    def fetch(url: str) -> bytes:
+        if failing["on"]:
+            raise ConnectionError("issuer unreachable")
+        return json.dumps(payload).encode()
+
+    feed = RevocationFeed(
+        ISSUER_ID,
+        issuer_public,
+        "https://issuer.example/revoked.json",
+        fetch=fetch,
+    )
+    assert feed.refresh() is True
+    held = feed.current
+    assert held is not None and held.seq == 3
+
+    def relay_records():
+        return [r for r in caplog.records if r.name == "metasync_relay"]
+
+    failing["on"] = True
+    with caplog.at_level(logging.WARNING, logger="metasync_relay"):
+        assert feed.refresh() is False
+    assert feed.current is held
+    assert any(
+        "revocation_feed_fetch_failed" in r.message for r in relay_records()
+    )
+
+    # A served list that does not verify is a failure too, logged
+    # as one — and the held list is still untouched.
+    caplog.clear()
+    bad = dict(payload, sig=encode_base64url(b"\x00" * 64))
+    feed._fetch = lambda url: json.dumps(bad).encode()  # type: ignore[method-assign]
+    with caplog.at_level(logging.WARNING, logger="metasync_relay"):
+        assert feed.refresh() is False
+    assert feed.current is held
+    assert any(
+        "revocation_feed_invalid" in r.message for r in relay_records()
+    )
+
+    # The same list re-served (no newer sequence) is the steady
+    # state: unchanged, and silent.
+    caplog.clear()
+    feed._fetch = fetch  # type: ignore[method-assign]
+    failing["on"] = False
+    with caplog.at_level(logging.WARNING, logger="metasync_relay"):
+        assert feed.refresh() is False
+    assert feed.current is held
+    assert relay_records() == []
+
+
 # -- counters, pruning, forward-compat -----------------------------------------
 
 
