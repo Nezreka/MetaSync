@@ -1301,8 +1301,10 @@ async def start_server(relay: Relay, host: str, port: int):
         # the warning above stays silent — but a feed with no URL
         # never fetches, so the relay holds an empty list and its
         # hello/reauth revocation checks enforce nothing. That
-        # state gets its own loud line (the production config sits
-        # here until the portal revocation endpoint ships).
+        # state gets its own loud line. The production config no
+        # longer sits here — the portal endpoint shipped and
+        # fly.toml sets the URL — but a relay run without
+        # fly.toml's environment still can.
         log.warning(
             "revocation_feed_unconfigured: an issuer id is set but "
             "no RELAY_REVOCATIONS_URL; the relay holds an empty "
