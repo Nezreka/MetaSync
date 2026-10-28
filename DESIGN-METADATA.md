@@ -793,13 +793,29 @@ from it by having arrived from the network. Per-workflow policy
 (§14.1) tunes only **above** this floor — preference order,
 eagerness, which fields a workflow bothers with — never below it.
 
+**Interim state (SoulSync side, Oct 28, 2026):** leg (c)'s slot
+anchor is switched **off for provider-ID fields** until the
+per-slot provider ID is recorded at verification time and the
+anchor checks the candidate against the ID the verified
+tracklist carries at that slot — this section's original intent
+(the track rule above: "the candidate is the ID the verified
+release's tracklist carries at that position"). As the depot's
+code stands, the anchor checks the slot, not the ID the slot
+carries: it proves which track this is and says nothing about
+whether the provider ID attached to it is right, and on a niche
+item a single answering node is automatically the single
+survivor. Provider IDs promote via legs (a) and (b) meanwhile.
+
 **Provenance:** every merged field carries value, support
 (strong-verified by this node / plausible / coarse node bucket §9),
 and `merge_rules_version`. Asserting node keys are protocol-visible
 to the receiving node's *software* — signatures, dedupe (§6), and
 reputation (§9) are impossible without them — but they are never
 shown to the user and never passed to SoulSync: the user and
-SoulSync see coarse support buckets only. SoulSync stores that
+SoulSync see coarse support buckets only. That binds **every**
+user surface, the node's own pages included: exact support
+counts and asserting node keys are deliberately never exposed
+to a user anywhere (Oct 28, 2026). SoulSync stores that
 provenance **in the depot** with the merged record, and when a
 workflow promotes a value (§14.1) the provenance travels with it
 into the library record — including the mark §2.4 requires, so a
@@ -1472,20 +1488,43 @@ by its own users. It is also the design's honest cost, alongside
    ships.
 8. **SoulSync depot + surfaces:** the **depot first** (§1) — the
    SoulSync extension holding network-collected metadata with its
-   provenance, consumed by tagging at post-processing — then the
-   detail-page jump-start, then the combined search tab (active
-   source + MusicBrainz, deduped via the depot's link claims).
-   Dedupe merges must not block first results: results render
-   immediately, rows merge as depot answers land. Every
-   network-sourced string is escaped at render (§6). The depot's
-   per-field provenance and the §2.4 network mark originate here
-   (SoulSync-side storage and export bit, §5.1 G1), and the
-   §2.4 tag-travel limit — values in file tags re-importing as
-   provider-sourced — is the accepted risk recorded there; if
-   SoulSync ever tracks re-import provenance, it lands in this
-   step. Its own
-   SoulSync PR(s), against dev.
-9. **Enrichment view:** merged record vs local gaps, display-only.
+   provenance — then the SoulSync surfaces, all governed by one
+   rule (Boulder, Oct 28, 2026): **the network is asked only on
+   real interest — a click, a wishlist add, a download. A search
+   result appearing on screen never asks.**
+   - **Tagging never asks.** Tagging at post-processing reads the
+     depot only; it never sends a question. Depot data arrives
+     from asks made earlier, at moments of interest, and from
+     the daily reconcile — never from a tagging-time miss. (If
+     any tagging-time fallback is ever kept, it is local-only —
+     `network: false` — under a hard per-file budget of ~2s.)
+   - **The detail-page jump-start and the combined search tab
+     are one mechanism: ask on click.** Clicking a result sends
+     the node one exact question, by the IDs the sources already
+     returned; the page renders immediately from the active
+     source + MusicBrainz, and the network's answer fills a
+     "From the network" section when it lands — a section that
+     renders **only when non-empty**: nobody answered, no box.
+     Wishlist adds and queued downloads ask the same way, in the
+     background, skipping the ask when the depot already holds a
+     fresh answer.
+   - **The combined tab** shows the active source + MusicBrainz
+     as one deduplicated list (the depot's link facts may inform
+     the merge); its **badges are read from the depot only** —
+     an item never asked about shows no badge and sends no
+     question. Dedupe merges must not block first results:
+     source rows render first, network extras arrive later.
+   Every network-sourced string is escaped at render (§6). The
+   depot's per-field provenance and the §2.4 network mark
+   originate here (SoulSync-side storage and export bit, §5.1
+   G1), and the §2.4 tag-travel limit — values in file tags
+   re-importing as provider-sourced — is the accepted risk
+   recorded there; if SoulSync ever tracks re-import provenance,
+   it lands in this step. Its own SoulSync PR(s), against dev.
+9. **Enrichment view:** merged record vs local gaps,
+   display-only. It is a user surface like any other: §9's
+   buckets only — exact counts and origin keys are never exposed
+   on any user surface, this one included.
 10. **Scaffold cleanup — DO NOW,** in the first PR that touches
     the tree, not last: delete `src/metasync/` (per-item server
     records — the design refuses them) and the PR #11 branch's
@@ -1498,7 +1537,15 @@ and without the network, verification fetches counted on the network's
 side (§15's targets come from this model, not from assertion) —
 and it gets the §7.1 terms list **read by a human**. It still also
 sizes the local claims store and the text index. It runs whenever
-Boulder's export is available.
+Boulder's export is available. Under the agreed plan (Oct 28,
+2026) the network's value is better and more complete data — the
+versions people own, the cross-provider links, the long tail —
+more than fewer calls, so the model matters less than it did
+when step 0 was written. It is still owed: on a few hundred real
+albums from Boulder's library, measure **calls today** (what
+tagging costs now), **fields filled** (what the depot would fill
+above the floor), and **verification cost** (what verifying them
+costs).
 
 **Scaling trigger (written down, not pre-built):** broadcast (§3)
 holds until roughly 1,000 concurrently answering nodes at
@@ -1535,6 +1582,22 @@ holds no database access (§10); relay instead of DHT for v1
 routing (§11); answering defaults to own-library-only with
 re-serving as the user's switch (§9); asking is ungated beyond a
 bound SIN key (§9).
+
+**Known limits (accepted for v1):**
+
+- **Revocations reach the depot late.** The node has no durable
+  invalidation outbox yet, so a revocation reaches SoulSync's
+  depot only through the daily reconcile — up to ~24 hours in
+  which a revoked origin's depot fields remain promotable. The
+  node itself purges on receipt (§9); the lag is SoulSync-side
+  only.
+- **Duration is held, never promoted.** The depot stores
+  durations, but no workflow promotes one — SoulSync's
+  `tracks.duration` has mixed-unit history — so the node need
+  not ship duration to SoulSync yet.
+- **The depot as built is v1's ceiling.** New edge cases go on
+  this list, not into code, until real traffic shows they
+  matter (Boulder, Oct 28, 2026).
 
 ## 15. Success measures
 

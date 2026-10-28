@@ -940,6 +940,10 @@ merged view (DESIGN-METADATA.md §5–§9; code in
   user surface. The disambiguation settlement rides the
   projection (provider ids are public identifiers, not
   provenance).
+- **When SoulSync asks (the one rule).** SoulSync asks only on
+  real interest — a click, a wishlist add, a download (design
+  §13 step 8, Oct 28, 2026). A search result appearing never
+  asks, and tagging reads the depot only: it never asks at all.
 - **Verification (§7)** runs AFTER answers land — streamed
   results are unverified first, verdicts upgrade the cache as
   checks complete. Scheduling is RELIANCE-GATED: only subjects
