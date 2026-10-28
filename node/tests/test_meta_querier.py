@@ -1372,5 +1372,423 @@ class AttestationSelectionTest(unittest.TestCase):
         self.assertIsNone(self.service._attestation_pool_note())
 
 
+class _CloseStream:
+    """A query stream the querier CAN close: records the close so a
+    test can tell an early-closed ask from a full-window one."""
+
+    def __init__(self, envelopes):
+        self._it = iter(list(envelopes))
+        self.closed = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._it)
+
+    def close(self):
+        self.closed = True
+
+
+class _UnnegotiatedStream:
+    """A stream from a session that never negotiated early close
+    (gate fold 2, SF-1): close_early() is the negotiated path —
+    it is consulted at the bar and refuses, nothing is ever sent —
+    so the ask must consume the full window, and the plain
+    close() must never be reached on this path either."""
+
+    def __init__(self, envelopes):
+        self._it = iter(list(envelopes))
+        self.close_early_calls = 0
+        self.closed = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._it)
+
+    def close_early(self):
+        self.close_early_calls += 1
+        return False
+
+    def close(self):
+        self.closed = True
+
+
+class UnnegotiatedFakeRelayClient(FakeRelayClient):
+    def query(self, kind, mode, subjects=None, terms=None, **kwargs):
+        self.queries.append(
+            {"kind": kind, "mode": mode, "subjects": subjects,
+             "terms": terms})
+        self.stream = _UnnegotiatedStream(self.envelopes)
+        return self.stream
+
+
+class ClosingFakeRelayClient(FakeRelayClient):
+    def query(self, kind, mode, subjects=None, terms=None, **kwargs):
+        self.queries.append(
+            {"kind": kind, "mode": mode, "subjects": subjects,
+             "terms": terms})
+        self.stream = _CloseStream(self.envelopes)
+        return self.stream
+
+
+class EarlyCloseTest(QuerierCase):
+    """Early close (§19): an EXACT ask stops waiting once the
+    MERGED view is sufficient — every carried subject found with
+    a value at support ≥ EARLY_CLOSE_SUPPORT (5 distinct standing
+    origins). Niche asks never close; a stream that cannot be
+    closed behaves exactly as asks always have. TEXT asks never
+    close at all: their resolution set grows as answers land, so
+    a mid-stream check would truncate the slow terms."""
+
+    def _popular(self, count, deezer_ids=None):
+        envs = []
+        for n in range(count):
+            origin = NodeIdentity(key=f"{n + 1:02x}" * 32)
+            deezer_id = "12345" if deezer_ids is None else deezer_ids[n]
+            envs.append(envelope(
+                origin, claims=track_claims(deezer_id=deezer_id),
+                attestation=standing_attestation(origin)))
+        return envs
+
+    @staticmethod
+    def _claims(subject, name, *, deezer_id=None, spotify_id=None):
+        claims = [
+            {"subject": subject, "kind": "track", "field": "name",
+             "value": name, "source": "file_tags",
+             "soulid_version": C.SOULID_VERSION},
+        ]
+        if deezer_id is not None:
+            claims.append(
+                {"subject": subject, "kind": "track",
+                 "field": "deezer_id", "value": deezer_id,
+                 "source": "deezer",
+                 "soulid_version": C.SOULID_VERSION})
+        if spotify_id is not None:
+            claims.append(
+                {"subject": subject, "kind": "track",
+                 "field": "spotify_id", "value": spotify_id,
+                 "source": "spotify",
+                 "soulid_version": C.SOULID_VERSION})
+        return claims
+
+    @staticmethod
+    def _forwarded(inner, forwarder):
+        fwd = {"origin_batch_id": C.batch_digest(inner["batch"]),
+               "origin_node": inner["batch"]["header"]["node"],
+               "forwarded_at": "2026-10-27T00:00:00+00:00"}
+        fwd["sig"] = forwarder.sign(C.canonical_bytes(fwd))
+        return {"forward": fwd, "envelope": inner}
+
+    def test_popular_exact_stream_closes_at_the_bar(self):
+        relay = ClosingFakeRelayClient(self._popular(6))
+        querier = self.querier(relay)
+        out = querier.query_exact("track", [SUBJECT])
+        self.assertTrue(relay.stream.closed)
+        # The close fired the moment the fifth standing origin
+        # landed: the sixth envelope was never even admitted.
+        self.assertEqual(out["admitted"], 5)
+        record = out["records"][0]
+        self.assertTrue(record["found"])
+        entry = record["fields"]["deezer_id"]["values"][0]
+        self.assertEqual(entry["support"], 5)
+
+    def test_text_ask_rides_the_full_window_for_late_terms(self):
+        # A text ask NEVER closes early (fold, §19): its terms
+        # re-resolve over a PROGRESSIVELY growing set, so a
+        # sufficiency check mid-stream judges only the subjects
+        # resolved so far — here the fast popular term alone, at
+        # the bar after five envelopes — and would close the
+        # query over the obscure term whose only answer arrives
+        # LAST. The pin: the obscure term's record comes back.
+        popular = self._popular(6)
+        obscure_subject = S.generate_soul_id(
+            "track", "Zqx Wobble", "Obscure Song")
+        obscure_claims = [
+            {"subject": obscure_subject, "kind": "track",
+             "field": "name", "value": ["Zqx Wobble", "Obscure Song"],
+             "source": "file_tags",
+             "soulid_version": C.SOULID_VERSION},
+            {"subject": obscure_subject, "kind": "track",
+             "field": "deezer_id", "value": "777",
+             "source": "deezer", "soulid_version": C.SOULID_VERSION},
+        ]
+        slow_origin = NodeIdentity(key="07" * 32)
+        slow = envelope(
+            slow_origin, claims=obscure_claims,
+            attestation=standing_attestation(slow_origin))
+        relay = ClosingFakeRelayClient(popular + [slow])
+        querier = self.querier(relay)
+        out = querier.query_text("track", ["Airbag", "Obscure Song"])
+        self.assertFalse(relay.stream.closed)
+        self.assertEqual(out["admitted"], 7)
+        by_subject = {r["subject"]: r for r in out["records"]}
+        self.assertTrue(by_subject[SUBJECT]["found"])
+        obscure = by_subject[obscure_subject]
+        self.assertTrue(obscure["found"])
+        self.assertEqual(
+            obscure["fields"]["deezer_id"]["values"][0]["value"],
+            "777")
+
+    def test_niche_stream_never_closes(self):
+        relay = ClosingFakeRelayClient(self._popular(2))
+        querier = self.querier(relay)
+        out = querier.query_exact("track", [SUBJECT])
+        self.assertFalse(relay.stream.closed)
+        self.assertEqual(out["admitted"], 2)
+        self.assertTrue(out["records"][0]["found"])
+
+    def test_busy_but_disagreeing_stream_never_closes(self):
+        # Six standing origins, six DIFFERENT deezer ids: plenty of
+        # answers, no value five origins agree on. Head-count alone
+        # is not sufficiency — the window runs out in full.
+        relay = ClosingFakeRelayClient(
+            self._popular(6, deezer_ids=[str(2000 + n) for n in range(6)]))
+        querier = self.querier(relay)
+        out = querier.query_exact("track", [SUBJECT])
+        self.assertFalse(relay.stream.closed)
+        self.assertEqual(out["admitted"], 6)
+
+    def test_unresolved_verbatim_ref_blocks_the_close(self):
+        # The query carries deezer:999999 verbatim; the stream is
+        # popular-shaped but never resolves that ref, so some later
+        # answer might still have held it — no close.
+        relay = ClosingFakeRelayClient(self._popular(6))
+        querier = self.querier(relay)
+        out = querier.query_exact("track", ["deezer:999999"])
+        self.assertFalse(relay.stream.closed)
+        self.assertEqual(out["admitted"], 6)
+        self.assertEqual(out["unresolved"], ["deezer:999999"])
+
+    def test_verbatim_ref_closes_on_its_matching_identity(self):
+        # The positive side of the verbatim rule: five direct
+        # standing origins assert the very deezer id the asker
+        # named, on the subject it resolves to — the matching
+        # value carries the bar and the ask closes there.
+        relay = ClosingFakeRelayClient(self._popular(6))
+        querier = self.querier(relay)
+        out = querier.query_exact("track", ["deezer:12345"])
+        self.assertTrue(relay.stream.closed)
+        self.assertEqual(out["admitted"], 5)
+        self.assertEqual(out["unresolved"], [])
+        record = out["records"][0]
+        self.assertEqual(record["subject"], SUBJECT)
+        entry = record["fields"]["deezer_id"]["values"][0]
+        self.assertEqual(entry["support"], 5)
+
+    def test_verbatim_ref_needs_the_matching_identity_supported(self):
+        # The gate's steering trace, end to end: ONE zero-standing
+        # key plants deezer:X on a popular subject (admission writes
+        # the provider-index link even at zero support); five
+        # forwarded standing batches then make an UNRELATED identity
+        # on that subject clear the general bar; one more direct
+        # standing batch supplies the second direct answerer, so the
+        # direct-answerer rule is satisfied too. Only the verbatim
+        # rule can keep this open: the asked-for deezer value on the
+        # resolved subject has support 0. The real owner of X
+        # answers last and must be read.
+        ref_id = "424242"
+        attacker = NodeIdentity(key="a1" * 32)
+        steering = envelope(
+            attacker,
+            claims=self._claims(
+                SUBJECT, ["Radiohead", "Airbag"], deezer_id=ref_id))
+        forwarder = NodeIdentity(key="f1" * 32)
+        forwarded = []
+        for n in range(5):
+            origin = NodeIdentity(key=f"{n + 1:02x}" * 32)
+            inner = envelope(
+                origin,
+                claims=self._claims(
+                    SUBJECT, ["Radiohead", "Airbag"],
+                    spotify_id="spotify-popular"),
+                attestation=standing_attestation(origin))
+            forwarded.append(self._forwarded(inner, forwarder))
+        direct_supporter = NodeIdentity(key="06" * 32)
+        direct = envelope(
+            direct_supporter,
+            claims=self._claims(
+                SUBJECT, ["Radiohead", "Airbag"],
+                spotify_id="spotify-popular"),
+            attestation=standing_attestation(direct_supporter))
+        real_subject = S.generate_soul_id(
+            "track", "Radiohead", "Real Airbag")
+        real_owner = NodeIdentity(key="07" * 32)
+        real_answer = envelope(
+            real_owner,
+            claims=self._claims(
+                real_subject, ["Radiohead", "Real Airbag"],
+                deezer_id=ref_id),
+            attestation=standing_attestation(real_owner))
+
+        relay = ClosingFakeRelayClient(
+            [steering, *forwarded, direct, real_answer])
+        querier = self.querier(relay)
+        out = querier.query_exact("track", [f"deezer:{ref_id}"])
+
+        self.assertFalse(relay.stream.closed)
+        self.assertEqual(out["admitted"], 8)
+        by_subject = {r["subject"]: r for r in out["records"]}
+        steered = by_subject[SUBJECT]
+        self.assertTrue(steered["found"])
+        # The unrelated identity really did clear the general bar —
+        # under the old any-identity rule this ask closed before the
+        # real owner arrived.
+        spotify = steered["fields"]["spotify_id"]["values"][0]
+        self.assertEqual(spotify["support"], 6)
+        planted = steered["fields"]["deezer_id"]["values"][0]
+        self.assertEqual(planted["value"], ref_id)
+        self.assertEqual(planted["support"], 0)
+        # The dispute is visible in the final result and the real
+        # owner's answer was read, not cut off.
+        real = by_subject[real_subject]
+        self.assertTrue(real["found"])
+        real_value = real["fields"]["deezer_id"]["values"][0]
+        self.assertEqual(real_value["value"], ref_id)
+        self.assertEqual(real_value["support"], 1)
+
+    def test_forwarded_replays_alone_never_close(self):
+        # Five standing origins' batches, every one replayed by a
+        # SINGLE forwarder: the support bar is met on paper, but no
+        # node answered this ask with its own batch, so sufficiency
+        # is never even checked and the window runs out in full.
+        forwarder = NodeIdentity(key="f1" * 32)
+        relay = ClosingFakeRelayClient(
+            [self._forwarded(inner, forwarder)
+             for inner in self._popular(5)])
+        querier = self.querier(relay)
+        out = querier.query_exact("track", [SUBJECT])
+        self.assertFalse(relay.stream.closed)
+        self.assertEqual(out["admitted"], 5)
+        entry = out["records"][0]["fields"]["deezer_id"]["values"][0]
+        self.assertEqual(entry["support"], 5)
+
+    def test_forwarded_bar_closes_after_two_direct_answerers(self):
+        # The same forwarded bar, followed by direct batches from
+        # two further origins: the deferred check runs when the
+        # second direct answerer lands and closes there — the
+        # eighth envelope is never admitted.
+        forwarder = NodeIdentity(key="f1" * 32)
+        envs = [self._forwarded(inner, forwarder)
+                for inner in self._popular(5)]
+        for key in ("06", "07", "08"):
+            origin = NodeIdentity(key=key * 32)
+            envs.append(envelope(
+                origin, claims=track_claims(),
+                attestation=standing_attestation(origin)))
+        relay = ClosingFakeRelayClient(envs)
+        querier = self.querier(relay)
+        out = querier.query_exact("track", [SUBJECT])
+        self.assertTrue(relay.stream.closed)
+        self.assertEqual(out["admitted"], 7)
+        entry = out["records"][0]["fields"]["deezer_id"]["values"][0]
+        self.assertEqual(entry["support"], 7)
+
+    def test_shapeless_forward_replays_never_close(self):
+        # Gate fold 2, the must-fix regression: one forwarder
+        # replays five standing origins' batches as
+        # {"forward": {}, "envelope": <origin batch>} — a dict
+        # `forward` with the signed forwarding fields left out.
+        # Unwrap used to hand admission the inner batch while the
+        # classifier called it NOT forwarded, so each replay
+        # counted as its own DIRECT answerer: standing 5, direct
+        # 5, and the ask closed on one node's cache. Admission now
+        # drops the shape as malformed before any accounting, so
+        # nothing is admitted and the window runs out in full.
+        relay = ClosingFakeRelayClient(
+            [{"forward": {}, "envelope": inner}
+             for inner in self._popular(5)])
+        querier = self.querier(relay)
+        out = querier.query_exact("track", [SUBJECT])
+        self.assertFalse(relay.stream.closed)
+        self.assertEqual(out["admitted"], 0)
+        self.assertEqual(out["dropped"], 5)
+        self.assertFalse(out["records"][0]["found"])
+
+    def test_direct_answerers_need_standing(self):
+        # Gate fold 2, SF-2: the 2-answerer rule counts only
+        # direct answerers whose own batches carry STANDING. The
+        # forwarded bar plus two direct answers from fresh
+        # zero-standing keys — and even one direct standing
+        # answer — must not clear it; only the SECOND direct
+        # standing answer does.
+        forwarder = NodeIdentity(key="f1" * 32)
+        envs = [self._forwarded(inner, forwarder)
+                for inner in self._popular(5)]
+        for key in ("11", "12"):
+            fresh = NodeIdentity(key=key * 32)
+            envs.append(envelope(fresh, claims=track_claims()))
+        for key in ("06", "07", "08"):
+            origin = NodeIdentity(key=key * 32)
+            envs.append(envelope(
+                origin, claims=track_claims(),
+                attestation=standing_attestation(origin)))
+        relay = ClosingFakeRelayClient(envs)
+        querier = self.querier(relay)
+        out = querier.query_exact("track", [SUBJECT])
+        self.assertTrue(relay.stream.closed)
+        # 5 forwarded + 2 zero-standing direct + "06" (first
+        # standing direct: rule still short) + "07" (second: the
+        # deferred check runs and closes). "08" is never read —
+        # had zero-standing directs counted, the close would have
+        # fired two envelopes earlier.
+        self.assertEqual(out["admitted"], 9)
+
+    def test_own_key_never_counts_as_a_direct_answerer(self):
+        # Gate fold 2, fix (c): this node's own batch arriving as
+        # a direct standing answer to its own ask is not ANOTHER
+        # node answering. The forwarded bar plus the asker's own
+        # direct batch plus one other direct standing batch stays
+        # deferred; the close fires only when a second OTHER node
+        # answers directly.
+        forwarder = NodeIdentity(key="f1" * 32)
+        envs = [self._forwarded(inner, forwarder)
+                for inner in self._popular(5)]
+        envs.append(envelope(
+            self.identity, claims=track_claims(),
+            attestation=standing_attestation(self.identity)))
+        for key in ("06", "07", "08"):
+            origin = NodeIdentity(key=key * 32)
+            envs.append(envelope(
+                origin, claims=track_claims(),
+                attestation=standing_attestation(origin)))
+        relay = ClosingFakeRelayClient(envs)
+        querier = self.querier(relay)
+        out = querier.query_exact("track", [SUBJECT])
+        self.assertTrue(relay.stream.closed)
+        # 5 forwarded + own + "06" + "07" (the second other direct
+        # standing answerer) = 8; had the own key counted, the
+        # close would have fired at 7.
+        self.assertEqual(out["admitted"], 8)
+
+    def test_unnegotiated_session_rides_the_full_window(self):
+        # Gate fold 2, SF-1: sufficiency is reached (five direct
+        # standing answers), the negotiated path is consulted —
+        # and refuses, because this session never negotiated the
+        # close. The ask must then consume the FULL window: no
+        # local early exit while the relay keeps forwarding.
+        relay = UnnegotiatedFakeRelayClient(self._popular(6))
+        querier = self.querier(relay)
+        out = querier.query_exact("track", [SUBJECT])
+        self.assertGreaterEqual(relay.stream.close_early_calls, 1)
+        self.assertFalse(relay.stream.closed)
+        self.assertEqual(out["admitted"], 6)
+        entry = out["records"][0]["fields"]["deezer_id"]["values"][0]
+        self.assertEqual(entry["support"], 6)
+
+    def test_stream_without_close_is_exactly_todays_behavior(self):
+        # The plain fake's stream has no close(): the ask consumes
+        # everything and merges it all, as asks did before the
+        # message existed (the lost-close case, by construction).
+        relay = FakeRelayClient(self._popular(6))
+        querier = self.querier(relay)
+        out = querier.query_exact("track", [SUBJECT])
+        self.assertEqual(out["admitted"], 6)
+        entry = out["records"][0]["fields"]["deezer_id"]["values"][0]
+        self.assertEqual(entry["support"], 6)
+
+
 if __name__ == "__main__":
     unittest.main()

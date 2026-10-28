@@ -72,19 +72,54 @@ class Admission:
     batch_id: str | None = None
     origin_node: str | None = None
     standing: bool = False
+    forwarded: bool = False
 
 
 def unwrap_envelope(envelope: Any) -> dict[str, Any] | None:
     """The signed {batch, sig} envelope admission judges: the
     envelope itself for a direct answer, the inner envelope of a
     forwarding envelope for a re-served one (§6 — re-served copies
-    count once, under the ORIGIN's key and age)."""
+    count once, under the ORIGIN's key and age).
+
+    Unwrap and classification share ONE predicate (gate fold 2):
+    an envelope is unwrapped only when `is_forwarding_envelope`
+    says it has the full signed forwarding shape. Any other
+    envelope carrying a ``forward`` key returns None here, so
+    admission drops it as malformed — the two must never disagree
+    again, because the disagreement was load-bearing: a bare
+    ``{"forward": {}, "envelope": ...}`` unwrapped to the inner
+    batch while classifying as NOT forwarded, so one forwarder's
+    replays counted as many nodes answering directly."""
     if not isinstance(envelope, dict):
         return None
-    if isinstance(envelope.get("forward"), dict):
+    if "forward" in envelope:
+        if not is_forwarding_envelope(envelope):
+            return None
         inner = envelope.get("envelope")
         return inner if isinstance(inner, dict) else None
     return envelope
+
+
+def is_forwarding_envelope(envelope: Any) -> bool:
+    """Whether an envelope has the real forwarding shape: a signed
+    forwarding attestation naming the origin batch and node,
+    wrapping the origin envelope. This predicate is the ONLY
+    definition of a forwarding envelope — unwrap, classification,
+    and the client's stamp check all key off the same shape. A
+    bare ``forward`` key is not a forwarding envelope; an envelope
+    carrying one without the full shape is malformed, never a
+    direct batch that happens to carry an unrelated value."""
+    if not isinstance(envelope, dict):
+        return False
+    forward = envelope.get("forward")
+    if not isinstance(forward, dict):
+        return False
+    if not isinstance(envelope.get("envelope"), dict):
+        return False
+    return all(
+        isinstance(forward.get(field), str)
+        for field in ("origin_batch_id", "origin_node",
+                      "forwarded_at", "sig"))
 
 
 def _drop(reason: str, origin_node: str | None = None) -> Admission:
@@ -110,6 +145,7 @@ def admit_envelope(
     nothing can verify, so every attestation admits at zero
     support — never a bypass of the four checks."""
     received = time.time() if now is None else now
+    forwarded = is_forwarding_envelope(envelope)
     inner = unwrap_envelope(envelope)
     if inner is None:
         return _drop("malformed_envelope")
@@ -180,4 +216,5 @@ def admit_envelope(
     return Admission(
         admitted=True,
         reason="admitted" if standing else "admitted_zero_support",
-        batch_id=batch_id, origin_node=origin, standing=standing)
+        batch_id=batch_id, origin_node=origin, standing=standing,
+        forwarded=forwarded)

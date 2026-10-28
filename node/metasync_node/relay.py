@@ -379,6 +379,12 @@ class _QueryState:
     reply_private: bytes | None = None
     completed_at: float | None = None
     complete_grace_seconds: float = DEFAULT_GRACE_SECONDS
+    # Early close (post-v2): the outbox this query was actually
+    # delivered on — the close must ride the SAME connection the
+    # query did, or the relay ignores it — and whether a close
+    # was already sent for it (a query closes once).
+    delivered_outbox: Any | None = None
+    close_sent: bool = False
 
     @property
     def deadline(self) -> float:
@@ -462,7 +468,34 @@ class _QueryStream:
     def close(self) -> None:
         if not self._done:
             self._done = True
+            # The consumer stopped early: tell the relay, when the
+            # session negotiated it, so it stops forwarding (and
+            # stops charging answerers for) answers this stream no
+            # longer wants. Best-effort only — the unregister
+            # above already ends the stream locally.
+            self._client._maybe_send_close(self._state)
             self._client._unregister_query(self._state)
+
+    def close_early(self) -> bool:
+        """End the stream NOW on the querier's sufficiency call —
+        but only when the wire `close` was queued for delivery to
+        the relay. Returns whether the stream ended.
+
+        An unnegotiated session (or an unsendable close: already
+        completed, never delivered, connection gone) leaves the
+        stream completely untouched — not done, not unregistered —
+        so the consumer keeps riding the window exactly as it did
+        before the close message existed. Anything weaker would
+        cut the stream locally while the relay, never told, keeps
+        forwarding answers and charging their senders for bytes
+        nobody reads (gate fold 2, SF-1)."""
+        if self._done:
+            return False
+        if not self._client._maybe_send_close(self._state):
+            return False
+        self._done = True
+        self._client._unregister_query(self._state)
+        return True
 
     def __del__(self) -> None:
         try:
@@ -559,6 +592,12 @@ class RelayClient:
         # long after `complete` this session's queries stay open for
         # in-flight answers. None before the first v2 welcome.
         self._relay_grace_seconds: float | None = None
+        # Whether the live relay advertised the early-close
+        # capability in its welcome: only then does this client
+        # ever send a `close` message (a relay that predates it
+        # would merely ignore one, but the capability is the
+        # contract — the sender side never guesses).
+        self._relay_early_close: bool = False
 
         self._thread: threading.Thread | None = None
         self._stop_evt = threading.Event()
@@ -976,6 +1015,7 @@ class RelayClient:
                     self._reauth_pending_exp = None
                     self._session_relay_identity = None
                     self._relay_grace_seconds = None
+                    self._relay_early_close = False
                     self._finish_all_queries()
                 self._ws = None
                 self._outbox = None
@@ -1131,6 +1171,19 @@ class RelayClient:
                 # so the wait stays bounded however large it claims.
                 self._relay_grace_seconds = min(
                     float(grace), MAX_RELAY_GRACE_SECONDS)
+            # Early close is capability-negotiated: the exact
+            # JSON value `true` for `early_close` in this welcome's
+            # capabilities is the only license to send a `close`
+            # message for the life of this session. Anything else —
+            # no capabilities, a non-dict, a falsy flag, or a truthy
+            # value of another type — is "not negotiated": the
+            # client then never sends one and its queries end
+            # exactly as they always did, at the window.
+            caps = reply.get("capabilities")
+            self._relay_early_close = bool(
+                isinstance(caps, dict)
+                and caps.get("early_close") is True
+            )
         self._apply_revocations(reply.get("revocations"))
 
     async def _shutdown_ws(self) -> None:
@@ -1294,18 +1347,53 @@ class RelayClient:
         )
 
     def _stamp_matches(self, stamp: Any, envelope: dict[str, Any]) -> bool:
-        """The sender-stamp pre-filter (design section 11): for a
-        DIRECT answer, the relay's stamp names the authenticated
-        answerer; the batch header names the signer. A mismatch means
-        the envelope is not what the relay routed — drop it here,
-        before any signature verification anywhere downstream.
-        Forwarding envelopes keep their step-4 semantics (the stamp
-        names the forwarder, the header the origin) and are never
-        checked; with no stamp (a v1 relay) there is nothing to check."""
+        """The sender-stamp pre-filter (design section 11): the
+        relay's stamp names the authenticated connection that
+        handed it this answer, so a mismatch with what the
+        envelope claims means the envelope is not what the relay
+        routed — drop it here, before any signature verification
+        anywhere downstream. The rules, by envelope kind:
+
+        - DIRECT answer: the stamp must name the batch's signer
+          (the stamp names the answerer; the header names the
+          signer).
+        - FORWARDING envelope (the full signed step-4 shape):
+          the stamp names the forwarder and the header the
+          origin, so the two are never COMPARED — the exemption
+          is the comparison, not the stamp's presence. A `forward`
+          key short of the full shape earns no exemption at all
+          (see below).
+        - NO STAMP, or a stamp naming no sender: on an
+          unnegotiated session there is nothing to check — a v1
+          relay stamps nothing — and the answer passes exactly as
+          it always has. On a session that negotiated early
+          close, the session is speaking to a v2 relay, and v2
+          stamps every answer it routes, so a stamp-less answer
+          did not come through the routing and is refused
+          outright, for forwards as for direct answers (DATA
+          section 19; gate confirmation 2, note 1, and
+          confirmation 3)."""
         if not isinstance(stamp, dict):
-            return True
+            return not self._relay_early_close
+        claimed = stamp.get("from")
+        if self._relay_early_close and not isinstance(claimed, str):
+            # Negotiated session: the stamp must name a sender
+            # for forwards too — section 19 refuses a stamp
+            # naming no sender outright on such a session, with
+            # no forwarding exemption.
+            return False
         if self._is_forwarding_envelope(envelope):
             return True
+        if "forward" in envelope:
+            # A `forward` key without the full forwarding shape
+            # (gate fold 2): not an honest re-serve, and not a
+            # plain direct batch either — one variant puts the
+            # sender's own batch at the top-level `batch` key this
+            # check reads while a different origin's batch rides
+            # under `envelope`, which is what admission judges.
+            # Reject it here; admission drops the same shape as
+            # malformed, so the two layers agree.
+            return False
         batch = envelope.get("batch")
         if not isinstance(batch, dict):
             return True
@@ -1313,8 +1401,13 @@ class RelayClient:
         if not isinstance(header, dict):
             return True
         node = header.get("node")
-        claimed = stamp.get("from")
-        if not isinstance(node, str) or not isinstance(claimed, str):
+        if not isinstance(claimed, str):
+            # Unnegotiated only — a negotiated session with a
+            # sender-less stamp already returned above. The stamp
+            # names no sender: stamp-less in effect, nothing to
+            # check.
+            return True
+        if not isinstance(node, str):
             return True
         try:
             signer_id = hashlib.sha256(b64url_decode(node)).hexdigest()
@@ -1424,6 +1517,11 @@ class RelayClient:
             self._fail_query(state, "relay connection dropped before the query was sent")
             return
         outbox.put_nowait(text)
+        # The query is on the wire now: remember WHICH connection
+        # carries it. The relay honors an early close only from the
+        # connection that owns the query, so a close must ride this
+        # exact outbox or it is ignored by design.
+        state.delivered_outbox = outbox
 
     def _unregister_query(self, state: _QueryState) -> None:
         with self._lock:
@@ -1432,8 +1530,82 @@ class RelayClient:
 
     def _complete_query(self, state: _QueryState) -> None:
         """End a query's stream normally and stop routing to it."""
+        # A buffer-cap finish is this node quitting the query
+        # early exactly like a consumer close: the relay gets the
+        # same early close, queued for delivery BEFORE the state
+        # is finished, or it keeps forwarding answers nobody will
+        # read and charging their senders for them.
+        self._maybe_send_close(state)
         state.finished.set()
         self._unregister_query(state)
+
+    def _maybe_send_close(self, state: _QueryState) -> bool:
+        """Best-effort early close for one query (post-v2,
+        capability-negotiated). Every skip below is a silent no-op
+        and leaves behavior exactly as it was before the message
+        existed — the stream already ended locally, and the relay
+        ends the query at the window on its own:
+
+        - the live relay never advertised `early_close`;
+        - the query never reached the wire (no owning outbox);
+        - the query was already closed, or the relay already
+          ended it itself (`complete` seen — nothing to close);
+        - the state already finished another way (window deadline,
+          teardown — teardown orphans the query at the relay,
+          which purges it on its own schedule).
+
+        Otherwise the close is queued for delivery on the query's
+        own outbox: a close riding any other connection would be
+        ignored by the relay, by design. If that connection is
+        gone, the relay has already orphaned the query and there
+        is nothing to close. Nothing here may raise into a consumer.
+
+        Returns whether the close was queued for delivery — the
+        querier's sufficiency path (stream.close_early) ends a
+        stream early ONLY on a True here, so an unnegotiated
+        session leaves the stream riding its window instead of
+        cutting it locally while the relay keeps forwarding.
+        Queued is not delivered: delivery re-checks the session on
+        arrival, and if the owning connection died in between, the
+        frame is never sent. Ending the local stream on a True is
+        still correct — a dead connection means the relay already
+        orphaned the query, so there was nothing left to close."""
+        with self._lock:
+            outbox = state.delivered_outbox
+            if (
+                not self._relay_early_close
+                or outbox is None
+                or state.close_sent
+                or state.completed_at is not None
+                or state.finished.is_set()
+            ):
+                return False
+            state.close_sent = True
+        text = json.dumps({"type": "close", "query_id": state.query_id})
+        loop = self._loop
+        if loop is None:
+            return False
+        if threading.get_ident() == self._loop_thread_id:
+            self._deliver_close(outbox, state, text)
+        else:
+            try:
+                loop.call_soon_threadsafe(self._deliver_close, outbox, state, text)
+            except RuntimeError:
+                return False  # the loop is gone; the query ends at the window
+        return True
+
+    def _deliver_close(
+        self, outbox: asyncio.Queue, state: _QueryState, text: str
+    ) -> None:
+        """Queue the close on the query's own connection (loop
+        thread). Re-checks the session on arrival: if the owning
+        connection tore down since the close was decided, the
+        relay already orphaned the query — sending the close on
+        the replacement connection would be ignored anyway, and
+        is not attempted."""
+        if self._outbox is not outbox or not self._connected:
+            return
+        outbox.put_nowait(text)
 
     def _fail_query(self, state: _QueryState, error: str) -> None:
         """End a query's stream with an error the consumer will raise."""

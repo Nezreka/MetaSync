@@ -93,6 +93,7 @@ class MatrixTest(AdmissionCase):
     def test_clean_batch_without_attestation_admits_zero_support(self):
         out = self.admit(envelope(self.origin))
         self.assertTrue(out.admitted)
+        self.assertFalse(out.forwarded)
         self.assertFalse(out.standing)
         self.assertEqual(out.reason, "admitted_zero_support")
         self.assertEqual(self.cached(), 1)
@@ -229,8 +230,53 @@ class ForwardingTest(AdmissionCase):
         fwd["sig"] = forwarder.sign(C.canonical_bytes(fwd))
         out = self.admit({"forward": fwd, "envelope": inner})
         self.assertTrue(out.admitted)
+        self.assertTrue(out.forwarded)
         self.assertEqual(out.origin_node, self.origin.public_key_b64url)
         self.assertTrue(out.standing)
+
+    def test_forward_key_without_the_signed_shape_drops(self):
+        # Gate fold 2: unwrap and classification disagreed about
+        # what a forwarding envelope is — a dict-valued `forward`
+        # with the signed fields left out unwrapped to the inner
+        # batch while classifying as NOT forwarded, so one node
+        # replaying cached batches under this shape made every
+        # origin look like a direct answerer. The honest inner
+        # batch below is fully valid and standing; under the old
+        # unwrap it admitted as a direct answer. Now any `forward`
+        # key short of the full shape is malformed, however valid
+        # what it wraps is.
+        inner = envelope(self.origin,
+                         attestation=standing_attestation(self.origin))
+        for junk_forward in (
+                {},
+                {"origin_batch_id": C.batch_digest(inner["batch"])},
+                {"origin_node": self.origin.public_key_b64url,
+                 "forwarded_at": "2026-10-27T00:00:00+00:00",
+                 "sig": "unsigned"},
+                "not-even-a-dict"):
+            out = self.admit({"forward": junk_forward, "envelope": inner})
+            self.assertFalse(out.admitted, junk_forward)
+            self.assertEqual(out.reason, "malformed_envelope")
+        self.assertEqual(self.cached(), 0)
+
+    def test_forward_key_beside_an_own_batch_drops(self):
+        # The variant: a valid batch of the SENDER's at the top
+        # level (which is what a stamp check reads) plus a
+        # different origin's batch under `envelope` (which is
+        # what the old unwrap judged). The envelope is malformed
+        # as a whole — neither batch is admitted.
+        inner = envelope(self.origin,
+                         attestation=standing_attestation(self.origin))
+        sender = NodeIdentity(key="dd" * 32)
+        own = envelope(sender,
+                       attestation=standing_attestation(sender))
+        forged = dict(own)
+        forged["forward"] = {}
+        forged["envelope"] = inner
+        out = self.admit(forged)
+        self.assertFalse(out.admitted)
+        self.assertEqual(out.reason, "malformed_envelope")
+        self.assertEqual(self.cached(), 0)
 
 
 class OwnPoolForgeryTest(AdmissionCase):

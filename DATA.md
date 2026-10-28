@@ -672,6 +672,47 @@ This section covers only the node's connection to it.
   the pool's public key, and checks the issuer's signed revocation
   list. Whether the node's key is valid and bound was checked by
   the portal when it issued that token, not by the relay.
+- **Early close.** A query's window runs its full course by default,
+  but the ASKING node may end its own query early with a `close`
+  message carrying the query id (the querier's sufficiency rule is
+  §19). It is a post-v2 addition negotiated by CAPABILITY, not a
+  version bump: the relay advertises `early_close` in its v2 welcome
+  capabilities, and a node sends `close` only to a relay that
+  advertised it (the client adopts the capability only when the
+  advertised value is exactly JSON `true`). Capability negotiation
+  remains the client-side discipline that decides whether a close
+  is ever SENT; relay-side, a close is honored only on OWNERSHIP
+  AND protocol v2 — the same connection the query was routed on,
+  speaking version 2 or above. A close from a v1 connection is
+  ignored, so v1 traffic keeps exactly its pre-close treatment.
+  A relay that predates the message ignores it (the dispatch
+  already ignores unknown message types on v2 connections),
+  and a peer that never sends one behaves exactly as before — its
+  queries end at the window. The relay honors a close ONLY from the
+  owning v2 connection; a close for an unknown, finished, or foreign
+  query is ignored with identical silence, so the response never
+  reveals whether the query exists. On an honored close the query's fan-out
+  state is freed at once and the id joins the same purged tombstones
+  a window-expired query leaves. A tombstone remembers the asker's
+  node id: if the asker itself re-registers the spent id it gets the
+  `duplicate_query` refusal, but a NON-owner re-registering it gets
+  exactly the treatment an id still open would draw (the
+  `query_id_in_use` violation) — the response must not tell a fan-out
+  recipient whether the asker has already closed. Answers still in
+  flight are dropped
+  silently and are NEVER charged — not against the per-query total
+  byte budget, not against the answering node's hourly byte budget,
+  never a strike — because they were solicited in good faith before
+  the close. No `complete` is sent back: the asker initiated the
+  close and ends its own stream. The relay counts honored closes
+  (`queries_closed_early`) in its aggregate counters; nothing else
+  about a close is recorded. One inference survives all of this,
+  named rather than hidden: an answer sent while the query is
+  still open IS charged against the answering node's hourly byte
+  budget while an answer sent after a close is dropped uncharged,
+  so a fan-out recipient watching its own budget can tell open
+  from closed — the same inference window expiry already allowed,
+  accepted as low-value.
 - **The switch.** The node connects only when the user turns the
   metadata network on: settings `meta_network`, **default off**, plus
   a relay URL in `meta_relay_url`. With no URL stored, the node dials
@@ -810,13 +851,135 @@ merged view (DESIGN-METADATA.md §5–§9; code in
   relay connection itself (`meta_network`); without a client,
   queries answer from local data + cache alone and say so
   (`asked_network: false`).
-- **Early close (§10).** A network ask need not ride the full
-  answer window: once the answers in hand are enough — the
-  agreed shape is about five strong-verified answers — the
-  node sends `close` for the query and stops admitting for it,
-  and the relay drops anything that arrives later, never
-  charged. A query with few answers rides the full window, so
-  a niche item's few owners are never cut off.
+- **Early close — when an ask stops waiting (§17).** An EXACT ask
+  rides its full window unless the merged view of what has ALREADY
+  arrived is sufficient, where SUFFICIENT is pinned to merge's own
+  terms: for EVERY subject the query carried, the subject's merged
+  record is found AND at least one merged IDENTITY value on it — a
+  provider id, an MBID, or an ISRC (claims.py's identity set) —
+  carries support ≥ 5, support in merge's exact sense (distinct
+  standing origins, this node's own key excluded, `network`-sourced
+  rows excluded). Agreement on anything else never suffices: a
+  SoulID subject's name is what its id is computed from, so a crowd
+  can unanimously agree on the name while every provider id is
+  still contested — and contested ids are exactly what the rest of
+  the window is for. A provider ref riding verbatim counts only once it
+  has resolved; an unresolved ref blocks sufficiency, since a
+  later answer may still hold it. A RESOLVED verbatim ref carries
+  a further condition: the identity value MATCHING the asked ref —
+  that provider's field carrying that exact id — must itself carry
+  support ≥ 5 on every subject the ref resolved to. The general
+  any-identity bar cannot vouch for a verbatim ref, because the
+  ref→subject link it rides on may rest on a single zero-standing
+  assertion: one such key can plant `deezer:X` on a popular subject
+  whose unrelated Spotify id is genuinely well supported, and the
+  old rule closed on that strength before the real owner of X
+  answered. If the matching value does not carry the bar, the entry
+  counts as unresolved and blocks closing, exactly like a ref that
+  has not resolved at all.
+  Sufficiency additionally requires at least TWO DISTINCT DIRECT
+  ANSWERERS WITH STANDING in the stream — nodes whose own batches
+  arrived, in this stream, carrying standing; forwarding envelopes
+  never make their carrier a direct answerer, and the asking
+  node's own key never counts (it is not another node answering
+  its own ask). The standing condition is load-bearing: without
+  it, two fresh zero-standing keys answering directly plus
+  forwarded standing batches would clear a rule meant to keep one
+  cheap source from ending the window. Forwarded copies still count toward an
+  identity value's support (they are the origin's signed claims,
+  counted once under the origin), but the whole bar arriving as
+  replays through ONE forwarder does not license closing: that one
+  node could be replaying a stale cache while the origins' current
+  batches (including retractions) are still in flight. When the
+  standing bar lands before the second direct answerer, the check
+  is deferred until that answerer arrives. A "forwarded copy"
+  means the honest shape only: the full signed forwarding envelope
+  (origin batch id, origin node, forwarded_at, signature) wrapping
+  the origin envelope. Unwrap and classification share that ONE
+  predicate — an earlier shape let a bare `{"forward": {},
+  "envelope": ...}` unwrap to the inner batch at admission while
+  classifying as NOT forwarded, so one forwarder's replays each
+  counted as a separate direct answerer (standing 5, direct 5)
+  and closed the ask on a single node's cache. Any envelope
+  carrying a `forward` key short of the full shape is now dropped
+  at admission as malformed, and the client's stamp check refuses
+  the same shape before routing. The stamp check itself is
+  stricter on a session that negotiated early close: a v2 relay
+  stamps every answer it routes, so an answer arriving without a
+  stamp (or with a stamp naming no sender) did not come through
+  the routing and is refused outright — on an unnegotiated
+  session, where a v1 relay never stamps, it still passes
+  unchecked exactly as before. The plan's example bar was "5
+  strong-verified answers": §7 verification runs only AFTER an
+  ask returns, so fresh answers carry no verdict mid-stream and
+  "strong-verified" cannot be evaluated for the answers a close
+  would cut off — 5 distinct standing origins asserting the same
+  value is the honest pre-verification form of that bar, and it
+  is deliberately the crowd signal, not a per-origin verdict. The
+  check runs on a real merge of the admitted cache (never on raw
+  arrivals), first when 5 distinct standing origins have
+  contributed AND two distinct direct answerers with standing
+  have arrived —
+  deferred to the second direct answerer when the standing bar
+  lands first — and again at each doubling (10, 20, …), so its cost
+  stays rare relative to the stream. Three properties are the
+  point: a NICHE query never closes early — with fewer than 5
+  standing origins in total, or fewer than two direct answerers,
+  the check never even runs, and a
+  subject nobody answered keeps the query open to the window's
+  end (early close is a popular-item optimization only); closing
+  is BEST-EFFORT — a lost close, an unnegotiated relay, or a
+  checker error all leave behavior exactly as it was, the query
+  ending at its window, and on an unnegotiated session the ask
+  does not even end LOCALLY: the stream ends early only when the
+  wire close was queued for delivery on the owning connection, so
+  sufficiency reached without
+  negotiation is simply unused and the window runs in full (an
+  earlier shape ended the local stream anyway, leaving the relay
+  forwarding — and charging answerers for — answers nobody read);
+  and nothing downstream changes — what
+  arrived still merges, verifies, and sanity-checks through the
+  normal post-ask path, so an early-closed ask differs from a
+  full-window one only in what never arrived.
+  TEXT asks never close early. A text ask's terms re-resolve
+  over a set that grows as answers land — resolution is
+  progressive — so a sufficiency check mid-stream can only
+  judge the subjects resolved SO FAR: the fast terms would
+  read sufficient and the query would close over the obscure
+  term whose answers arrive late, silently truncating its
+  results. The exact path anchors on its ask-start subject
+  set; the text path has no anchor, and completeness is the
+  point of asking by name. Text asks ride the full window,
+  always.
+  Name the missed workload honestly: sufficiency is an
+  EVERY-subject rule, so a multi-subject batch ask closes
+  early only when EVERY carried subject clears the bar — rare
+  enough that the optimization effectively serves
+  single-subject click asks, the workload it was built for.
+  Fan-out itself is one query per ask either way, so nothing
+  about the relay's load changes for batch asks; they simply
+  wait, as they always did.
+  The cut-off tail's sharpest consequence is disputes. For
+  fields no provider can verify in v1 (the Spotify, Tidal and
+  iTunes ids), a dispute that would have arrived in the
+  cut-off tail is not merely delayed: the admitted claims make
+  the subject LIVE in this node's cache, so a later identical
+  ask is cache-served and never re-asks — the one-sided view
+  persists until the unverified claims age out (90 days).
+  What is NOT exposed is promotion: support alone never
+  promotes — the floor's legs require verification or a local
+  confirmation fetch — so a cut-off dispute costs display-tier
+  completeness, never a wrong value in the library. Accepted
+  for v1.
+  A quieter gradient rides along: claims admitted before a
+  close are re-served with their original attribution — no
+  support laundering — but a popular item's cached claims skew
+  toward its FASTEST responders, and variants held only by
+  slow nodes propagate less readily than the full-window set
+  would have carried. Across many askers this partially
+  self-corrects (each asker's close lands at a different
+  point in its own stream), but the skew is real and is named
+  rather than hidden.
 - **Legacy aliases.** The export serves `soul_id` +
   `soul_id_legacy` per row; the builder learns the mapping into
   the store's `legacy_aliases` table ONLY when it verifies — the
@@ -1387,3 +1550,25 @@ one place the full record is rendered whole
   the store, and the page's chrome checks existence without
   touching it — the §19 `meta_status` doctrine, applied to a
   browser surface.
+
+## 21. Known issue — provider-index resolution without standing (named, not fixed here)
+
+- **A planted provider link can steer local resolution.** A
+  provider ref (`deezer:X`) resolves locally through the provider
+  index, and admission writes index links for EVERY admitted
+  batch — including batches with no standing at all. When a ref
+  resolves locally through such a link, the ask goes to the
+  network carrying the resolved SoulID and never the ref itself,
+  so the ref's real owner is never asked: the question was
+  silently redirected by a link nobody vouched for. The claims
+  behind the planted link still count only their own support and
+  nothing promotes on them, but display and resolution follow
+  the link. This is PRE-EXISTING — it predates early close, and
+  early close adds nothing to it (the §19 matching-value rule
+  guards only refs that actually ride verbatim to the network) —
+  and it affects every ask, not just closable ones. It is
+  ticketed for its own change: whether a link may resolve locally
+  only with standing (or some support) behind it, or whether a
+  locally resolved ref should ALSO ride verbatim so its owner is
+  asked, is a resolution-semantics decision, deliberately not
+  folded into the early-close work.
