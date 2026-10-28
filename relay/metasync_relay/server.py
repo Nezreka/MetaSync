@@ -5,6 +5,10 @@ A dumb switchboard, by specification:
 - queries fan out to the other connected nodes; answers route only to
   the connection that asked, only for query IDs the relay actually
   routed, only inside the answer window plus a grace period;
+- an asker may end its own query early with a `close` message
+  (post-v2, advertised in the welcome's capabilities): the query's
+  fan-out state is freed at once and its late answers take the
+  purged-query path — dropped silently, never charged;
 - budgets are byte-based (section 10): answer bytes per node per query
   and per hour, plus a query count per hour. Late answers are dropped,
   never charged; cap hits are silent drops; violations decay;
@@ -48,6 +52,7 @@ from .protocol import (
     MAX_FRAME_BYTES,
     Answer,
     Bye,
+    Close,
     Done,
     Hello,
     ProtocolError,
@@ -138,6 +143,7 @@ class RelayCounters:
 
     queries_routed: int = 0
     queries_answered: int = 0
+    queries_closed_early: int = 0
     answers_forwarded: int = 0
     answers_dropped: int = 0
     bytes_in: int = 0
@@ -149,6 +155,7 @@ class RelayCounters:
         return {
             "queries_routed": self.queries_routed,
             "queries_answered": self.queries_answered,
+            "queries_closed_early": self.queries_closed_early,
             "share_answered": (
                 round(self.queries_answered / self.queries_routed, 4)
                 if self.queries_routed
@@ -293,6 +300,17 @@ class _OpenQuery:
             self.all_responded_at = now
 
 
+@dataclass(frozen=True)
+class _PurgedQuery:
+    """A spent query id: when it was purged, and the node that had
+    asked it. The owner is remembered so a re-registration attempt
+    can be answered without revealing the query's fate to anyone
+    else (see _route_query's tombstone branch)."""
+
+    purged_at: float
+    asker_node_id: str | None
+
+
 class Relay:
     def __init__(
         self,
@@ -311,12 +329,15 @@ class Relay:
         self.presence: dict[str, _Connection] = {}
         self.open_queries: dict[str, _OpenQuery] = {}
         # Tombstones of queries this relay DID route and has since
-        # purged (query id -> monotonic purge time), pruned after an
-        # hour. An answer that arrives after the purge is late, not
+        # purged (query id -> _PurgedQuery), pruned after an hour.
+        # An answer that arrives after the purge is late, not
         # uninvited (gate S4): without the tombstone it would be
         # struck as unknown_query, and honest slowness is not an
-        # abuse signal (section 10).
-        self._purged_queries: dict[str, float] = {}
+        # abuse signal (section 10). Each tombstone also remembers
+        # the asker's node id, used only to keep a non-owner's
+        # re-registration response indistinguishable from the
+        # still-open case.
+        self._purged_queries: dict[str, _PurgedQuery] = {}
         self.node_state: dict[str, _NodeState] = {}
         self.counters = RelayCounters()
         if revocation_feed is not None:
@@ -342,6 +363,13 @@ class Relay:
             )
             self.node_state[node_id] = state
         return state
+
+    def _tombstone_query(self, query_id: str,
+                         asker_node_id: str | None, *,
+                         now: float | None = None) -> None:
+        self._purged_queries[query_id] = _PurgedQuery(
+            purged_at=self._mono() if now is None else now,
+            asker_node_id=asker_node_id)
 
     def counters_snapshot(self) -> dict:
         return self.counters.snapshot(connections_active=len(self.presence))
@@ -422,6 +450,11 @@ class Relay:
             welcome["capabilities"] = {
                 "sealing": ["hpke"],
                 "encodings": ["zstd-dict1", "none"],
+                # The asker may end its own query early with a
+                # `close` message; clients send one only to a relay
+                # whose welcome advertises it (protocol.py's
+                # early-close note).
+                "early_close": True,
             }
             # The asker's post-complete grace must match this
             # relay's admission end (gate S3): without the number,
@@ -576,7 +609,8 @@ class Relay:
                     # joins the purged set (gate S4), so a responder's
                     # late answer to it is a silent drop, not a strike.
                     del self.open_queries[query_id]
-                    self._purged_queries[query_id] = now
+                    self._tombstone_query(
+                        query_id, oq.asker.node_id, now=now)
 
     # -- send path --------------------------------------------------------
 
@@ -672,6 +706,8 @@ class Relay:
             return await self._route_answer(conn, msg, size)
         if isinstance(msg, Done):
             return await self._route_done(conn, msg)
+        if isinstance(msg, Close):
+            return self._route_close(conn, msg)
         if isinstance(msg, Reauth):
             return await self._route_reauth(conn, msg)
         return True
@@ -698,6 +734,36 @@ class Relay:
                 )
                 return True
             return await self._violate(conn, "query_id_in_use")
+        tombstone = self._purged_queries.get(query.query_id)
+        if tombstone is not None:
+            # A tombstoned id is spent (fold): the query closed or
+            # expired, and its late answers are still being absorbed
+            # by the tombstone. Re-registering the id would route
+            # those late answers — solicited by the OLD query — to
+            # a new stream (possibly a new asker's).
+            if tombstone.asker_node_id != conn.node_id:
+                # A non-owner must not learn from this response
+                # whether the id is spent or still open: the
+                # still-open case above is a query_id_in_use
+                # violation, so the tombstone case takes exactly
+                # that treatment. (A node that was fanned out to
+                # could otherwise probe the id mid-window and learn
+                # whether the asker had already closed.)
+                return await self._violate(conn, "query_id_in_use")
+            # The actual asker re-registering its own spent id gets
+            # the duplicate shape: a notice, never a strike, and
+            # before the budget charge like the duplicate check.
+            self._enqueue(
+                conn,
+                relay_message_to_json(
+                    {
+                        "type": "query_refused",
+                        "query_id": query.query_id,
+                        "reason": "duplicate_query",
+                    }
+                ),
+            )
+            return True
         state = self._state_for(conn.node_id)
         if not self._charge(state.query_times, self.config.queries_per_hour):
             # The asker learns at once (a notice, not silence) so it
@@ -749,6 +815,37 @@ class Relay:
             self._enqueue(peer, query_to_json(query, peer.version))
         if not expected:
             self._maybe_send_complete(oq, now)
+        return True
+
+    def _route_close(self, conn: _Connection, close: Close) -> bool:
+        """The asker's early close (post-v2, capability-negotiated):
+        the asker has enough answers and ends its own query before
+        the window runs out. Honored only from the connection that
+        owns the query — the same connection the query was routed
+        on — speaking protocol v2. Anything else (an unknown id, an
+        already-finished query, another connection's query, the
+        same node's NEW connection after a reconnect, or a v1
+        connection) is ignored with the identical silence, so the
+        response never reveals which case it was or that the query
+        exists at all. The v2 condition keeps v1 traffic on exactly
+        its pre-close treatment: close is a post-v2 message, and
+        capability negotiation is the client-side discipline that
+        decides whether one is ever sent.
+
+        Honoring a close frees the fan-out state at once: the
+        query leaves the open set and joins the purged tombstones,
+        so answers still in flight land on exactly the path a
+        window-expired query's late answers take — dropped
+        silently, never metered, never a strike (section 10: they
+        were solicited in good faith before the close, and honest
+        slowness is not an abuse signal). No `complete` is sent:
+        the asker initiated the close and ends its own stream."""
+        oq = self.open_queries.get(close.query_id)
+        if oq is None or oq.asker is not conn or conn.version < 2:
+            return True
+        del self.open_queries[close.query_id]
+        self._tombstone_query(close.query_id, oq.asker.node_id)
+        self.counters.queries_closed_early += 1
         return True
 
     async def _route_answer(
@@ -1087,12 +1184,13 @@ class Relay:
                 self._maybe_send_complete(oq, now)
             if now > oq.admission_end() + _PURGE_MARGIN_SECONDS:
                 del self.open_queries[query_id]
-                self._purged_queries[query_id] = now
+                self._tombstone_query(
+                    query_id, oq.asker.node_id, now=now)
         # Tombstones live an hour: long enough that any answer still
         # in flight when its query was purged has landed or died,
         # short enough that the map stays a rounding error.
-        for query_id, purged_at in list(self._purged_queries.items()):
-            if now - purged_at > 3600:
+        for query_id, tombstone in list(self._purged_queries.items()):
+            if now - tombstone.purged_at > 3600:
                 del self._purged_queries[query_id]
         # Sessions end at their token's expiry (plus a short grace
         # for the re-authentication exchange) when no re-auth landed.

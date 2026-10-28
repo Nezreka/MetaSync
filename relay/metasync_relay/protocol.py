@@ -25,6 +25,18 @@ sealed answers (``sealed``), in-band ``reauth``, the relay's
 per-connection shape rules are the server's, this module parses the
 union and validates whatever is present.
 
+Early close (a post-v2 addition, negotiated by capability, not a
+version bump): the asker's ``close`` message ends one of its own
+queries before the window runs out. It needed no version gate of
+its own — a relay that predates it raises ``unknown_type``, which
+the dispatch already IGNORES for v2 connections (a violation only
+on a v1 connection, and genuine v1 clients never send it), so the
+message alone could never break a mixed deployment. What gates
+sending is the welcome: this relay advertises ``early_close`` in
+its v2 welcome capabilities, and a client sends ``close`` only to
+a relay that advertised it. A peer that never sends one behaves
+exactly as before: its queries end at the window.
+
 JSON parsing is defensive: non-finite constants (NaN/Infinity, which
 Python's json accepts by default and would re-emit) are refused, and
 pathological nesting surfaces as a ProtocolError, never as a
@@ -104,6 +116,11 @@ class Done:
 
 
 @dataclass(frozen=True)
+class Close:
+    query_id: str
+
+
+@dataclass(frozen=True)
 class Reauth:
     token: str
     timestamp: int
@@ -115,7 +132,7 @@ class Bye:
     pass
 
 
-Message = Hello | Query | Answer | Done | Reauth | Bye
+Message = Hello | Query | Answer | Done | Close | Reauth | Bye
 
 
 def _no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
@@ -313,6 +330,11 @@ def _parse_done(obj: dict) -> Done:
     return Done(query_id=parse_query_id(obj["query_id"]))
 
 
+def _parse_close(obj: dict) -> Close:
+    _require_keys(obj, frozenset({"type", "query_id"}))
+    return Close(query_id=parse_query_id(obj["query_id"]))
+
+
 def _parse_reauth(obj: dict) -> Reauth:
     _require_keys(obj, frozenset({"type", "token", "timestamp", "signature"}))
     if not isinstance(obj["token"], str) or not obj["token"]:
@@ -373,6 +395,8 @@ def parse_message(raw: str | bytes) -> Message:
         return _parse_answer(obj)
     if mtype == "done":
         return _parse_done(obj)
+    if mtype == "close":
+        return _parse_close(obj)
     if mtype == "reauth":
         return _parse_reauth(obj)
     if mtype == "bye":

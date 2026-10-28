@@ -34,6 +34,7 @@ from typing import Any
 
 from ..relay import RelayError, RelayNotConnected
 from . import admission as meta_admission
+from . import claims as meta_claims
 from . import merge as meta_merge
 from .responder import Responder, _normalize_provider_ref
 from .store import MetaStore, provider_refs, value_key
@@ -43,6 +44,38 @@ from .verify import VERIFIABLE_FIELDS
 # prune_answer_cache). The cap is generous — eviction is a size
 # discipline, not a freshness one (aging handles freshness).
 MAX_CACHED_BATCHES = 2000
+
+# Early close (post-v2, DATA.md §19): the support bar one merged
+# IDENTITY value must clear before an ask may call a subject
+# SUFFICIENT and close its query early. Identity fields are the
+# codebase's own set (claims.py: provider ids, MBIDs, ISRC) — the
+# fields that say WHICH entity this is. Agreement on anything else
+# never suffices: a SoulID subject's name is what its id is
+# computed from, so a crowd can unanimously agree on the name
+# while every provider id is still contested, and contested ids
+# are exactly what the rest of the window is for. Support is
+# merge's own count — distinct standing origins (attested
+# ≥30 days, signature verified), own key excluded,
+# `network`-sourced rows excluded — the crowd signal the merged
+# view already computes, so the check runs on a merge that has
+# actually happened, never on raw arrivals. The plan's example
+# bar was "5 strong-verified answers": verification (§7) runs
+# only AFTER an ask returns, so a freshly admitted batch carries
+# no verdict mid-stream and "strong-verified" cannot be evaluated
+# for the answers the close would cut off; support ≥ 5 distinct
+# standing origins on an identity value is the honest
+# pre-verification translation — five independent, attested
+# libraries asserting the same identity. Two narrowings ride on
+# that general bar (DATA.md §19): a verbatim provider ref needs
+# the MATCHING identity value supported on its resolved subject,
+# because the ref→subject link itself may have no standing; and
+# the stream must contain at least two direct answerers, because
+# forwarded replays alone may all have arrived through one node.
+EARLY_CLOSE_SUPPORT = 5
+
+_IDENTITY_FIELDS = frozenset(
+    meta_claims.PROVIDER_ID_FIELDS + meta_claims.MBID_FIELDS + ("isrc",)
+)
 
 _STALE_S = meta_merge.VERIFICATION_STALE_S
 
@@ -423,13 +456,93 @@ class Querier:
 
     # -- the relay fan-out -------------------------------------------------
 
+    @staticmethod
+    def _record_sufficient(record: dict[str, Any]) -> bool:
+        """One subject's share of the early-close bar (DATA.md
+        §19): the merged record is FOUND and at least one merged
+        IDENTITY value (provider id, MBID, ISRC) carries support
+        ≥ EARLY_CLOSE_SUPPORT. A subject with answers but no
+        identity five standing origins agree on is not sufficient
+        — the disagreement is exactly what the rest of the window
+        is for."""
+        if not record.get("found"):
+            return False
+        for field, entry in record.get("fields", {}).items():
+            if field not in _IDENTITY_FIELDS:
+                continue
+            for value in entry.get("values", []):
+                if value.get("support", 0) >= EARLY_CLOSE_SUPPORT:
+                    return True
+        return False
+
+    @staticmethod
+    def _record_sufficient_for_ref(record: dict[str, Any],
+                                   ref: str) -> bool:
+        """The verbatim-ref tightening of the early-close bar: the
+        identity value the asker actually named — this provider's
+        field carrying this exact id — must itself carry support
+        ≥ EARLY_CLOSE_SUPPORT on the subject the ref resolved to.
+
+        A provider ref is not the subject's identity by itself. It
+        becomes one only through a ref→subject link in the provider
+        index, and admission writes that link even for a batch with
+        no standing. Letting ANY identity value on the resolved
+        subject clear the general bar would let one zero-standing
+        key steer the ref onto a popular subject whose unrelated
+        identity is well supported, then close before the ref's
+        real owner can answer. The matching value is the fact the
+        user asked by, so it is the fact that must be supported."""
+        normalized = _normalize_provider_ref(ref)
+        if normalized is None:
+            return False
+        provider, _, external_id = normalized.partition(":")
+        if provider == "musicbrainz":
+            field = {
+                "artist": "artist_mbid",
+                "album": "release_group_mbid",
+                "track": "recording_mbid",
+            }.get(record.get("kind"))
+        else:
+            field = f"{provider}_id"
+        if field is None:
+            return False
+        entry = record.get("fields", {}).get(field, {})
+        return any(
+            value.get("value") == external_id
+            and value.get("support", 0) >= EARLY_CLOSE_SUPPORT
+            for value in entry.get("values", []))
+
     def _ask(self, kind: str, mode: str, *, subjects=None, terms=None,
+             sufficient: Callable[[], bool] | None = None,
              ) -> dict[str, Any]:
         """Stream one relay query into admission. Relay trouble is
         a shorter answer, never an exception: what already landed
         (and everything local) still merges. "attempted" is False
         when no relay client exists at all — asked_network in the
-        result means a query actually went out."""
+        result means a query actually went out.
+
+        `sufficient`, when given, is the early-close check: once
+        EARLY_CLOSE_SUPPORT distinct standing origins have
+        contributed, at least two distinct direct answerers with
+        standing have arrived (their own standing batches, not
+        forwarding envelopes, and never this node's own key), and
+        again at each doubling of the standing count, so the merge
+        the check runs stays rare relative to the stream — it is
+        asked whether the merged view of what has arrived is
+        enough. If the standing bar lands before the direct
+        answerers, the check is deferred until the second direct
+        answerer arrives rather than being spent on a stream one
+        forwarder could have supplied alone. A yes ends the
+        stream ONLY when the session negotiated the close and the
+        wire message was queued for delivery; on an unnegotiated
+        session the stream is not even ended locally — sufficiency
+        is simply unused and the ask rides the window exactly as
+        it did before the message existed. Everything already
+        admitted still merges through the normal post-ask path.
+        The check is best-effort in both directions: a checker
+        that raises reads as "not sufficient", and a stream with
+        no close() (a test double, an older client) simply runs
+        to the window as before."""
         tally: dict[str, Any] = {"admitted": 0, "dropped": 0,
                                  "attempted": False}
         client = None
@@ -444,9 +557,89 @@ class Querier:
         try:
             stream = client.query(kind, mode, subjects=subjects,
                                   terms=terms)
+            own_key = self.identity.public_key_b64url
+            standing_origins: set[str] = set()
+            direct_answerers: set[str] = set()
+            next_check = EARLY_CLOSE_SUPPORT
+            check_deferred = False
             for envelope in stream:
                 out = self.admit(envelope)
                 tally["admitted" if out.admitted else "dropped"] += 1
+                if sufficient is None or not out.admitted:
+                    continue
+                if out.standing and out.origin_node is not None:
+                    standing_origins.add(out.origin_node)
+                if out.standing and not out.forwarded \
+                        and out.origin_node is not None \
+                        and out.origin_node != own_key:
+                    # A DIRECT ANSWERER for the 2-answerer rule
+                    # (gate fold 2): its own batch, in this stream,
+                    # carrying STANDING (SF-2 — two fresh
+                    # zero-standing keys answering directly must
+                    # not clear a rule meant to keep one cheap
+                    # source from ending the window), and never the
+                    # asker's own key (fix (c) — this node is not
+                    # another node answering its own ask).
+                    direct_answerers.add(out.origin_node)
+                if len(standing_origins) < next_check:
+                    continue
+                if len(direct_answerers) < 2:
+                    # The support bar is in, but everything that
+                    # supplied it may have arrived through one
+                    # forwarder replaying cached origin batches.
+                    # Forwarded copies count toward support (they
+                    # are the origins' signed claims), but they do
+                    # not by themselves license ending the window:
+                    # defer this milestone until a second node has
+                    # answered with its own standing batch.
+                    check_deferred = True
+                    continue
+                if not check_deferred \
+                        and len(standing_origins) > next_check:
+                    continue
+                # Advance to the next doubling above the CURRENT
+                # standing count. A deferred check can run above
+                # its original milestone (more origins landed while
+                # waiting for direct answerers), so "double the
+                # threshold" is computed from where the stream is.
+                milestone = EARLY_CLOSE_SUPPORT
+                while milestone <= len(standing_origins):
+                    milestone *= 2
+                next_check = milestone
+                check_deferred = False
+                try:
+                    enough = sufficient()
+                except Exception:  # noqa: BLE001 - best-effort
+                    enough = False
+                if not enough:
+                    continue
+                early_close = getattr(stream, "close_early", None)
+                if callable(early_close):
+                    # The negotiated path — the only one the real
+                    # client takes: the stream ends ONLY when the
+                    # wire close was queued for delivery.
+                    # Unnegotiated, sufficiency is simply unused
+                    # and the loop keeps consuming to the window;
+                    # ending the stream locally anyway would leave
+                    # the relay forwarding (and charging answerers
+                    # for) answers nobody reads (gate fold 2, SF-1).
+                    try:
+                        queued = bool(early_close())
+                    except Exception:  # noqa: BLE001 - best-effort
+                        queued = False
+                    if queued:
+                        break
+                    continue
+                closer = getattr(stream, "close", None)
+                if not callable(closer):
+                    # Nothing to signal with: the stream runs to
+                    # the window exactly as it always did.
+                    continue
+                try:
+                    closer()
+                except Exception:  # noqa: BLE001, S110 - best-effort
+                    pass
+                break
         except (RelayNotConnected, RelayError):
             pass
         if tally["admitted"]:
@@ -580,6 +773,15 @@ class Querier:
 
     # -- the ask API ---------------------------------------------------------
 
+    def _resolve_entry(self, entry: str,
+                       kind: str | None = None) -> list[str]:
+        """Local resolution for ONE exact-ask entry, in the
+        responder's deterministic order."""
+        query: dict[str, Any] = {"subjects": [entry]}
+        if kind is not None:
+            query["kind"] = kind
+        return self.responder._resolve_exact(query)
+
     def _resolve_entries(self, entries: list[str],
                          kind: str | None = None):
         """Per-entry local resolution: (subjects, ask_verbatim).
@@ -599,10 +801,7 @@ class Querier:
         subjects: list[str] = []
         ask_verbatim: list[str] = []
         for entry in entries:
-            query: dict[str, Any] = {"subjects": [entry]}
-            if kind is not None:
-                query["kind"] = kind
-            got = self.responder._resolve_exact(query)
+            got = self._resolve_entry(entry, kind)
             if got:
                 for subject in got:
                     if subject not in subjects:
@@ -627,8 +826,50 @@ class Querier:
         asked = False
         tally = {"admitted": 0, "dropped": 0}
         if network and (missing or ask_verbatim):
+            asked_subjects = list(missing)
+            verbatim_entries = list(ask_verbatim)
+
+            def _sufficient() -> bool:
+                # The bar ranges over what the query CARRIED —
+                # the missing subjects plus the verbatim refs,
+                # which count only once they resolve (an
+                # unresolved ref means some node may still hold
+                # the answer the window would have brought).
+                wanted = list(asked_subjects)
+                verbatim_subjects: dict[str, list[str]] = {}
+                for entry in verbatim_entries:
+                    resolved_for_entry = self._resolve_entry(
+                        entry, kind)
+                    if not resolved_for_entry:
+                        return False
+                    verbatim_subjects[entry] = resolved_for_entry
+                    wanted.extend(
+                        s for s in resolved_for_entry
+                        if s not in wanted)
+                rows, slots, _nv, _nr, _live, titles = \
+                    self._assemble(wanted)
+                records = {
+                    s: self._record(s, kind, rows, slots, titles)
+                    for s in wanted}
+                if not all(self._record_sufficient(records[s])
+                           for s in wanted):
+                    return False
+                # A verbatim ref additionally needs the MATCHING
+                # identity value supported on every subject it
+                # resolved to. The general any-identity bar above
+                # cannot vouch for the ref→subject link: that link
+                # may rest on one zero-standing assertion while an
+                # unrelated identity on the (wrong) subject is the
+                # value carrying five origins.
+                return all(
+                    self._record_sufficient_for_ref(records[s], entry)
+                    for entry, subjects_for_entry
+                    in verbatim_subjects.items()
+                    for s in subjects_for_entry)
+
             tally = self._ask(kind, "exact",
-                              subjects=missing + ask_verbatim)
+                              subjects=missing + ask_verbatim,
+                              sufficient=_sufficient)
             asked = tally["attempted"]
             if tally["admitted"]:
                 # Answers may resolve entries that were verbatim a
@@ -676,6 +917,18 @@ class Querier:
         # does not satisfy the query — it goes to the network like
         # an empty one, and the answers re-resolve afterwards.
         if network and not any(s in live for s in resolved):
+            # Early close is EXACT-only (fold, DATA.md §19): a
+            # text ask never arms the sufficiency closer. Text
+            # resolution is PROGRESSIVE — the terms re-resolve
+            # over a set that grows as answers land — so a
+            # mid-stream check can only judge the subjects
+            # resolved SO FAR: the fast terms would read
+            # sufficient and close the query over the obscure
+            # term whose answers arrive late, silently
+            # truncating its results. The exact path anchors on
+            # its ask-start subject set; the text path has no
+            # anchor. A text ask rides the full window, always —
+            # completeness is the point of asking by name.
             tally = self._ask(kind, "text", terms=terms)
             asked = tally["attempted"]
             if tally["admitted"]:

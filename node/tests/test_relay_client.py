@@ -1163,6 +1163,180 @@ class TestProtocolV2(RelayClientCase):
             None,
         )
         self.assertTrue(state.batches.empty())
+        # Gate fold 2: the same disguised batch with a MATCHING
+        # stamp is refused too. A `forward` key without the full
+        # shape is not a direct batch at all, so there is nothing
+        # for the stamp to vouch for — the variant being stopped
+        # puts the sender's own batch at the top-level `batch` key
+        # this check reads while a different origin's batch rides
+        # under `envelope`, which is what admission judges.
+        client._dispatch(
+            json.dumps(
+                {
+                    "type": "answer",
+                    "query_id": state.query_id,
+                    "batch": disguised,
+                    "stamp": {"from": signer.node_id,
+                                "query_id": state.query_id},
+                }
+            ),
+            None,
+        )
+        self.assertTrue(state.batches.empty())
+        # And the no-top-level-batch shape — a bare forward key
+        # wrapping another origin's envelope — never routes: the
+        # old check read "no batch" as "nothing to check" and waved
+        # it through, while admission unwrapped and judged the
+        # inner batch as a DIRECT answer.
+        wrapped = {"forward": {}, "envelope": envelope}
+        client._dispatch(
+            json.dumps(
+                {
+                    "type": "answer",
+                    "query_id": state.query_id,
+                    "batch": wrapped,
+                    "stamp": {"from": other.node_id,
+                                "query_id": state.query_id},
+                }
+            ),
+            None,
+        )
+        self.assertTrue(state.batches.empty())
+
+    def test_stamp_required_once_early_close_negotiated(self) -> None:
+        # Gate confirmation 2, note 1: with no stamp there is
+        # nothing to check, which a v1 session needs — but a
+        # session that negotiated early close is talking to a v2
+        # relay, and v2 stamps every answer it routes. A
+        # stamp-less answer on such a session did not come through
+        # the routing; passing it unchecked would let one
+        # forwarder relay cached origin batches as direct
+        # answerers and help close the ask on its own cache.
+        client = self.make_client()
+        signer = NodeIdentity(key=secrets.token_hex(32))
+        state = _QueryState(query_id="d" * 32)
+        with client._lock:
+            client._queries[state.query_id] = state
+        envelope = {
+            "batch": {
+                "header": {"version": 1, "node": signer.public_key_b64url},
+                "claims": [],
+            },
+            "sig": "c2ln",
+        }
+        stampless = json.dumps(
+            {
+                "type": "answer",
+                "query_id": state.query_id,
+                "batch": envelope,
+            }
+        )
+        # Unnegotiated: no stamp, nothing to check — the answer
+        # routes exactly as it always has.
+        client._dispatch(stampless, None)
+        self.assertEqual(state.batches.get_nowait(), envelope)
+        # Negotiated: the same stamp-less answer is refused.
+        with client._lock:
+            client._relay_early_close = True
+        client._dispatch(stampless, None)
+        self.assertTrue(state.batches.empty())
+        # A stamp that names no sender is stamp-less in effect:
+        # refused on the negotiated session as well.
+        client._dispatch(
+            json.dumps(
+                {
+                    "type": "answer",
+                    "query_id": state.query_id,
+                    "batch": envelope,
+                    "stamp": {"query_id": state.query_id},
+                }
+            ),
+            None,
+        )
+        self.assertTrue(state.batches.empty())
+        # A properly stamped answer still routes — what the
+        # negotiated session requires is a stamp, not a refusal
+        # of everything.
+        client._dispatch(
+            json.dumps(
+                {
+                    "type": "answer",
+                    "query_id": state.query_id,
+                    "batch": envelope,
+                    "stamp": {"from": signer.node_id,
+                              "query_id": state.query_id},
+                }
+            ),
+            None,
+        )
+        self.assertEqual(state.batches.get_nowait(), envelope)
+
+    def test_negotiated_session_refuses_sender_less_forward_stamp(
+            self) -> None:
+        # Gate confirmation 3: section 19 refuses a stamp naming
+        # no sender outright on a negotiated session — for
+        # forwards too. The forwarding exemption skips COMPARING
+        # the stamp to the batch header (the stamp names the
+        # forwarder, the header the origin); it does not exempt
+        # a forward from HAVING a stamp that names a sender. The
+        # stamp-less forward on a negotiated session was already
+        # refused by the missing-stamp rule; a forward whose
+        # stamp names no sender slipped through the exemption.
+        # The two cases now follow the one rule.
+        client = self.make_client()
+        signer = NodeIdentity(key=secrets.token_hex(32))
+        forwarder = NodeIdentity(key=secrets.token_hex(32))
+        state = _QueryState(query_id="e" * 32)
+        with client._lock:
+            client._queries[state.query_id] = state
+        envelope = {
+            "batch": {
+                "header": {"version": 1, "node": signer.public_key_b64url},
+                "claims": [],
+            },
+            "sig": "c2ln",
+        }
+        forwarded = {
+            "forward": {
+                "origin_batch_id": "a" * 64,
+                "origin_node": signer.public_key_b64url,
+                "forwarded_at": "2026-10-27T00:00:00+00:00",
+                "sig": "c2ln",
+            },
+            "envelope": envelope,
+        }
+
+        def dispatch(stamp) -> None:
+            msg = {
+                "type": "answer",
+                "query_id": state.query_id,
+                "batches": [forwarded],
+            }
+            if stamp is not None:
+                msg["stamp"] = stamp
+            client._dispatch(json.dumps(msg), None)
+
+        # Unnegotiated: a stamp-less forward routes — a v1 relay
+        # stamps nothing, forwards included.
+        dispatch(None)
+        self.assertEqual(state.batches.get_nowait(), forwarded)
+        with client._lock:
+            client._relay_early_close = True
+        # Negotiated: the stamp-less forward is refused...
+        dispatch(None)
+        self.assertTrue(state.batches.empty())
+        # ...and a forward whose stamp names no sender — missing
+        # or not a string — is refused under the same rule.
+        dispatch({"query_id": state.query_id})
+        self.assertTrue(state.batches.empty())
+        dispatch({"from": 42, "query_id": state.query_id})
+        self.assertTrue(state.batches.empty())
+        # A properly stamped forward still routes: the stamp
+        # names the FORWARDER, not the origin signer, and is
+        # exempt from comparison — that exemption is the point
+        # of the forwarding shape.
+        dispatch({"from": forwarder.node_id, "query_id": state.query_id})
+        self.assertEqual(state.batches.get_nowait(), forwarded)
 
     def test_pack_answer_messages_refuses_plaintext_for_sealed_query(self) -> None:
         # Gate S1, answerer hop: a query carrying a reply key is
@@ -1395,6 +1569,175 @@ class TestProtocolV2(RelayClientCase):
         self.assertLess(time.monotonic() - started, 10.0)
 
 
+class TestEarlyClose(RelayClientCase):
+    """Early close (post-v2): a consumer ending its stream early
+    tells the relay — only when the session's welcome advertised
+    the capability, only on the connection the query rode, only
+    once, and never when the relay already ended the query."""
+
+    def _hello_flag(self, caps_literal: str) -> bool:
+        client = self.make_client()
+        challenge = json.dumps(
+            {"type": "challenge", "nonce": b64url_encode(b"\x02" * 32)}
+        )
+        welcome = (
+            '{"type": "welcome", "version": 2, "peers": 0,'
+            f' "capabilities": {caps_literal}}}'
+        )
+        incoming = [challenge, welcome]
+
+        class FakeWS:
+            async def recv(self) -> str:
+                return incoming.pop(0)
+
+            async def send(self, text: str) -> None:
+                pass
+
+        asyncio.run(
+            client._hello(FakeWS(), self.server.url, "own_library", "tok")
+        )
+        return client._relay_early_close
+
+    def test_welcome_capability_adopted_only_when_advertised(self) -> None:
+        self.assertTrue(self._hello_flag('{"early_close": true}'))
+        self.assertFalse(self._hello_flag('{"early_close": false}'))
+        self.assertFalse(self._hello_flag('{"sealing": ["hpke"]}'))
+        self.assertFalse(self._hello_flag("null"))
+
+    def test_welcome_capability_requires_the_exact_true_value(self) -> None:
+        # Adoption is `is True`, not truthiness: a relay (or a
+        # downgrade in transit) claiming the capability with 1 or
+        # "yes" has not advertised it in the protocol's shape.
+        self.assertFalse(self._hello_flag('{"early_close": 1}'))
+        self.assertFalse(self._hello_flag('{"early_close": "yes"}'))
+        self.assertFalse(self._hello_flag('{"early_close": ["true"]}'))
+
+    def _wired_client(self, *, early_close: bool = True):
+        """A bare client with a live-looking session: its outbox is
+        the connection, and this thread plays the loop thread so
+        delivery is synchronous."""
+        client = RelayClient(
+            NodeIdentity(key=secrets.token_hex(32)),
+            url_provider=lambda: "",
+            mode_provider=lambda: "own_library",
+            token_provider=lambda: "tok",
+        )
+        outbox: asyncio.Queue = asyncio.Queue()
+        client._outbox = outbox
+        client._loop = asyncio.new_event_loop()
+        client._loop_thread_id = threading.get_ident()
+        with client._lock:
+            client._connected = True
+            client._relay_early_close = early_close
+        state = _QueryState(query_id="a" * 32)
+        with client._lock:
+            client._queries[state.query_id] = state
+        client._deliver_query(outbox, state, "query-text")
+        self.assertEqual(outbox.get_nowait(), "query-text")
+        self.assertIs(state.delivered_outbox, outbox)
+        return client, state, outbox
+
+    def test_stream_close_sends_one_close_on_the_query_connection(self) -> None:
+        client, state, outbox = self._wired_client()
+        stream = _QueryStream(client, state)
+        stream.close()
+        stream.close()  # a second close is a no-op, not a second frame
+        frame = json.loads(outbox.get_nowait())
+        self.assertEqual(
+            frame, {"type": "close", "query_id": state.query_id})
+        self.assertTrue(outbox.empty())
+        self.assertTrue(state.close_sent)
+
+    def test_no_close_without_the_capability(self) -> None:
+        client, state, outbox = self._wired_client(early_close=False)
+        _QueryStream(client, state).close()
+        self.assertTrue(outbox.empty())
+        self.assertFalse(state.close_sent)
+
+    def test_close_early_ends_the_stream_only_when_the_close_is_queued(
+            self) -> None:
+        # Gate fold 2, SF-1: the querier's sufficiency path ends
+        # a stream through close_early(), which reports whether
+        # the wire close was queued for delivery. Negotiated: the
+        # close is queued on the query's connection, the stream
+        # ends, the query is unregistered, and a second call is
+        # a no-op.
+        client, state, outbox = self._wired_client()
+        stream = _QueryStream(client, state)
+        self.assertTrue(stream.close_early())
+        frame = json.loads(outbox.get_nowait())
+        self.assertEqual(
+            frame, {"type": "close", "query_id": state.query_id})
+        self.assertNotIn(state.query_id, client._queries)
+        self.assertFalse(stream.close_early())
+
+    def test_close_early_without_the_capability_leaves_the_stream_open(
+            self) -> None:
+        # Unnegotiated: close_early() refuses WITHOUT touching
+        # the stream — not done, not unregistered, nothing queued —
+        # so the ask keeps consuming to the window exactly as it
+        # did before the close message existed, instead of ending
+        # locally while the relay keeps forwarding (and charging
+        # answerers for) answers nobody reads.
+        client, state, outbox = self._wired_client(early_close=False)
+        stream = _QueryStream(client, state)
+        self.assertFalse(stream.close_early())
+        self.assertTrue(outbox.empty())
+        self.assertFalse(state.close_sent)
+        self.assertIn(state.query_id, client._queries)
+        # Still a live stream: a batch routed afterwards is read.
+        batch = {"batch": {"claims": [{"n": 1}]}, "sig": "c2ln"}
+        client._route_batch(state, batch)
+        self.assertEqual(next(stream), batch)
+
+    def test_no_close_when_the_relay_already_completed_the_query(self) -> None:
+        client, state, outbox = self._wired_client()
+        state.completed_at = time.monotonic()
+        _QueryStream(client, state).close()
+        self.assertTrue(outbox.empty())
+        self.assertFalse(state.close_sent)
+
+    def test_close_never_rides_a_replacement_connection(self) -> None:
+        client, state, outbox = self._wired_client()
+        replacement: asyncio.Queue = asyncio.Queue()
+        client._outbox = replacement  # the owning connection is gone
+        _QueryStream(client, state).close()
+        self.assertTrue(outbox.empty())
+        self.assertTrue(replacement.empty())
+
+    def test_buffer_cap_finish_also_closes_at_the_relay(self) -> None:
+        client, state, outbox = self._wired_client()
+        client._complete_query(state)
+        frame = json.loads(outbox.get_nowait())
+        self.assertEqual(frame["type"], "close")
+        self.assertTrue(state.finished.is_set())
+        self.assertNotIn(state.query_id, client._queries)
+
+    def test_close_round_trip_against_the_real_relay(self) -> None:
+        fast = self.connect_client()
+        slow = self.connect_client()
+        asker = self.connect_client()
+        # The live relay advertises the capability in its welcome.
+        self.assertTrue(asker._relay_early_close)
+        batch = {"claims": [{"n": 1}]}
+        fast.set_query_handler(lambda query: [batch])
+
+        def slow_handler(query):
+            time.sleep(3.0)
+            return []
+
+        slow.set_query_handler(slow_handler)
+        stream = asker.query(
+            "track", "exact", subjects=["soul_e"],
+            window_s=5.0, grace_s=5.0)
+        self.assertEqual(next(stream), batch)
+        (query_id,) = list(asker._queries)
+        # The slow responder has not done, so no `complete` can have
+        # ended this query: closing now is the asker's own act.
+        stream.close()
+        relay = self.server.relay
+        wait_until(lambda: relay.counters.queries_closed_early == 1)
+        wait_until(lambda: query_id not in relay.open_queries)
 class TestDefaultRelayUrl(unittest.TestCase):
     """Step 7: the production relay URL ships as the node's default.
     A settings dict with no meta_relay_url at all dials
