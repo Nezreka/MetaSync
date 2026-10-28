@@ -1741,7 +1741,7 @@ class TestEarlyClose(RelayClientCase):
 class TestDefaultRelayUrl(unittest.TestCase):
     """Step 7: the production relay URL ships as the node's default.
     A settings dict with no meta_relay_url at all dials
-    wss://relay.ssync.net; an explicitly stored value — including
+    wss://relay.metasync.ssync.net; an explicitly stored value — including
     an explicitly blanked one — always wins."""
 
     def _service(self) -> NodeService:
@@ -1761,9 +1761,9 @@ class TestDefaultRelayUrl(unittest.TestCase):
     def test_unset_setting_gets_the_shipped_default(self):
         service = self._service()
         self.assertNotIn("meta_relay_url", service.store.settings)
-        self.assertEqual(service._meta_relay_url(), "wss://relay.ssync.net")
+        self.assertEqual(service._meta_relay_url(), "wss://relay.metasync.ssync.net")
         self.assertEqual(
-            service.relay_status()["relay_url"], "wss://relay.ssync.net"
+            service.relay_status()["relay_url"], "wss://relay.metasync.ssync.net"
         )
 
     def test_explicit_setting_wins(self):

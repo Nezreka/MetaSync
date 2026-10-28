@@ -227,13 +227,14 @@ why step 3 below exists.
    is: the step 3 deploy carried it), and the `<app>.fly.dev`
    hostname is never a working v2 address once this is set
    (its hellos sign for the wrong origin and are refused).
-   - `fly certs add relay.ssync.net`
-   - In Cloudflare DNS for ssync.net, add the records Fly prints:
-     the `relay` CNAME to `<app>.fly.dev` with the proxy OFF
-     (DNS only — a proxied record breaks Fly's certificate
-     validation and the WebSocket path), plus the ACME challenge
-     record if Fly asks for one.
-   - Wait until `fly certs show relay.ssync.net` reports the
+   - `fly certs add relay.metasync.ssync.net`
+   - In Cloudflare DNS for ssync.net, add the records Fly prints
+     for the name `relay.metasync` (that name in the ssync.net
+     zone IS relay.metasync.ssync.net): the A and AAAA records to
+     the app's Fly IPs with the proxy OFF (DNS only — a proxied
+     record breaks Fly's certificate validation and the WebSocket
+     path), plus the ACME challenge record if Fly asks for one.
+   - Wait until `fly certs show relay.metasync.ssync.net` reports the
      certificate issued.
 5. Smoke test with a real node. Two preconditions, both easy to
    miss:
@@ -247,7 +248,7 @@ why step 3 below exists.
      only useful once that is true: the default IS the custom
      domain, so before cert + DNS the default points nowhere.
    Then: leave the node's `meta_relay_url` unset (it now defaults
-   to `wss://relay.ssync.net`), set `meta_issuer_public_key` from
+   to `wss://relay.metasync.ssync.net`), set `meta_issuer_public_key` from
    `GET /v1/auth/public-key` (step 2), turn `meta_network` on,
    and read the node's relay status (`connected`, `peers`,
    `last_error`):
@@ -348,13 +349,14 @@ why step 3 below exists.
      lists on the node side, but the session still connects. If
      the session is up, that setting is not your problem.
 
-### If a node was ever pointed at the fly.dev name
+### If a node was ever pointed at the fly.dev name — or the old relay.ssync.net name
 
 A stored `meta_relay_url` wins over the shipped default —
 forever. A node whose settings once carried
-`wss://<app>.fly.dev` (from an early test, say) keeps dialing it:
-it signs its v2 hello for the fly.dev origin, the relay's
-identity is `wss://relay.ssync.net`, and the hello is refused.
+`wss://<app>.fly.dev` (from an early test, say), or the retired
+`wss://relay.ssync.net` from before the rename, keeps dialing it:
+it signs its v2 hello for that origin, the relay's
+identity is `wss://relay.metasync.ssync.net`, and the hello is refused.
 The node looks healthy in every other way; it just never gets a
 v2 session. There is no UI field for this setting, so the fix
 is by hand — and order matters: STOP the node first, then edit,
@@ -362,8 +364,8 @@ then start it. (A running node rewrites `settings.json` from its
 in-memory settings whenever it saves, silently overwriting a
 hand edit.) With the node stopped, in its state directory edit
 `settings.json` — either delete the `meta_relay_url` key (the
-node falls back to the shipped default, `wss://relay.ssync.net`)
-or set it to `wss://relay.ssync.net` — then start the node.
+node falls back to the shipped default, `wss://relay.metasync.ssync.net`)
+or set it to `wss://relay.metasync.ssync.net` — then start the node.
 
 ### Day to day
 

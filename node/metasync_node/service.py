@@ -56,7 +56,7 @@ _META_REBUILD_INTERVAL_H = 20
 # (dial nowhere), and a stored null also resolves to no-dial (see
 # _meta_relay_url) — so a user can still point a node at a
 # third-party relay or nowhere.
-_DEFAULT_META_RELAY_URL = "wss://relay.ssync.net"
+_DEFAULT_META_RELAY_URL = "wss://relay.metasync.ssync.net"
 
 
 def _env_flag(raw: str) -> bool:
