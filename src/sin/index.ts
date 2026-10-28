@@ -7,7 +7,11 @@
  *   POST /v1/auth/exchange      X-SIN-Key (raw portal/admin/shared key) +
  *                               node signature → short-lived access token
  *                               (§3A.4); 202 binding_pending when a portal
- *                               key's node is not approved yet
+ *                               key's node is not approved yet. A bound
+ *                               portal key's 200 also carries its binding
+ *                               attestation + the revocation list (§9/§10)
+ *   GET  /v1/meta/revocations   public — the issuer-signed revocation
+ *                               list (bare object, §10), fetched by relays
  *   POST /v1/report             legacy X-SIN-Key (admin / shared env
  *                               key only) OR Bearer access token + node
  *                               signature; one report per token per
@@ -44,7 +48,7 @@
  *
  * Signals are keyed by MusicBrainz IDs only. SoulID is NOT used by SIN.
  */
-import { timingSafeEqual } from "node:crypto";
+import { timingSafeEqual, type KeyObject } from "node:crypto";
 import { and, desc, eq, gte, inArray, isNotNull, isNull, lt, max, notInArray, or, sql } from "drizzle-orm";
 import { Hono } from "hono";
 import { getDb, type SinDb } from "./db.ts";
@@ -52,6 +56,7 @@ import {
   ADMIN_TOKEN_SCOPES,
   aggregateRawReports,
   base64UrlEncode,
+  buildBindingAttestation,
   computeBreakouts,
   computeMostWanted,
   computeTrending,
@@ -64,6 +69,7 @@ import {
   loadPoolTokenPrivateKey,
   MAX_PLAYLISTS_BODY_BYTES,
   MAX_REPORT_BODY_BYTES,
+  META_ISSUER_ID,
   nodeIdForPublicKey,
   NODE_TIMESTAMP_WINDOW_SECONDS,
   PLAYLIST_KEYS,
@@ -76,6 +82,7 @@ import {
   K_PUBLISH_THRESHOLD,
   RequestRateLimiter,
   sha256Hex,
+  signRevocationList,
   USER_TOKEN_SCOPES,
   validatePlaylistsPublish,
   validateReport,
@@ -83,10 +90,12 @@ import {
   verifyNodeSignature,
   type AccessTokenClaims,
   type AggregateRow,
+  type BindingAttestation,
   type CanonicalPlaylist,
   type PlaylistKey,
   type PlaylistsPublishInput,
   type ReportInput,
+  type RevocationListObject,
 } from "./logic.ts";
 import {
   aggregateCounts,
@@ -94,6 +103,9 @@ import {
   canonicalPlaylists,
   indexPublications,
   mbResolutions,
+  metaRevocationState,
+  metaRevokedNodes,
+  metaSeenBindings,
   portalKeys,
   rawReports,
   reportPopulations,
@@ -259,6 +271,207 @@ export async function touchPortalKeyLastUsed(
     )
     .returning({ id: portalKeys.id });
   return updated.length > 0;
+}
+
+/**
+ * Sync the revocation bookkeeping with the current portal_keys state
+ * and return the current signed list (DESIGN-METADATA.md §9/§10,
+ * migration 0012). Exported for tests.
+ *
+ * The revoked set is a CURRENT-state computation, recomputed on every
+ * call:
+ *  - a node bound only on revoked keys (a revoked key is this
+ *    codebase's key deletion: keys are never hard-deleted) and not
+ *    bound on any live key;
+ *  - a node id in meta_seen_bindings that is no longer bound anywhere
+ *    — unbinding clears portal_keys.bound_*, and account deletion
+ *    cascades the key row away, so the seen record is the only place
+ *    that node id survives; its disappearance from the bound set IS
+ *    the revocation.
+ * A node that binds again (re-approved after an unbind, or carried
+ * onto a rolled key) is in the bound set and leaves the list — the
+ * sequence advancing on that change is what lets holders notice.
+ * Expiry alone never revokes (§9).
+ *
+ * The sequence lives in meta_revocation_state and advances ONLY when
+ * the served key set changes; issued_at moves with it. Holders apply
+ * a list only when its seq exceeds the highest they have seen, so a
+ * regressed sequence would be silently ignored — persistence here is
+ * what guarantees that never happens across restarts.
+ *
+ * CONCURRENCY: serverless isolates run this sync concurrently, and
+ * two invariants must hold: one seq names exactly one key set, and a
+ * served list never reflects an OLDER portal snapshot than a list
+ * already served at a lower seq. Neither is left to timing:
+ *
+ *  - Each attempt runs inside a transaction that first takes
+ *    pg_advisory_xact_lock(REVOCATION_SYNC_LOCK_KEY), so attempts
+ *    serialize across isolates. The portal_keys read, the seen
+ *    recording, the materialization, the sequence advance and the
+ *    serve re-read all happen inside that critical section — an
+ *    attempt's snapshot is never older than the snapshot behind any
+ *    list a previous attempt served, and a stale attempt can never
+ *    rewrite the materialized set out from under a fresher one (the
+ *    un-revoke race: a pre-unbind reader deleting a node a completed
+ *    sync had just revoked, then winning the advance).
+ *  - Inside the lock the advance is still a single conditional
+ *    update — a compare-and-swap on the full snapshot the attempt
+ *    read (seq AND keys hash) — as a second line of defence: it
+ *    applies only on top of that exact state row, so even a writer
+ *    that somehow bypassed the lock cannot make one seq name two
+ *    sets or regress the sequence. A refused advance retries the
+ *    whole attempt in a fresh transaction (bounded attempts, then
+ *    it throws rather than sign an inconsistent list).
+ *  - The list returned is RE-READ from stored state — seq/issued_at
+ *    from the state row, keys from the materialized set — and signed
+ *    only when the two agree by hash, so what is served is what is
+ *    stored.
+ */
+/** Advisory-lock key serializing revocation sync attempts
+ *  (pg_advisory_xact_lock, held for one attempt's transaction).
+ *  The value is arbitrary — "META" as ASCII hex — and only has to
+ *  be the same for every sync and distinct from any other advisory
+ *  lock taken on this database (nothing else here takes one). */
+const REVOCATION_SYNC_LOCK_KEY = 1296389185;
+
+export async function buildRevocationList(
+  db: SinDb,
+  privateKey: KeyObject,
+  now: Date = new Date(),
+): Promise<RevocationListObject> {
+  const nowSeconds = Math.floor(now.getTime() / 1000);
+  const MAX_ATTEMPTS = 5;
+  for (let attempt = 1; ; attempt++) {
+    // One attempt is one transaction holding the sync advisory
+    // lock. The callback returns the signed list, or null when the
+    // stored state moved under the attempt (only possible for a
+    // writer that bypassed the lock — the lock serializes syncs) —
+    // the loop then retries in a fresh transaction, bounded, and
+    // throws rather than sign an inconsistent list. A database
+    // error inside the attempt aborts the transaction and
+    // propagates as-is: fail-closed at the feed, fail-soft at the
+    // exchange carriage, exactly as before.
+    const list = await db.transaction(async (tx) => {
+      await tx.execute(
+        sql`SELECT pg_advisory_xact_lock(${REVOCATION_SYNC_LOCK_KEY})`,
+      );
+      const rows = await tx.select(PORTAL_KEY_SELECTION).from(portalKeys);
+      const currentBound = new Map<string, string>();
+      const liveBound = new Set<string>();
+      const revokedBound = new Set<string>();
+      for (const row of rows) {
+        if (!row.boundNodeId || !NODE_ID_SHAPE.test(row.boundNodeId)) continue;
+        currentBound.set(row.boundNodeId, row.id);
+        if (row.revokedAt) revokedBound.add(row.boundNodeId);
+        else liveBound.add(row.boundNodeId);
+      }
+
+      // Record every binding ever observed BEFORE judging disappearances:
+      // a binding first seen on this call is bound, not revoked.
+      const seenRows = await tx.select().from(metaSeenBindings);
+      const seen = new Set(seenRows.map((r) => r.nodeId));
+      for (const [nodeId, keyId] of currentBound) {
+        if (seen.has(nodeId)) continue;
+        await tx
+          .insert(metaSeenBindings)
+          .values({ nodeId, keyId })
+          .onConflictDoNothing();
+        seen.add(nodeId);
+      }
+
+      const desired = new Set<string>();
+      for (const nodeId of revokedBound) {
+        if (!liveBound.has(nodeId)) desired.add(nodeId);
+      }
+      for (const nodeId of seen) {
+        if (!currentBound.has(nodeId)) desired.add(nodeId);
+      }
+
+      // Materialize the computed set (the stored form the serve below
+      // re-reads; the set itself is computed above, not derived from
+      // this table).
+      const heldRows = await tx.select().from(metaRevokedNodes);
+      const held = new Set(heldRows.map((r) => r.nodeId));
+      for (const nodeId of desired) {
+        if (held.has(nodeId)) continue;
+        await tx
+          .insert(metaRevokedNodes)
+          .values({ nodeId })
+          .onConflictDoNothing();
+      }
+      const stale = [...held].filter((nodeId) => !desired.has(nodeId));
+      if (stale.length > 0) {
+        await tx
+          .delete(metaRevokedNodes)
+          .where(inArray(metaRevokedNodes.nodeId, stale));
+      }
+
+      const keys = [...desired].sort();
+      const keysHash = sha256Hex(keys.join("\n"));
+      const stateRows = await tx.select().from(metaRevocationState);
+      const state = stateRows[0];
+      if (!state) {
+        // First sync ever: create the singleton state row. The
+        // onConflictDoNothing covers a row created outside the lock
+        // (a migration or a manual repair); the serve below re-reads
+        // the row either way, and a hash mismatch retries into the
+        // CAS path.
+        await tx
+          .insert(metaRevocationState)
+          .values({ issuer: META_ISSUER_ID, seq: 1, issuedAt: nowSeconds, keysHash })
+          .onConflictDoNothing();
+      } else if (state.keysHash !== keysHash) {
+        // Compare-and-swap advance: one statement, applying only if
+        // the stored seq AND hash still equal the snapshot this
+        // attempt read. (Hash alone is not enough: a key set can
+        // leave and return, so the same hash legitimately recurs at a
+        // higher seq — an older snapshot with that hash must not be
+        // allowed to write a regressed seq.) Zero rows back means a
+        // writer outside the lock advanced first — retry the attempt
+        // against its state instead of reusing its seq.
+        const updated = await tx
+          .update(metaRevocationState)
+          .set({ seq: state.seq + 1, issuedAt: nowSeconds, keysHash })
+          .where(
+            and(
+              eq(metaRevocationState.issuer, META_ISSUER_ID),
+              eq(metaRevocationState.seq, state.seq),
+              eq(metaRevocationState.keysHash, state.keysHash),
+            ),
+          )
+          .returning({ issuer: metaRevocationState.issuer });
+        if (updated.length === 0) {
+          return null;
+        }
+      }
+
+      // Serve exactly what is stored: seq/issued_at from the state
+      // row, keys from the materialized set, cross-checked by hash.
+      // A mismatch means a writer outside the lock is mid-advance —
+      // retry and let the newest stored state win rather than sign
+      // a list the store does not describe.
+      const storedRows = await tx.select().from(metaRevocationState);
+      const stored = storedRows[0];
+      const servedRows = await tx.select().from(metaRevokedNodes);
+      const servedKeys = servedRows.map((r) => r.nodeId).sort();
+      if (
+        stored &&
+        stored.keysHash === keysHash &&
+        sha256Hex(servedKeys.join("\n")) === stored.keysHash
+      ) {
+        return signRevocationList(privateKey, {
+          seq: stored.seq,
+          issuedAt: stored.issuedAt,
+          keys: servedKeys,
+        });
+      }
+      return null;
+    });
+    if (list) return list;
+    if (attempt >= MAX_ATTEMPTS) {
+      throw new Error("revocation_sync_conflict");
+    }
+  }
 }
 
 /** Which door a request came through, and its rate-limit bucket.
@@ -867,6 +1080,97 @@ app.post("/v1/auth/exchange", async (c) => {
         // Fire-and-forget (§3.3).
       }
     }
+    // Metadata issuance (§9/§10) rides the 200 only — never the 202
+    // binding-pending or any error response. The attestation is for a
+    // BOUND portal key only: env-credential exchanges (admin/shared)
+    // have no portal row and no bound_at, and receive none — standing
+    // is a property of a portal-bound key, and that path never earns
+    // it. node_key is re-encoded from expectedPublicRaw, the decoded
+    // raw bytes (the presented key's, verified identical to the bound
+    // key's) — never the stored bound_node_public_key string, which
+    // is the binding-time header exactly as sent, un-normalised.
+    const extra: {
+      attestation?: BindingAttestation;
+      revocations?: RevocationListObject;
+    } = {};
+    if (portalRow && portalRow.boundAt) {
+      // BEFORE signing: the node this attestation names must be on
+      // record as seen, or it could never be revoked during the
+      // attestation's 7-day life. The revocation sync also records
+      // seen bindings, but it reads portal_keys AFTER this handler
+      // read its row (an unbind in between erases the binding before
+      // the sync ever sees it) and it is fail-soft (its failure is
+      // logged, the exchange still succeeds) — so the sync alone
+      // leaves a gap exactly where it matters. This insert is the
+      // guarantee: per-exchange, never memoized, and if it fails the
+      // attestation is omitted (the exchange still succeeds).
+      // Defence in depth first: the id the revocation bookkeeping
+      // tracks (portalRow.boundNodeId) must be the id OF THE KEY
+      // being attested — today they agree only by how the portal
+      // stored the binding, so verify it here rather than trust it.
+      let preIssuanceFailure: string | null = null;
+      if (
+        !portalRow.boundNodeId ||
+        nodeIdForPublicKey(expectedPublicRaw) !== portalRow.boundNodeId
+      ) {
+        preIssuanceFailure = "bound_node_id_mismatch";
+      } else {
+        try {
+          await db
+            .insert(metaSeenBindings)
+            .values({ nodeId: portalRow.boundNodeId, keyId: portalRow.id })
+            .onConflictDoNothing();
+        } catch {
+          preIssuanceFailure = "seen_record_failed";
+        }
+      }
+      if (preIssuanceFailure) {
+        console.error(`sin: attestation omitted (${preIssuanceFailure})`);
+      } else {
+        const attestation = buildBindingAttestation(privateKey, {
+          nodeKeyRaw: expectedPublicRaw,
+          boundAt: portalRow.boundAt,
+          now,
+        });
+        if (attestation) {
+          extra.attestation = attestation;
+        } else {
+          // Omission is correct behavior (the node would drop an
+          // unusable attestation anyway) — but a silent omission hides
+          // a clock-skewed or malformed binding forever, so log the
+          // reason category. No key material, no identifiers.
+          const reason =
+            expectedPublicRaw.length !== 32
+              ? "malformed_key"
+              : Math.floor(portalRow.boundAt.getTime() / 1000) >
+                  Math.floor(now.getTime() / 1000)
+                ? "bound_at_ahead_of_clock"
+                : "bound_at_invalid";
+          console.error(`sin: attestation omitted (${reason})`);
+        }
+      }
+    }
+    // The current revocation list (§10): the exchange is the issuer's
+    // own endpoint — the delivery channel a withholding relay cannot
+    // sit on. Fail-soft like the attestation consumer: a list that
+    // cannot be built is omitted, never a failed exchange.
+    try {
+      extra.revocations = await buildRevocationListMemoized(
+        db,
+        privateKey,
+        now,
+      );
+    } catch (err) {
+      // Omitted; the node keeps whatever list it already holds.
+      // Logged, not silent: the sync also records newly seen
+      // bindings, so an unlogged failure would let the revocation
+      // bookkeeping fall behind invisibly.
+      console.error(
+        `sin: revocation sync failed on exchange: ${
+          err instanceof Error ? err.message : "unknown error"
+        }`,
+      );
+    }
     return c.json({
       access_token: issued.accessToken,
       token_type: "Bearer",
@@ -874,7 +1178,69 @@ app.post("/v1/auth/exchange", async (c) => {
       scopes: [...scopes],
       key_prefix: portalRow ? portalRow.keyPrefix : null,
       node_id: headers.nodeId,
+      ...extra,
     });
+  } catch {
+    return c.json({ error: "database_unavailable" }, 503);
+  }
+});
+
+/** The revocation sync memo, shared by the feed route and the
+ *  exchange carriage. Each buildRevocationList call is a full sync
+ *  (portal read + seen recording + materialization + a possible
+ *  sequence advance) — O(total keys) with several writes — so
+ *  running one per request makes both endpoints write amplifiers:
+ *  the feed is public and unauthenticated, and the exchange is the
+ *  node's routine check-in. The relay — the feed's only real
+ *  consumer — polls on a 300s interval, so a 30s per-isolate memo
+ *  caps the write volume while adding at most 30s to a revocation's
+ *  visibility, well inside one poll cycle. The memo holds a list
+ *  that was signed from stored state, so it cannot resurrect a
+ *  superseded sequence/set pairing; it can only serve a lower seq,
+ *  which holders ignore. The ONE revocation write never memoized is
+ *  the exchange's pre-signing seen insert (see the issuance block):
+ *  that one is the guarantee a fresh attestation is revocable, and
+ *  it runs on every exchange regardless of this memo. */
+const REVOCATION_SYNC_TTL_MS = 30_000;
+let revocationSyncMemo: { at: number; list: RevocationListObject } | null =
+  null;
+
+export function resetRevocationFeedMemoForTests(): void {
+  revocationSyncMemo = null;
+}
+
+async function buildRevocationListMemoized(
+  db: SinDb,
+  privateKey: KeyObject,
+  now: Date = new Date(),
+): Promise<RevocationListObject> {
+  if (
+    revocationSyncMemo &&
+    Date.now() - revocationSyncMemo.at < REVOCATION_SYNC_TTL_MS
+  ) {
+    return revocationSyncMemo.list;
+  }
+  const list = await buildRevocationList(db, privateKey, now);
+  revocationSyncMemo = { at: Date.now(), list };
+  return list;
+}
+
+app.get("/v1/meta/revocations", async (c) => {
+  // The issuer-signed revocation list (§10) — the relay's copy,
+  // fetched by RevocationFeed (relay/metasync_relay/revocations.py)
+  // on an interval. Public by design: the list is a signed public
+  // statement (key status only, never account information), and the
+  // relay's fetcher sends no credentials. The BARE list object — no
+  // envelope. Serving syncs the bookkeeping with portal_keys first,
+  // so an unbind or a key revocation is reflected on the next poll;
+  // the sequence advances only when the served set changes.
+  const privateKey = poolTokenKey();
+  if (!privateKey) return tokenNotConfigured();
+  const found = requireDb();
+  if ("response" in found) return found.response;
+  try {
+    const list = await buildRevocationListMemoized(found.db, privateKey);
+    return c.json(list);
   } catch {
     return c.json({ error: "database_unavailable" }, 503);
   }

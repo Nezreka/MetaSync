@@ -415,12 +415,14 @@ or set it to `wss://relay.metasync.ssync.net` — then start the node.
 
 ## Portal follow-up: attestation issuance and the revocation feed
 
-Two portal-side pieces pair with this deployment. They are NOT
-built yet — as of this writing there is no attestation or
-revocation code anywhere in `src/sin/` or the portal — but both
-consumers are finished and waiting, and this section pins the
-contract so the follow-up build has no open questions. Nothing in
-the relay or the node needs to change when these ship.
+Two portal-side pieces pair with this deployment. Both are now
+BUILT in `src/sin/` (attestation issuance in `logic.ts`, the
+exchange carriage and the revocation feed in `index.ts`), pending
+deploy: migration `0012_meta_revocations.sql` must be applied
+first, and the relay gains `RELAY_REVOCATIONS_URL` (below) at its
+next deploy. Both consumers were finished and waiting, and this
+section pins the contract the build followed. Nothing in the
+relay or the node needs to change when these ship.
 
 ### One issuer, one key, one id
 
@@ -514,9 +516,19 @@ node's enforcement mirrors the same shape. What is missing is
 only an endpoint that serves the list.
 
 - Path: the relay fetches whatever `RELAY_REVOCATIONS_URL`
-  names, so the path is the follow-up's choice. Proposed:
-  `GET /v1/meta/revocations` on the SIN function; when it ships,
-  set `RELAY_REVOCATIONS_URL` to its full URL and redeploy.
+  names. Built as proposed: `GET /v1/meta/revocations` on the SIN
+  function; when it deploys, set `RELAY_REVOCATIONS_URL` to its
+  full URL and redeploy. The exchange's 200 response also carries
+  the same signed list (the optional carriage above), so nodes
+  refresh at every exchange even before the relay is wired. The
+  revoked set is recomputed from `portal_keys` on every serve: a
+  node bound only on revoked keys, and a node id in
+  `meta_seen_bindings` (migration 0012) that is no longer bound
+  anywhere — unbinding clears `bound_*`, and account deletion
+  cascades the key row away, so the seen record is the only place
+  that id survives. The per-issuer sequence persists in
+  `meta_revocation_state` and advances only when the served set
+  changes.
 - Response: 200 JSON, the BARE list object — no envelope:
   `{issuer, seq, issued_at, keys, sig}`.
   - `issuer`: the issuer id above. The relay is configured with

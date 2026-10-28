@@ -18,6 +18,7 @@
  */
 import { sql } from "drizzle-orm";
 import {
+  bigint,
   index,
   integer,
   jsonb,
@@ -200,6 +201,50 @@ export const sinRequestNonces = pgTable(
     index("sin_request_nonces_expires_at_idx").on(t.expiresAt),
   ],
 );
+
+/**
+ * Metadata revocation bookkeeping (migration 0012, DESIGN-METADATA.md
+ * §9/§10). The revocation feed's durable state — nothing here is SIN
+ * report data; node ids are key-status identifiers, never accounts.
+ *
+ * meta_revocation_state: one row per issuer — the sequence of the
+ *   currently served list, when it was issued (epoch seconds), and a
+ *   hash of its sorted keys, so the sequence advances ONLY when the
+ *   served list changes and survives restarts.
+ * meta_seen_bindings: every node id ever observed bound to a portal
+ *   key. Unbinding clears portal_keys.bound_* and account deletion
+ *   cascades the key row away entirely, so without this record the
+ *   node id of an unbound or deleted binding would be unrecoverable —
+ *   a seen id that is no longer bound anywhere IS a revoked id.
+ * meta_revoked_nodes: the materialized revoked set the feed serves,
+ *   recomputed from portal_keys + meta_seen_bindings on every sync.
+ */
+export const metaRevocationState = pgTable("meta_revocation_state", {
+  issuer: text("issuer").primaryKey(),
+  seq: integer("seq").notNull(),
+  /** Unix epoch seconds the current list was issued at. */
+  issuedAt: bigint("issued_at", { mode: "number" }).notNull(),
+  /** SHA-256 hex of the served list's sorted keys, newline-joined. */
+  keysHash: text("keys_hash").notNull(),
+});
+
+export const metaSeenBindings = pgTable("meta_seen_bindings", {
+  /** Lowercase hex SHA-256 of the node's Ed25519 public key. */
+  nodeId: text("node_id").primaryKey(),
+  /** The portal key the binding was observed on (provenance only). */
+  keyId: text("key_id").notNull(),
+  seenAt: timestamp("seen_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+});
+
+export const metaRevokedNodes = pgTable("meta_revoked_nodes", {
+  /** Lowercase hex SHA-256 of the node's Ed25519 public key. */
+  nodeId: text("node_id").primaryKey(),
+  revokedAt: timestamp("revoked_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+});
 
 export const canonicalPlaylists = pgTable(
   "canonical_playlists",

@@ -1551,8 +1551,10 @@ by its own users. It is also the design's honest cost, alongside
    endpoints pair with this step and are deployed alongside it:
    attestation issuance at the token exchange and the issuer's
    revocation-list endpoint (§10, Identity) — the node-side
-   carriage of both already exists; the portal halves land
-   here. Broadcast plus the asker's early close (§10) is the
+   carriage of both already exists; the portal halves are built
+   (Oct 28, 2026: exchange issuance + `GET /v1/meta/revocations`
+   in `src/sin`, migration 0012) and deploy alongside the relay.
+   Broadcast plus the asker's early close (§10) is the
    deployed routing. Before any public node ships.
 8. **SoulSync depot + surfaces:** the **depot first** (§1) — the
    SoulSync extension holding network-collected metadata with its

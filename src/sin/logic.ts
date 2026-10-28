@@ -1273,6 +1273,160 @@ export function verifyAccessToken(
 }
 
 /* ------------------------------------------------------------------ */
+/* Metadata network issuance (§9/§10): binding attestations and the    */
+/* issuer-signed revocation list. The pool is the only issuer in v1    */
+/* and signs both objects with the SAME Ed25519 key as access tokens   */
+/* (SIN_TOKEN_PRIVATE_KEY). The canonical signed bytes are pinned by   */
+/* the node and relay packages (node/metasync_node/attestation.py,     */
+/* relay/metasync_relay/revocations.py) and by the conformance         */
+/* vectors in node/tests/test_meta_conformance.py — the TypeScript     */
+/* issuer must reproduce them byte for byte, and the tests in          */
+/* tests/sin-meta-issuance.test.ts pin the same literals here.         */
+/* ------------------------------------------------------------------ */
+
+/** The issuer id in every signed metadata object. fly.toml adopts it
+ *  as RELAY_ISSUER_ID; verifiers holding this id drop anything naming
+ *  another, so it must never change once shipped. */
+export const META_ISSUER_ID = "metasync";
+
+/** Attestation lifetime (§9): 7 days from issuance. Nodes accept a
+ *  window up to twice this; the pool always issues exactly this. */
+export const ATTESTATION_TTL_SECONDS = 7 * 24 * 60 * 60;
+
+export const ATTESTATION_SIGNING_CONTEXT = "metasync-attestation";
+export const REVOCATION_SIGNING_CONTEXT = "metasync-revocations";
+
+export interface BindingAttestation {
+  issuer: string;
+  node_key: string;
+  bound_at: number;
+  issued_at: number;
+  expires: number;
+  sig: string;
+}
+
+/** The canonical bytes the pool signs for one attestation: six lines,
+ *  each newline-terminated including the last. Mirrors
+ *  attestation_signing_text in node/metasync_node/attestation.py. */
+export function attestationSigningText(
+  issuer: string,
+  nodeKey: string,
+  boundAt: number,
+  issuedAt: number,
+  expires: number,
+): string {
+  return (
+    [
+      ATTESTATION_SIGNING_CONTEXT,
+      issuer,
+      nodeKey,
+      String(boundAt),
+      String(issuedAt),
+      String(expires),
+    ].join("\n") + "\n"
+  );
+}
+
+/**
+ * Issue one binding attestation for a bound portal key.
+ *
+ * `nodeKeyRaw` is the DECODED RAW BYTES of the bound node's Ed25519
+ * public key (the exchange's verified expected key); `node_key` on
+ * the wire is re-encoded from those bytes — never copied from the
+ * stored bound_node_public_key column, which holds the header string
+ * exactly as the node sent it at binding time, un-normalised, and
+ * which the node compares byte for byte. `boundAt` is the portal
+ * row's bound_at (a timestamptz in the DB): the wire value is integer
+ * Unix epoch seconds derived from it — never a timestamp string,
+ * never the current time; standing is computed from it, so it must
+ * not move across renewals. Returns null (the exchange then omits the
+ * field and the node simply keeps no attestation) for a malformed key
+ * or a bound_at after the issuance instant, both of which the node
+ * would silently drop anyway.
+ */
+export function buildBindingAttestation(
+  privateKey: KeyObject,
+  input: { nodeKeyRaw: Uint8Array; boundAt: Date; now?: Date },
+): BindingAttestation | null {
+  if (input.nodeKeyRaw.length !== 32) return null;
+  const boundAt = Math.floor(input.boundAt.getTime() / 1000);
+  const issuedAt = Math.floor((input.now ?? new Date()).getTime() / 1000);
+  if (!Number.isSafeInteger(boundAt) || boundAt < 0 || boundAt > issuedAt) {
+    return null;
+  }
+  const expires = issuedAt + ATTESTATION_TTL_SECONDS;
+  const nodeKey = base64UrlEncode(input.nodeKeyRaw);
+  const signature = cryptoSign(
+    null,
+    Buffer.from(
+      attestationSigningText(META_ISSUER_ID, nodeKey, boundAt, issuedAt, expires),
+      "utf8",
+    ),
+    privateKey,
+  );
+  return {
+    issuer: META_ISSUER_ID,
+    node_key: nodeKey,
+    bound_at: boundAt,
+    issued_at: issuedAt,
+    expires,
+    sig: base64UrlEncode(signature),
+  };
+}
+
+export interface RevocationListObject {
+  issuer: string;
+  seq: number;
+  issued_at: number;
+  keys: string[];
+  sig: string;
+}
+
+/** The canonical bytes the issuer signs for one revocation list:
+ *  context line, issuer, seq, issued_at, then the sorted
+ *  de-duplicated node ids, one per line, newline-terminated. Mirrors
+ *  list_signing_text in relay/metasync_relay/revocations.py. */
+export function revocationListSigningText(
+  issuer: string,
+  seq: number,
+  issuedAt: number,
+  keys: readonly string[],
+): string {
+  const lines = [
+    REVOCATION_SIGNING_CONTEXT,
+    issuer,
+    String(seq),
+    String(issuedAt),
+    ...[...new Set(keys)].sort(),
+  ];
+  return lines.join("\n") + "\n";
+}
+
+/** Sign one revocation list with the pool key. `keys` are lowercase
+ *  hex SHA-256 node ids; the wire form carries them sorted. */
+export function signRevocationList(
+  privateKey: KeyObject,
+  input: { seq: number; issuedAt: number; keys: readonly string[] },
+): RevocationListObject {
+  const keys = [...new Set(input.keys)].sort();
+  const signature = cryptoSign(
+    null,
+    Buffer.from(
+      revocationListSigningText(META_ISSUER_ID, input.seq, input.issuedAt, keys),
+      "utf8",
+    ),
+    privateKey,
+  );
+  return {
+    issuer: META_ISSUER_ID,
+    seq: input.seq,
+    issued_at: input.issuedAt,
+    keys,
+    sig: base64UrlEncode(signature),
+  };
+}
+
+/* ------------------------------------------------------------------ */
 /* Composer: weekly chart selection (auto-publish)                     */
 /*                                                                     */
 /* The composer turns one week's k-filtered aggregates into chart      */
