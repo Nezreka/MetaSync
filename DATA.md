@@ -804,6 +804,13 @@ merged view (DESIGN-METADATA.md §5–§9; code in
   relay connection itself (`meta_network`); without a client,
   queries answer from local data + cache alone and say so
   (`asked_network: false`).
+- **Early close (§10).** A network ask need not ride the full
+  answer window: once the answers in hand are enough — the
+  agreed shape is about five strong-verified answers — the
+  node sends `close` for the query and stops admitting for it,
+  and the relay drops anything that arrives later, never
+  charged. A query with few answers rides the full window, so
+  a niche item's few owners are never cut off.
 - **Legacy aliases.** The export serves `soul_id` +
   `soul_id_legacy` per row; the builder learns the mapping into
   the store's `legacy_aliases` table ONLY when it verifies — the

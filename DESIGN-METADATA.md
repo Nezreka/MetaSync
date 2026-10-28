@@ -1202,6 +1202,20 @@ optimization, not a v1 need):
   for a while after the purge, so an answer that arrives after
   it is a silent late drop — never a strike: honest slowness is
   not an abuse signal.
+- `close` — `{query_id}`, sent by the **asker**: the asker has
+  enough answers and ends its own window early (decided Oct 28,
+  2026). The bar is the asker's own call — the agreed shape is
+  about five strong-verified answers — or the asker simply
+  stops waiting. The relay honors it: routing for that query
+  ends, the id is purged (and remembered, like any purged id),
+  and anything arriving for it afterward is a silent late
+  drop — **dropped, never charged**, the treatment late
+  answers already get (§10 budgets, above). Early close is a
+  popular-item optimization only: it fires only when answers
+  already suffice, which is the well-held item's case — a
+  query with few answers never meets the bar and rides the
+  full window to `complete`, so a niche item's few owners are
+  never cut off by it.
 - `revocations` — `{issuer, seq, issued_at, keys, sig}`: the
   issuer-signed revocation list (§9) — `sig` is the issuer's
   signature over the canonical message, verified before the
@@ -1262,7 +1276,8 @@ connected at that moment and routes answers only for query IDs it
 actually routed, only back to the connection that asked, and only
 inside the window + grace period. An asking node admits answers
 **only for query IDs it minted and has not closed** — *closed*
-means `complete` plus the grace period (above), the one
+means `complete` plus the grace period (above), or the asker's
+own `close`, the one
 definition — and anything arriving for any other query ID is
 dropped on arrival, **silently**. No charging runs from asker to
 relay: an asker has no message that could charge a sender, and
@@ -1343,6 +1358,40 @@ implementation must pass it byte for byte.
   "a relay cannot assert data, only carry it" as if that were the
   whole story; the rest of it is that a relay is a trust domain
   for presence and accounting, never for data.)
+- **Broadcast is v1's routing, and it is cheap at v1's sizes.**
+  Under the click-only rule (§13 step 8 — a question exists only
+  where a user clicked, wishlisted or downloaded), 1,000 users
+  asking about 50 questions a day each is about 50,000 questions
+  a day — roughly 0.6 questions a second across the whole
+  network. The relay fans each one out to the connected nodes:
+  a few hundred bytes × 1,000 nodes is on the order of 600 tiny
+  messages a second, trivial for one small machine, and each
+  node fields about 0.6 lookups a second against its own
+  store — unnoticeable. Answers scale with an item's
+  popularity, not with the network's size (only owners reply);
+  the one real cost of broadcast is hundreds of owners
+  answering the same popular item, and the asker-side early
+  close (§10) is v1's trim for it, behind the answer cache
+  (§6), which serves a popular item for weeks after a single
+  ask. The trigger stands (§3): roughly 1,000 concurrently
+  answering nodes at sustained query budgets. Past it, the
+  decided path is **widen in rounds** — ask about 50 random
+  nodes, then 200 more, then everyone, stopping as soon as
+  answers suffice: popular items finish in round one, and
+  niche items still reach every owner because the last round
+  is everyone. It is adopted only if real traffic numbers
+  demand it; v1 does not pre-build it. Two alternatives are
+  rejected, on the record: **pure random sampling** — asking
+  random nodes until enough answers arrive, full stop — makes
+  the already-cheap popular items cheaper and the valuable
+  niche items slow or invisible, because only owners can
+  answer and an item owned by three nodes in a thousand is
+  almost never sampled; and a **holdings index** — nodes
+  advertising what they hold (a Bloom filter or similar) so
+  the relay routes only to likely owners — hands the relay a
+  who-owns-what map, the shape §12 Q3 forbids: holding is
+  revealed by answering, to the asker, never held at the
+  relay as a standing map.
 - **A DHT remains a possible later swap for the relay's *discovery*
   job** (who is online), if a relay ever becomes a bottleneck or an
   unwanted center. The query/answer/claim formats do not change —
@@ -1484,8 +1533,25 @@ by its own users. It is also the design's honest cost, alongside
    MusicBrainz-only (§7). Decide before this step starts.
 7. **Relay deployment:** a host, a public `wss://` address with
    TLS, restart + monitoring, and the official relay URL shipped
-   as the node's default (no pasted URLs). Before any public node
-   ships.
+   as the node's default (no pasted URLs). The host is decided
+   (Boulder, Oct 28, 2026): **Fly.io — one machine, always on**
+   (`min_machines_running = 1`, auto-stop off): presence lives
+   in that machine's memory (§10), so a slept machine
+   disconnects every connected node. No multi-machine until a
+   pub/sub join exists — two machines split presence, each
+   seeing only its own connections, and a query landing on one
+   never reaches owners connected to the other. TLS is the
+   platform's; deploys roll in place rather than running old
+   and new side by side (two at once is split presence again),
+   and nodes reconnect across the restart (step 3), so a deploy
+   is a blip, not an outage. Cost at these message sizes is a
+   few dollars a month, most of it the machine. The portal-side
+   endpoints pair with this step and are deployed alongside it:
+   attestation issuance at the token exchange and the issuer's
+   revocation-list endpoint (§10, Identity) — the node-side
+   carriage of both already exists; the portal halves land
+   here. Broadcast plus the asker's early close (§10) is the
+   deployed routing. Before any public node ships.
 8. **SoulSync depot + surfaces:** the **depot first** (§1) — the
    SoulSync extension holding network-collected metadata with its
    provenance — then the SoulSync surfaces, all governed by one
@@ -1550,7 +1616,8 @@ costs).
 **Scaling trigger (written down, not pre-built):** broadcast (§3)
 holds until roughly 1,000 concurrently answering nodes at
 sustained query budgets. Past that trigger, routing is redesigned
-(§11) — a named future decision, taken when the numbers force it.
+(§11) — widen in rounds, the decided path, taken when the numbers
+force it.
 
 ## 14. Open decisions (Boulder)
 
