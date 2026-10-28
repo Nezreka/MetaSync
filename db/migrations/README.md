@@ -25,6 +25,17 @@ psql "$DATABASE_URL_UNPOOLED" -f db/migrations/0001_sin_init.sql
 | `0009_drop_stored_oauth_tokens.sql` | Clears stored OAuth tokens from `portal_accounts` (the portal no longer stores them) |
 | `0010_report_populations.sql` | Per-week counts of reports and of reports from installs sharing drop signals, so Loved & Kept can scale drops to the whole population |
 | `0008_count_on_arrival_and_listen.sql` | `report_tokens`, `aggregate_counts` (count on arrival), `listen_album`. **Apply before deploying the matching backend**: the new report path writes these tables. |
+| `0012_meta_revocations.sql` | Metadata revocation feed state: `meta_revocation_state` (per-issuer seq), `meta_seen_bindings` (every node id ever bound — an unbound/deleted binding's id survives only here), `meta_revoked_nodes` (materialized form of the computed revoked set). **Apply before deploying the matching backend**: the feed sync writes these tables on every read. |
+
+**Restore warning (0012):** `meta_revocation_state` holds the revocation
+feed's sequence, and holders apply a list only when its seq exceeds the
+highest they have seen. If a database restore loses or rolls back that
+row, the sequence restarts below what holders already applied and they
+ignore the feed — permanently, by design; there is no signal to detect
+it from the holder side. After ANY restore, check this row before
+trusting the feed: if it was lost or regressed, re-seed `seq` above the
+last served value as part of the restore, before the backend serves
+again.
 
 No migration has been run yet — Neon is not authenticated in the agent
 environment, and running one is Boulder's step after sign-in.
