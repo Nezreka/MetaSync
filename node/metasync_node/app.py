@@ -18,6 +18,7 @@ from typing import Any
 from flask import Flask, abort, flash, redirect, render_template, request, session, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
 
+from .meta import enrichment as enrichment_view
 from .service import NodeService, PairingError, PairingRateLimited, check_pool_url
 
 # POST routes SoulSync calls (no browser session, no form): CSRF-exempt.
@@ -506,6 +507,92 @@ def create_app(service: NodeService) -> Flask:
         store.save_settings()
         store.save_state()
         return redirect(url_for("pools"))
+
+    @app.get("/enrichment")
+    @login_required
+    def enrichment():
+        # §13 step 9's view: the merged record for one lookup —
+        # what this node knows about an artist, album or track,
+        # and how it knows it (verdicts, gap classification,
+        # support as the §9 bucket). The page itself writes
+        # nothing and promotes nothing (a GET form on purpose);
+        # what a lookup does is the form's scope: "ask" runs
+        # the querier's normal ask paths (cache-first; answers
+        # may be admitted and verification scheduled, as with
+        # any ask), "local" is a pure read of what the node
+        # already holds. Asking is never the default: a bare
+        # /enrichment?q=... link (a cross-site top-level
+        # navigation carries the session — SameSite=Lax) must
+        # not set a relay fan-out in motion, so a missing or
+        # unrecognized scope means local; ask happens only
+        # when the operator picks it in the form.
+        #
+        # The template context is built HERE, stripped: the
+        # service returns the FULL result (unprojected records
+        # with origins, batches and exact counts, the own key
+        # string, the whole querier status) because the
+        # presenter needs it — and none of it crosses into the
+        # context. What crosses is the presenter's views plus
+        # a fixed set of lookup facts: ok/error, asked_network,
+        # unresolved, and the presenter-shaped backlog pair
+        # the tiles render (both counters as presence only —
+        # admissions land in the unverified queue unverdicted,
+        # and asks force-recheck stale verdicts away, so any
+        # finer rendering hands back, by subtraction, counts
+        # correlated with other nodes' claims). (The
+        # cache-size counters stay out entirely, for the same
+        # subtraction reason, with no tile's job to keep.) §9
+        # binds this page:
+        # no exact count, origin key, batch id or report count
+        # reaches the template, by construction, not by the
+        # template's restraint.
+        kind = request.args.get("kind") or "artist"
+        if kind not in ("artist", "album", "track"):
+            kind = "artist"
+        mode = request.args.get("mode") or "text"
+        if mode not in ("exact", "text"):
+            mode = "text"
+        scope = request.args.get("scope")
+        if scope not in ("ask", "local"):
+            scope = "local"
+        query = (request.args.get("q") or "").strip()
+        page = None
+        views: list[dict[str, Any]] = []
+        if query:
+            result = service.meta_enrichment({
+                "kind": kind, "mode": mode, "query": query,
+                "network": scope == "ask"})
+            if result.get("ok"):
+                views = [
+                    enrichment_view.record_view(
+                        record, own_key=result.get("own_key"))
+                    for record in result["records"]]
+                page = {
+                    "ok": True,
+                    "asked_network":
+                        bool(result.get("asked_network")),
+                    "unresolved":
+                        list(result.get("unresolved") or []),
+                    # The backlog pair, presenter-shaped:
+                    # both counters cross as presence only
+                    # ("none" / "some") — admissions land in
+                    # the unverified queue unverdicted, and
+                    # admissions DO move the stale count
+                    # (forced re-checks on ask, prune
+                    # evictions), so no count or bucket of
+                    # either is safe from subtraction.
+                    "backlog": enrichment_view.backlog_view(
+                        (result.get("querier") or {}).get(
+                            "verification"))
+                    if result.get("querier") else None,
+                }
+            else:
+                page = {"ok": False, "error": result.get("error")}
+        return render_template(
+            "enrichment.html",
+            store_exists=service.meta_store_exists(),
+            kind=kind, mode=mode, scope=scope, query=query,
+            result=page, views=views)
 
     @app.get("/preview")
     @login_required

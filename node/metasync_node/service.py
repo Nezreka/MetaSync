@@ -1524,6 +1524,104 @@ class NodeService:
             return None
         return meta_merge.project_for_depot(record)
 
+    def meta_store_exists(self) -> bool:
+        """Whether the claims store exists yet (the enrichment
+        page's chrome reads this so that merely viewing it never
+        creates the store file — see meta_enrichment)."""
+        return self._meta_store_created()
+
+    def _meta_enrichment_local(self, querier: Querier, kind: str,
+                               mode: str, query: str):
+        """Scope "local" (§20): a PURE READ of what this node
+        already holds. Exact rides Querier.record() — the
+        designed pure read (own claims + answer cache assembly;
+        schedules NO verification, runs no sanity triggers,
+        never touches the relay). Text has no record() twin, so
+        it is built from the same parts: the responder's local
+        name-index resolution (a store read), then record()'s
+        assembly per resolved subject. Nothing is admitted,
+        fetched, or scheduled on either path — the scope label
+        "only what this node knows" is a promise, and the ask
+        paths cannot keep it (query_exact schedules verification
+        even with network=False, query_text fires §8 sanity
+        triggers), which is why this scope does not use them."""
+        if mode == "exact":
+            record = querier.record(query)
+            if record is None:
+                return [], [query]
+            return [record], []
+        resolved = querier.responder._resolve_text(
+            {"kind": kind, "terms": [query]})
+        records = []
+        for subject in resolved:
+            record = querier.record(subject)
+            if record is not None:
+                records.append(record)
+        return records, ([] if resolved else [query])
+
+    def meta_enrichment(self, payload: Any) -> dict[str, Any]:
+        """One lookup for the enrichment view (§13 step 9),
+        returning the FULL merged records, unprojected. The
+        presenter (meta/enrichment.py) reads the whole record —
+        its gap classification is computed from the origin
+        lists — but exposes to the page exactly the depot
+        projection's field set per value: §9 binds this surface
+        too, so exact counts, origin keys, batch ids and report
+        counts are stripped in the presenter and never reach
+        the template. It renders only in this node's
+        login-gated UI, and viewing never promotes anything or
+        serves the shown data onward.
+
+        Two scopes, honestly different. "ask" (payload network
+        not False) runs the querier's existing ask paths (exact
+        / text — the same cache-first fan-out SoulSync's asks
+        use): it may admit new answers into the cache and
+        schedule verification, exactly like any ask. "local"
+        (network False) is a pure read of what the node already
+        holds — see _meta_enrichment_local.
+
+        A node whose claims store was never created gets the
+        empty marker WITHOUT one being opened — merely viewing
+        the page must not create meta_claims.sqlite3 on a node
+        with the feature off (the meta_status doctrine)."""
+        if not self._meta_store_created():
+            return {"ok": True, "store_exists": False,
+                    "asked_network": False, "unresolved": [],
+                    "records": [], "querier": None}
+        if not isinstance(payload, dict):
+            return {"ok": False, "error": "lookup must be an object"}
+        kind = payload.get("kind")
+        if kind not in ("artist", "album", "track"):
+            return {"ok": False,
+                    "error": "kind must be artist, album or track"}
+        mode = payload.get("mode") or "text"
+        query = str(payload.get("query") or "").strip()
+        if not query:
+            return {"ok": False, "error": "a lookup needs a query"}
+        if mode not in ("exact", "text"):
+            return {"ok": False, "error": "mode must be exact or text"}
+        network = payload.get("network") is not False
+        querier = self._meta_querier_obj()
+        if not network:
+            records, unresolved = self._meta_enrichment_local(
+                querier, kind, mode, query)
+            return {"ok": True, "store_exists": True,
+                    "asked_network": False,
+                    "unresolved": unresolved,
+                    "records": records,
+                    "querier": querier.status(),
+                    "own_key": self.identity.public_key_b64url}
+        if mode == "exact":
+            out = querier.query_exact(kind, [query], network=True)
+        else:
+            out = querier.query_text(kind, [query], network=True)
+        return {"ok": True, "store_exists": True,
+                "asked_network": out["asked_network"],
+                "unresolved": out["unresolved"],
+                "records": out["records"],
+                "querier": querier.status(),
+                "own_key": self.identity.public_key_b64url}
+
     def rebuild_meta_store(self, now: datetime | None = None,
                            force_full: bool = False,
                            live_gate: bool = False) -> dict[str, Any]:

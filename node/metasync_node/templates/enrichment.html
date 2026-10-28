@@ -1,0 +1,166 @@
+{% extends "base.html" %}
+{% block title %}MetaSync · Enrichment{% endblock %}
+{% block content %}
+<div class="page-head">
+  <p class="eyebrow-chip">Metadata network</p>
+  <h1>Enrichment</h1>
+  <p class="page-sub">Look up an artist, album or track and see everything this node knows
+  about it — and how it knows it: which values are your own library's, which came from the
+  network, and what this node has verified itself. Support is shown the way §9 shows it
+  everywhere, this page included: as a coarse bucket (none, 1-2, 3+) — this page shows
+  no exact support count of its own, and the node keys of whoever asserted a value are never
+  shown to any user, not even here. A few orderings inherited from the merge itself are
+  the named exception, listed in DATA.md §20. Viewing never promotes anything into
+  your library, and nothing this page shows is sent anywhere. Scope is the one choice
+  that matters: “ask the network” runs this node's normal ask — it can bring new answers into the local
+  cache and schedule verification of them, exactly as any ask does — while “only what
+  this node knows” is a pure read of what the node already holds: no ask, no fetches, no
+  verification.</p>
+</div>
+
+{% if not store_exists %}
+<div class="empty-state"><strong>No metadata store yet</strong>
+This node has not built its claims store, so there is nothing to look up yet. The store
+appears when the library is built for the metadata network (answering) or the node first
+asks a question of it.</div>
+{% else %}
+<form class="card enr-form" method="get" action="{{ url_for('enrichment') }}">
+  <div class="enr-group">
+    <label for="enr-kind">Kind</label>
+    <select id="enr-kind" name="kind">
+      <option value="artist" {% if kind == "artist" %}selected{% endif %}>Artist</option>
+      <option value="album" {% if kind == "album" %}selected{% endif %}>Album</option>
+      <option value="track" {% if kind == "track" %}selected{% endif %}>Track</option>
+    </select>
+  </div>
+  <div class="enr-group">
+    <label for="enr-mode">Lookup</label>
+    <select id="enr-mode" name="mode">
+      <option value="text" {% if mode == "text" %}selected{% endif %}>By name</option>
+      <option value="exact" {% if mode == "exact" %}selected{% endif %}>By exact ID</option>
+    </select>
+  </div>
+  <div class="enr-group enr-grow">
+    <label for="enr-q">{{ "Name or title" if mode == "text" else "SoulID or provider ref (deezer:3135556)" }}</label>
+    <input type="text" id="enr-q" name="q" value="{{ query }}" autocomplete="off"
+           placeholder="{{ 'Radiohead' if mode == 'text' else 'soul_… or deezer:3135556' }}">
+  </div>
+  <div class="enr-group">
+    <label for="enr-scope">Scope</label>
+    <select id="enr-scope" name="scope">
+      <option value="ask" {% if scope == "ask" %}selected{% endif %}>Ask the network for what's missing</option>
+      <option value="local" {% if scope == "local" %}selected{% endif %}>Only what this node knows</option>
+    </select>
+  </div>
+  <button class="primary" type="submit">Look up</button>
+</form>
+<p class="muted">Asking is cache-first: the network is only asked for subjects this node
+cannot already answer, and answers stream in unverified — verification (§7) runs after
+they land, so a value's tier can improve on a later look. The local scope skips the ask
+entirely: what is already held, read as it stands.</p>
+
+{% if result is not none and not result.ok %}
+<div class="flash error">{{ result.error }}</div>
+{% endif %}
+
+{% if result is not none and result.ok %}
+{% if result.backlog %}
+<div class="stat-tiles">
+  <div class="stat-tile"><span class="stat-num">{{ result.backlog.unverified_claims }}</span><span class="stat-label">Cached claims awaiting a first check</span></div>
+  <div class="stat-tile"><span class="stat-num">{{ result.backlog.stale_verdicts }}</span><span class="stat-label">Verdicts stale (re-check before reliance)</span></div>
+</div>
+{% endif %}
+{% if result.asked_network %}<p class="muted">The network was asked for what this node could not answer locally.</p>{% endif %}
+{% if result.unresolved %}<p class="muted">Could not resolve: {% for entry in result.unresolved %}<code>{{ entry }}</code>{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
+
+{% for view in views %}
+<section class="card">
+  <div class="card-head">
+    <p class="eyebrow">{{ view.kind }} · merged record v{{ view.version }}</p>
+    <h2>{{ view.name or view.subject }}</h2>
+    <span class="status-pill {{ 'ok' if view.found else 'error' }}">{{ "found" if view.found else "not found" }}</span>
+  </div>
+  <dl>
+    <dt>Subject</dt><dd><code class="break plain">{{ view.subject }}</code></dd>
+    {% if view.expired_network_claims %}<dt>Expired claims</dt><dd>Some network claims were dropped from this view by §6 aging (unverified claims expire 90 days after their origin asserted them; verified ones do not)</dd>{% endif %}
+    <dt>Verification</dt>
+    <dd>{{ view.verification.strong }} strong-verified · {{ view.verification.plausible }} plausible · {{ view.verification.unverified }} unverified{% if view.verification.stale %} · {{ view.verification.stale }} stale (due a re-check before reliance){% endif %}</dd>
+    <dt>Coverage</dt>
+    <dd>
+      {% if view.gap_fields.local %}<div><span class="status-pill ok">your library only</span> {{ view.gap_fields.local | join(", ") }}</div>{% endif %}
+      {% if view.gap_fields.network %}<div><span class="status-pill pending_approval">network only — gaps</span> {{ view.gap_fields.network | join(", ") }}</div>{% endif %}
+      {% if view.gap_fields.both %}<div><span class="status-pill">library + network</span> {{ view.gap_fields.both | join(", ") }}</div>{% endif %}
+      {% if view.gap_fields.own %}<div><span class="status-pill">this node only — re-served</span> {{ view.gap_fields.own | join(", ") }}</div>{% endif %}
+      {% if view.gap_fields.held %}<div><span class="status-pill pending_approval">network — held, not served</span> {{ view.gap_fields.held | join(", ") }}</div>{% endif %}
+      {% if view.disputed_fields %}<div><span class="status-pill error">disputed</span> {{ view.disputed_fields | join(", ") }}</div>{% endif %}
+    </dd>
+  </dl>
+
+  {% if view.disambiguation %}
+  <h3>Same-name disambiguation (§8)</h3>
+  <dl>
+    <dt>Settled on</dt><dd>{% if view.disambiguation.settled %}<code>{{ view.disambiguation.settled }}</code>{% else %}nothing — no candidate earned settlement{% endif %}</dd>
+    {% if view.disambiguation.via %}<dt>Settled via</dt><dd>{{ view.disambiguation.via }}{{ " · verified " ~ view.disambiguation.settled_at if view.disambiguation.settled_at }}</dd>{% endif %}
+    <dt>Promotion</dt><dd>{{ "the settlement may promote (it rests on verified evidence)" if view.disambiguation.promotion else "display only — counting never promotes" }}</dd>
+    {% if view.disambiguation.survivors %}<dt>Survivors</dt><dd>{% for s in view.disambiguation.survivors %}<code>{{ s }}</code>{% if not loop.last %}, {% endif %}{% endfor %}</dd>{% endif %}
+  </dl>
+  {% endif %}
+
+  {% for field in view.fields %}
+  <div class="enr-field">
+    <h3 class="enr-field-name">{{ field.field }}
+      {% if field.gap == "local" %}<span class="status-pill ok">your library</span>{% elif field.gap == "network" %}<span class="status-pill pending_approval">network only</span>{% elif field.gap == "both" %}<span class="status-pill">library + network</span>{% elif field.gap == "own" %}<span class="status-pill">this node — re-served</span>{% elif field.gap == "held" %}<span class="status-pill pending_approval">held — not served</span>{% endif %}
+      {% if field.disputed %}<span class="status-pill error">disputed</span>{% endif %}
+      {% if field.multiple %}<span class="status-pill pending_approval">multiple</span>{% endif %}
+      {% if field.never_auto_fill %}<span class="status-pill">advisory — never auto-filled</span>{% endif %}
+    </h3>
+    {% if field.local_values %}<p class="enr-meta">Your library: {% for lv in field.local_values %}<code>{{ lv }}</code>{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
+    {% if field.consensus_ms is defined %}
+    <p class="enr-meta">Consensus duration: {% if field.consensus_ms is not none %}<strong>{{ field.consensus }}</strong> ({{ field.consensus_ms }} ms, the report-weighted median of strong verdicts){% else %}none yet — no strong-verdict consensus{% endif %}{% if field.by_variant %} · per variant: {% for name, pretty in field.by_variant.items() %}{{ name }}: {{ pretty }}{% if not loop.last %}, {% endif %}{% endfor %}{% endif %}</p>
+    {% endif %}
+    {% if field.held %}<p class="enr-meta">Held out of the merge (§8: only MusicBrainz-sourced years merge): {{ field.held | join(", ") }}</p>{% endif %}
+    {% for value in field["values"] %}
+    <div class="enr-value">
+      <div class="enr-value-head">
+        <code class="enr-value-text">{{ value.display }}</code>
+        <span class="status-pill {{ value.tier_pill }}">{{ value.tier }}</span>
+        {% if value.local %}<span class="status-pill ok">your library</span>{% endif %}
+        {% if value.own %}<span class="status-pill">this node — re-served</span>{% endif %}
+        {% if value.verification_stale %}<span class="status-pill pending_approval">verification stale</span>{% endif %}
+      </div>
+      <p class="enr-meta">
+        support bucket <strong>{{ value.support }}</strong>
+        · “{{ value.support_label }}”
+        {% if value.verified_at %} · verified {{ value.verified_at }}{% endif %}
+        {% if value.sources %} · sources: {{ value.sources | join(", ") }}{% endif %}
+      </p>
+    </div>
+    {% endfor %}
+    {% for variant in field.variants or [] %}
+    <div class="enr-value">
+      <div class="enr-value-head">
+        <code class="enr-value-text">{{ variant.name }}</code>
+        <span class="status-pill {{ 'ok' if variant.settled else '' }}">{{ "settled" if variant.settled else "unsettled" }}</span>
+        <span class="enr-meta">fingerprint <code>{{ variant.fingerprint }}</code></span>
+      </div>
+      <div class="table-scroll">
+      <table>
+        <thead><tr><th>Disc</th><th>#</th><th>Track</th><th>Tier</th><th>Support</th><th>Yours</th></tr></thead>
+        <tbody>
+        {% for t in variant.tracks %}
+        <tr><td>{{ t.disc }}</td><td>{{ t.position }}</td><td><code class="break">{{ t.track }}</code></td><td><span class="status-pill {{ t.tier_pill }}">{{ t.tier }}</span>{% if t.verification_stale %} <span class="status-pill pending_approval">verification stale</span>{% endif %}</td><td>{{ t.support }}</td><td>{{ "yes" if t.local else "—" }}</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% endfor %}
+</section>
+{% else %}
+{% if query %}<div class="empty-state"><strong>Nothing known about that yet</strong>No local claims and no network answer resolved to a subject for this lookup. {% if scope == "local" %}Try asking the network for what's missing.{% endif %}</div>{% endif %}
+{% endfor %}
+{% endif %}
+{% endif %}
+{% endblock %}
