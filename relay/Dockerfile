@@ -9,7 +9,13 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY metasync_relay/ ./metasync_relay/
+# Force world-readable modes on the copy: build-context files can
+# arrive with restrictive modes (660 from the build machine's
+# checkout) and a plain COPY preserves them, locking the relay user
+# out of its own code (first fly deploy, oct 28 2026: PermissionError
+# on __init__.py). The code stays root-owned; the relay user only
+# reads it.
+COPY --chmod=a+rX metasync_relay/ ./metasync_relay/
 
 RUN useradd --uid 10001 --no-create-home relay
 USER relay
