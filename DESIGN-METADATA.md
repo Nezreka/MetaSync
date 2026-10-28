@@ -1092,8 +1092,10 @@ so it cannot be a Neon function (those sleep between requests). It
 is a small always-on program on the **operator's server
 infrastructure** (the same family as the SIN backend — never on
 users' machines, which §3 establishes cannot accept inbound
-connections; the host vendor is the operator's choice, §14.3). The
-relay needs no schema of its own and no database connection at all.
+connections). The official relay's host is decided — Fly.io
+(§13 step 7, §14.3); for pool and third-party relays the host
+vendor remains the operator's choice. The relay needs no schema
+of its own and no database connection at all.
 
 **Identity:** a node connects with the SIN exchange (§3A.2 rails:
 pool key + Ed25519 signature → a token with a **24-hour
@@ -1637,9 +1639,11 @@ force it.
    on §7.1's re-serving hold list until the terms read clears
    them. The alternative is dropping the noisiest field from v1
    entirely.
-3. **Relay host:** operator's choice (§10) — the properties
-   (always-on, outbound-only nodes, no storage) are decided; the
-   vendor is not. Deployment is a build step now (§13 step 7).
+3. **Relay host:** decided (Boulder, Oct 28, 2026 — §13
+   step 7): **Fly.io** for the official relay — one machine,
+   always on. The properties (always-on, outbound-only nodes, no
+   storage) were never open. Operator's choice remains true for
+   pool and third-party relays under §11 federation.
 
 Decided and therefore *not* open: no server-side metadata storage
 (§2.3); the depot model for SoulSync (§1); peer agreement never
