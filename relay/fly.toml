@@ -41,13 +41,13 @@ primary_region = "iad" # US East (Northern Virginia). A plain choice:
   # client-supplied headers). Nodes sign for the origin they
   # DIALED, and both sides canonicalize to scheme://host:port with
   # the port always explicit — so this value and a node dialing
-  # wss://relay.ssync.net agree on "wss://relay.ssync.net:443".
+  # wss://relay.metasync.ssync.net agree on "wss://relay.metasync.ssync.net:443".
   # Consequence: set this to the FINAL custom domain from the very
   # first deploy (see the runbook's ordering). Nodes dialing the
   # <app>.fly.dev hostname sign for the fly.dev origin and their v2
   # hellos will be refused — the fly.dev name is not a fallback
   # address once this is set.
-  RELAY_ORIGIN = "wss://relay.ssync.net"
+  RELAY_ORIGIN = "wss://relay.metasync.ssync.net"
   # The pool's issuer id. Must match, byte for byte, the `issuer`
   # the portal signs into attestations and revocation lists, or
   # the relay drops the revocation feed as foreign. No code in

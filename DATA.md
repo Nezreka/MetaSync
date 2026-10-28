@@ -716,7 +716,7 @@ This section covers only the node's connection to it.
 - **The switch.** The node connects only when the user turns the
   metadata network on: settings `meta_network`, **default off**, plus
   a relay URL in `meta_relay_url`. With no URL stored, the node dials
-  the shipped default destination, `wss://relay.ssync.net`; a stored
+  the shipped default destination, `wss://relay.metasync.ssync.net`; a stored
   URL wins over the default, and a stored empty or null value means
   dial nowhere. With the switch off the node never dials the relay.
   The connection authenticates with the pool exchange token (which
