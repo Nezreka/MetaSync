@@ -49,6 +49,15 @@ _SNAPSHOT_WEEKS = 3
 # what bounds how stale the node's answers can get).
 _META_REBUILD_INTERVAL_H = 20
 
+# The production relay (DESIGN-METADATA.md §10, step 7: one always-on
+# Fly.io machine, see relay/README.md "Deploying on Fly.io"). A node
+# whose settings carry no meta_relay_url key at all dials this; a
+# stored value always wins — an empty string is a deliberate blank
+# (dial nowhere), and a stored null also resolves to no-dial (see
+# _meta_relay_url) — so a user can still point a node at a
+# third-party relay or nowhere.
+_DEFAULT_META_RELAY_URL = "wss://relay.ssync.net"
+
 
 def _env_flag(raw: str) -> bool:
     return raw.lower() not in ("0", "false", "no", "off", "")
@@ -1012,7 +1021,18 @@ class NodeService:
 
     # -- metadata network (relay transport, DESIGN-METADATA.md section 10) --
     def _meta_relay_url(self) -> str:
-        return str(self.store.settings.get("meta_relay_url") or "").strip()
+        # Presence of the key is what counts as explicit: a stored
+        # value is the user's choice; only a node that has never
+        # set one gets the shipped production default. Two stored
+        # shapes both resolve to "" (dial nowhere, fail closed):
+        # an empty string, which is a deliberate blanking, and a
+        # null — which is NOT read as a deliberate choice (it
+        # usually arrives via a settings round-trip that dropped
+        # the value) but lands in the same place via the `or`
+        # below, rather than silently reviving the default.
+        if "meta_relay_url" in self.store.settings:
+            return str(self.store.settings.get("meta_relay_url") or "").strip()
+        return _DEFAULT_META_RELAY_URL
 
     def _meta_node_mode(self) -> str:
         return normalize_mode(self.store.settings.get("meta_node_mode"))

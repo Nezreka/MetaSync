@@ -1107,6 +1107,32 @@ def test_startup_warns_when_revocation_enforcement_is_off(
     )
 
 
+def test_startup_warns_when_issuer_set_but_no_feed_url(
+    caplog, pool_private, pool_public
+):
+    """Gate fold: an issuer id with no RELAY_REVOCATIONS_URL builds
+    an empty feed object, which used to suppress the enforcement-off
+    warning while enforcing nothing. It gets its own startup line,
+    and the off warning stays silent (a feed object DOES exist)."""
+    import logging
+
+    async def scenario():
+        async with Harness(
+            pool_private, pool_public, issuer_id="metasync"
+        ) as _h:
+            pass
+
+    with caplog.at_level(logging.WARNING, logger="metasync_relay"):
+        asyncio.run(scenario())
+    messages = [record.message for record in caplog.records]
+    assert any(
+        "revocation_feed_unconfigured" in message for message in messages
+    )
+    assert not any(
+        "revocation_enforcement_off" in message for message in messages
+    )
+
+
 def test_reauth_refusal_goes_through_the_send_queue(pool_public, node_a):
     """SF-7: a failed re-auth is refused via the connection's send
     queue — the sender task owns the socket after hello, and no
