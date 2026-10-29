@@ -16,7 +16,7 @@ export default function TermsPage() {
         </p>
         <p className={p}>
           MetaSync is part of the SoulSync project: free, open-source software by
-          Broque Thomas. These terms cover the MetaSync portal
+          BoulderBadgeDad. These terms cover the MetaSync portal
           (metasync.ssync.net), the SIN pool (the SoulSync Intelligence
           Network), and
           the metadata network relay. By creating a portal account or connecting

@@ -16,7 +16,7 @@ export default function PrivacyPage() {
         </p>
         <p className={p}>
           MetaSync is part of the SoulSync project: free, open-source software by
-          Broque Thomas. This policy covers the online services: the MetaSync
+          BoulderBadgeDad. This policy covers the online services: the MetaSync
           portal at metasync.ssync.net, SIN (the SoulSync Intelligence Network),
           and the metadata network relay. SoulSync and MetaSync themselves run on
           your own machine, under your control; this policy is about the services
