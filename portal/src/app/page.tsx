@@ -65,6 +65,16 @@ export default async function LandingPage() {
           . This portal (metasync.ssync.net) is only for accounts and keys —
           ssync.net itself has no sign-in.
         </p>
+
+        <p className="mt-4 text-xs text-white/30">
+          <Link href="/privacy" className="underline transition hover:text-white/60">
+            Privacy Policy
+          </Link>{' '}
+          ·{' '}
+          <Link href="/terms" className="underline transition hover:text-white/60">
+            Terms of Service
+          </Link>
+        </p>
       </div>
     </main>
   )
