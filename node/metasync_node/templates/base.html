@@ -15,6 +15,7 @@
 {%- elif name == "soulsync" -%}<path d="M10 14a4.5 4.5 0 0 0 6.4 0l3-3a4.5 4.5 0 0 0-6.4-6.4l-1 1"/><path d="M14 10a4.5 4.5 0 0 0-6.4 0l-3 3a4.5 4.5 0 0 0 6.4 6.4l1-1"/>
 {%- elif name == "pools" -%}<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/>
 {%- elif name == "preview" -%}<path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6M9 14l-2 2 2 2M15 14l2 2-2 2"/>
+{%- elif name == "enrichment" -%}<circle cx="10.5" cy="10.5" r="6.5"/><path d="M20.5 20.5L15.4 15.4M10.5 7.5v6M7.5 10.5h6"/>
 {%- elif name == "signout" -%}<path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3M10 16l-4-4 4-4M6 12h10"/>
 {%- endif -%}
 </svg>
@@ -34,6 +35,7 @@
       <p class="nav-label">Node</p>
       <a href="{{ url_for('dashboard') }}"{% if request.endpoint == 'dashboard' %} class="active" aria-current="page"{% endif %}><span class="nav-icon">{{ icon("dashboard") }}</span>Dashboard</a>
       <a href="{{ url_for('preview') }}"{% if request.endpoint == 'preview' %} class="active" aria-current="page"{% endif %}><span class="nav-icon">{{ icon("preview") }}</span>Payload preview</a>
+      <a href="{{ url_for('enrichment') }}"{% if request.endpoint == 'enrichment' %} class="active" aria-current="page"{% endif %}><span class="nav-icon">{{ icon("enrichment") }}</span>Enrichment</a>
       <p class="nav-label">Connect</p>
       <a href="{{ url_for('soulsync_settings') }}"{% if request.endpoint == 'soulsync_settings' %} class="active" aria-current="page"{% endif %}><span class="nav-icon">{{ icon("soulsync") }}</span>SoulSync</a>
       <a href="{{ url_for('pools') }}"{% if request.endpoint == 'pools' %} class="active" aria-current="page"{% endif %}><span class="nav-icon">{{ icon("pools") }}</span>Pools</a>

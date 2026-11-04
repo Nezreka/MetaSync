@@ -39,6 +39,34 @@
   </div>
 </section>
 
+{% if status.unsent_report %}
+<section class="card alert-card" id="unsent-report">
+  <div class="card-head">
+    <p class="eyebrow">Dry run · {{ status.unsent_report.week }}</p>
+    <h2>Your report is ready, and nothing was sent</h2>
+  </div>
+  <p>This week's report has <strong>{{ status.unsent_report.signal_count }}</strong> yes/no album signal{{ "" if status.unsent_report.signal_count == 1 else "s" }} for {{ status.unsent_report.pools }} pool{{ "" if status.unsent_report.pools == 1 else "s" }}. The network only counts installs that send, so this one isn't counted yet.</p>
+  <div class="hero-actions">
+    <form method="post" action="{{ url_for('action_start_sending') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="primary" type="submit">Start sending</button></form>
+    <a class="btn-ghost" href="{{ url_for('preview') }}">See exactly what would be sent</a>
+  </div>
+</section>
+{% endif %}
+
+{% if status.network %}
+<section class="card" id="network-size">
+  <div class="card-head">
+    <p class="eyebrow">The network · {{ status.network.pool }}</p>
+    <h2>{{ status.network.installs }} install{{ "" if status.network.installs == 1 else "s" }} reported {{ status.network.week }}</h2>
+  </div>
+  {% if status.network.installs < status.network.publish_threshold %}
+  <p>Charts from the network start once {{ status.network.publish_threshold }} installs report the same album in a week. Until then the playlists fill from ListenBrainz's public charts, and say so. Every install that sends brings that closer.</p>
+  {% else %}
+  <p>An album charts once {{ status.network.publish_threshold }} installs report it in a week.</p>
+  {% endif %}
+</section>
+{% endif %}
+
 {% for p in status.pools if p.binding_status == "pending_approval" %}
 <section class="card alert-card">
   <div class="card-head">

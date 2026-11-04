@@ -18,12 +18,14 @@ from typing import Any
 from flask import Flask, abort, flash, redirect, render_template, request, session, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
 
+from .meta import enrichment as enrichment_view
 from .service import NodeService, PairingError, PairingRateLimited, check_pool_url
 
 # POST routes SoulSync calls (no browser session, no form): CSRF-exempt.
 MACHINE_POST_PATHS = frozenset({
     "/local/pair/request", "/local/pair/claim",
     "/local/handoff/pool-key", "/local/disconnect",
+    "/local/meta/preview", "/local/meta/query",
 })
 
 LOGIN_MAX_FAILURES = 5
@@ -99,7 +101,7 @@ def create_app(service: NodeService) -> Flask:
 
     @app.get("/health")
     def health():
-        return {"ok": True, "service": "metasync-node", "version": "0.2.0"}
+        return {"ok": True, "service": "metasync-node", "version": "0.3.0"}
 
     @app.route("/setup", methods=["GET", "POST"])
     def setup():
@@ -284,6 +286,42 @@ def create_app(service: NodeService) -> Flask:
     def local_status():
         return service.local_status()
 
+    @app.post("/local/meta/preview")
+    @local_key_required
+    def local_meta_preview():
+        # "What your node would answer": the responder's exact code
+        # path over the local claims store, run locally — nothing is
+        # sent anywhere. Body: a query dict, or {"query": {...}}.
+        body = _json_body()
+        query = body.get("query") if isinstance(body.get("query"), dict) \
+            else body
+        return service.preview_answers(query)
+
+    @app.post("/local/meta/query")
+    @local_key_required
+    def local_meta_query():
+        # The querier (DESIGN-METADATA §6): cache-first asking.
+        # Body: {kind, mode: exact|text, subjects|terms}. Returns
+        # the merged records AS THE COARSE DEPOT PROJECTION
+        # (merge.project_for_depot: bucketed support, no origin
+        # keys or batch ids — the step-8 contract) plus whether
+        # the network was asked at all.
+        body = _json_body()
+        out = service.meta_query(body)
+        return out, 200 if out.get("ok") else 400
+
+    @app.get("/local/meta/record/<path:entry>")
+    @local_key_required
+    def local_meta_record(entry):
+        # One subject's merged view from local data + cache only —
+        # no relay traffic, served as the same coarse projection.
+        # The entry may be a SoulID, a provider ref (deezer:3135556)
+        # or a verified legacy alias.
+        record = service.meta_record(entry)
+        if record is None:
+            return {"ok": False, "error": "not_found"}, 404
+        return {"ok": True, "record": record}
+
     @app.get("/local/charts")
     @local_key_required
     def local_charts():
@@ -326,6 +364,22 @@ def create_app(service: NodeService) -> Flask:
         store.settings["dry_run"] = request.form.get("dry_run") == "on"
         store.save_settings()
         flash(f"Dry run is now {'ON' if store.settings['dry_run'] else 'OFF'}.", "ok")
+        return redirect(url_for("dashboard"))
+
+    @app.post("/actions/start-sending")
+    @login_required
+    def action_start_sending():
+        # The one-click way out of dry run, offered once a report is ready:
+        # turn sending on and send the closed week's report right away (the
+        # pool takes the closed week), so this install counts this week
+        # instead of after next Monday's scheduled run.
+        store.settings["dry_run"] = False
+        store.save_settings()
+        if not service.pools():
+            flash("Sending is on. Join a pool on the Pools page and the weekly report goes out.", "ok")
+            return redirect(url_for("dashboard"))
+        service.start_report_job()
+        flash("Sending is on. This week's report is going out now; its progress is below.", "ok")
         return redirect(url_for("dashboard"))
 
     @app.post("/actions/share-listening")
@@ -469,6 +523,92 @@ def create_app(service: NodeService) -> Flask:
         store.save_settings()
         store.save_state()
         return redirect(url_for("pools"))
+
+    @app.get("/enrichment")
+    @login_required
+    def enrichment():
+        # §13 step 9's view: the merged record for one lookup —
+        # what this node knows about an artist, album or track,
+        # and how it knows it (verdicts, gap classification,
+        # support as the §9 bucket). The page itself writes
+        # nothing and promotes nothing (a GET form on purpose);
+        # what a lookup does is the form's scope: "ask" runs
+        # the querier's normal ask paths (cache-first; answers
+        # may be admitted and verification scheduled, as with
+        # any ask), "local" is a pure read of what the node
+        # already holds. Asking is never the default: a bare
+        # /enrichment?q=... link (a cross-site top-level
+        # navigation carries the session — SameSite=Lax) must
+        # not set a relay fan-out in motion, so a missing or
+        # unrecognized scope means local; ask happens only
+        # when the operator picks it in the form.
+        #
+        # The template context is built HERE, stripped: the
+        # service returns the FULL result (unprojected records
+        # with origins, batches and exact counts, the own key
+        # string, the whole querier status) because the
+        # presenter needs it — and none of it crosses into the
+        # context. What crosses is the presenter's views plus
+        # a fixed set of lookup facts: ok/error, asked_network,
+        # unresolved, and the presenter-shaped backlog pair
+        # the tiles render (both counters as presence only —
+        # admissions land in the unverified queue unverdicted,
+        # and asks force-recheck stale verdicts away, so any
+        # finer rendering hands back, by subtraction, counts
+        # correlated with other nodes' claims). (The
+        # cache-size counters stay out entirely, for the same
+        # subtraction reason, with no tile's job to keep.) §9
+        # binds this page:
+        # no exact count, origin key, batch id or report count
+        # reaches the template, by construction, not by the
+        # template's restraint.
+        kind = request.args.get("kind") or "artist"
+        if kind not in ("artist", "album", "track"):
+            kind = "artist"
+        mode = request.args.get("mode") or "text"
+        if mode not in ("exact", "text"):
+            mode = "text"
+        scope = request.args.get("scope")
+        if scope not in ("ask", "local"):
+            scope = "local"
+        query = (request.args.get("q") or "").strip()
+        page = None
+        views: list[dict[str, Any]] = []
+        if query:
+            result = service.meta_enrichment({
+                "kind": kind, "mode": mode, "query": query,
+                "network": scope == "ask"})
+            if result.get("ok"):
+                views = [
+                    enrichment_view.record_view(
+                        record, own_key=result.get("own_key"))
+                    for record in result["records"]]
+                page = {
+                    "ok": True,
+                    "asked_network":
+                        bool(result.get("asked_network")),
+                    "unresolved":
+                        list(result.get("unresolved") or []),
+                    # The backlog pair, presenter-shaped:
+                    # both counters cross as presence only
+                    # ("none" / "some") — admissions land in
+                    # the unverified queue unverdicted, and
+                    # admissions DO move the stale count
+                    # (forced re-checks on ask, prune
+                    # evictions), so no count or bucket of
+                    # either is safe from subtraction.
+                    "backlog": enrichment_view.backlog_view(
+                        (result.get("querier") or {}).get(
+                            "verification"))
+                    if result.get("querier") else None,
+                }
+            else:
+                page = {"ok": False, "error": result.get("error")}
+        return render_template(
+            "enrichment.html",
+            store_exists=service.meta_store_exists(),
+            kind=kind, mode=mode, scope=scope, query=query,
+            result=page, views=views)
 
     @app.get("/preview")
     @login_required

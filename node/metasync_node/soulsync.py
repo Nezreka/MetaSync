@@ -131,6 +131,24 @@ class SoulSyncClient:
         env = self.get("/library/listening-activity", {"since": since, "until": until})
         return (env["data"] or {}).get("albums") or []
 
+    def export_page(self, entity: str, cursor: str = "", since: str = "",
+                    limit: int = 1000) -> dict[str, Any]:
+        """One page of the MetaSync metadata export (SoulSync PR #1883).
+
+        GET /metasync/export?entity=artist|album|track&cursor=&since=&limit=
+        -> data {entity, soulid_version, items[], next_cursor, has_more}.
+        Keyset pagination: pass next_cursor back until has_more is false.
+        `since` filters on the row's effective updated_at (parents
+        included, so an artist rename re-exports its albums/tracks).
+        Older SoulSync builds 404 here; callers treat that as "export
+        not available", never as an empty library.
+        """
+        env = self.get("/metasync/export", {
+            "entity": entity, "cursor": cursor, "since": since,
+            "limit": limit,
+        })
+        return env["data"] or {}
+
     def test_connection(self) -> dict[str, Any]:
         """Cheap read-only probe used by the UI's Test button."""
         env = self.get("/watchlist")

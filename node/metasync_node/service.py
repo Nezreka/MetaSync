@@ -23,9 +23,19 @@ from urllib.parse import urlparse
 
 from .config import Config
 from .identity import NodeIdentity, load_or_create_identity, token_for_week
-from .musicbrainz import MusicBrainzResolver
+from .meta import merge as meta_merge
+from .meta.builder import BuildStopped, LibraryBuilder
+from .meta.querier import Querier
+from .meta.responder import Responder
+from .meta.verify import DeezerFetcher, MusicBrainzFetcher, SpotifyFetcher
+from .meta.verify import Verifier
+from .meta.store import DB_FILENAME as META_DB_FILENAME
+from .meta.store import MetaStore
+from .musicbrainz import MusicBrainzResolver, Pacer
 from .playlists import build_canonical_playlists
 from .pool import PoolBindingPending, PoolClient, PoolError, PoolNotAvailable, is_loopback_url
+from .relay import RelayClient, RelayError, normalize_mode
+from .revocations import RevocationStore
 from .signals import KEEP_AFTER, LATE_WINDOW, compute_signals, is_uuid_shape
 from .soulsync import SoulSyncClient, SoulSyncError
 from .store import Store, default_pool_from_env
@@ -33,6 +43,20 @@ from .weekutil import closed_week_start, iso_week_string
 
 # How many complete weekly library snapshots the churn rule keeps.
 _SNAPSHOT_WEEKS = 3
+
+# A claims-store build is due again this long after the last
+# completed one (the export walk is incremental; this cadence is
+# what bounds how stale the node's answers can get).
+_META_REBUILD_INTERVAL_H = 20
+
+# The production relay (DESIGN-METADATA.md §10, step 7: one always-on
+# Fly.io machine, see relay/README.md "Deploying on Fly.io"). A node
+# whose settings carry no meta_relay_url key at all dials this; a
+# stored value always wins — an empty string is a deliberate blank
+# (dial nowhere), and a stored null also resolves to no-dial (see
+# _meta_relay_url) — so a user can still point a node at a
+# third-party relay or nowhere.
+_DEFAULT_META_RELAY_URL = "wss://relay.metasync.ssync.net"
 
 
 def _env_flag(raw: str) -> bool:
@@ -92,6 +116,9 @@ class NodeService:
             if "METASYNC_SHARE_LISTENING" in env:
                 settings["share_listening"] = _env_flag(env["METASYNC_SHARE_LISTENING"])
                 changed = True
+            if "METASYNC_META_ANSWERING" in env:
+                settings["meta_answering"] = _env_flag(env["METASYNC_META_ANSWERING"])
+                changed = True
         if changed:
             self.store.save_settings()
         self.allow_insecure_pools = bool(env and _env_flag(env.get("METASYNC_ALLOW_INSECURE_POOLS", "")))
@@ -105,11 +132,18 @@ class NodeService:
             del mb_cache[key]
         if stale:
             self.store.save_state()
+        # ONE MusicBrainz pacer for the whole node (R2-SF-6):
+        # the resolver and the §7 verifier's fetcher share it, so
+        # the node's aggregate MusicBrainz rate honors the
+        # ~1 req/s etiquette instead of doubling it per client.
+        self._musicbrainz_pacer = Pacer(
+            config.musicbrainz_min_interval_s)
         self.resolver = resolver or MusicBrainzResolver(
             config.musicbrainz_base_url,
             config.musicbrainz_user_agent,
             min_interval_s=config.musicbrainz_min_interval_s,
             cache=mb_cache,
+            pacer=self._musicbrainz_pacer,
         )
         # The clock the background job and the scheduler read; tests pin it.
         self.clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
@@ -117,6 +151,29 @@ class NodeService:
         # One report run at a time, whoever starts it (UI job or scheduler):
         # two concurrent runs would race the churn snapshots and state.
         self._run_lock = threading.Lock()
+        # The metadata-network relay client (DESIGN-METADATA.md section
+        # 10), created lazily by sync_relay_client when the user turns
+        # the network on. None means "never started on this process".
+        self._relay_client: RelayClient | None = None
+        self._relay_lock = threading.Lock()
+        # The node's ONE revocation store (§9/§10), created lazily by
+        # _revocation_store() and shared by the relay client, the
+        # pool clients, and the meta store: a list learned on any
+        # channel is the list every enforcement point reads.
+        self._shared_revocation_store: RevocationStore | None = None
+        # The metadata claims store + responder (DESIGN-METADATA.md
+        # section 5), created lazily: a node that never turns the
+        # metadata network on never opens the store file.
+        self._meta_store: MetaStore | None = None
+        self._meta_responder: Responder | None = None
+        self._meta_querier: Querier | None = None
+        # Lazy construction of the store/responder happens under
+        # this lock (a scheduler tick and a UI request must not race
+        # two stores into being). It is NOT _meta_lock: that one is
+        # held across whole builds, which themselves construct.
+        self._meta_construct_lock = threading.RLock()
+        self._meta_lock = threading.Lock()
+        self._meta_build_thread: threading.Thread | None = None
         # A job record persisted as "running" across a restart is a corpse:
         # its thread died with the old process. Close it out honestly.
         stale_job = self.store.state.get("report_job") or {}
@@ -157,6 +214,8 @@ class NodeService:
             auth_state=auth_state,
             persist=self.store.save_state,
             allow_legacy=self.allow_insecure_pools,
+            issuer_key_provider=self._meta_issuer_key,
+            revocation_sink=self._note_exchange_revocations,
         )
 
     def test_soulsync(self) -> dict[str, Any]:
@@ -453,7 +512,7 @@ class NodeService:
         return {
             "ok": True,
             "service": "metasync-node",
-            "version": "0.2.0",
+            "version": "0.3.0",
             "node_id": self.identity.node_id,
             "node_fingerprint": self.identity.fingerprint,
             "node_public_key": self.identity.public_key_b64url,
@@ -464,6 +523,11 @@ class NodeService:
             "last_report": status["last_report"],
             "last_refresh_at": status["last_refresh_at"],
             "charts_offered": status["charts_offered"],
+            # SoulSync's MetaSync settings say whether this install is
+            # counted yet, and how big the network is
+            "dry_run": status["dry_run"],
+            "unsent_report": status["unsent_report"],
+            "network": status["network"],
             "pairing_status": pairing.get("status") if pairing else None,
             "last_pairing": self.store.state.get("last_pairing"),
         }
@@ -921,6 +985,7 @@ class NodeService:
                     {"key": str(p.get("key")), "name": p.get("name"), "track_count": len(p.get("tracks") or [])}
                     for p in playlists
                 ]
+                self._remember_network(pool, client, now)
             except PoolBindingPending as err:
                 entry["status"] = "binding_pending"
                 entry["error"] = str(err)
@@ -960,6 +1025,748 @@ class NodeService:
                 })
         return {"week": week, "playlists": playlists}
 
+    # -- metadata network (relay transport, DESIGN-METADATA.md section 10) --
+    def _meta_relay_url(self) -> str:
+        # Presence of the key is what counts as explicit: a stored
+        # value is the user's choice; only a node that has never
+        # set one gets the shipped production default. Two stored
+        # shapes both resolve to "" (dial nowhere, fail closed):
+        # an empty string, which is a deliberate blanking, and a
+        # null — which is NOT read as a deliberate choice (it
+        # usually arrives via a settings round-trip that dropped
+        # the value) but lands in the same place via the `or`
+        # below, rather than silently reviving the default.
+        if "meta_relay_url" in self.store.settings:
+            return str(self.store.settings.get("meta_relay_url") or "").strip()
+        return _DEFAULT_META_RELAY_URL
+
+    def _meta_node_mode(self) -> str:
+        return normalize_mode(self.store.settings.get("meta_node_mode"))
+
+    def _relay_token(self, *, force: bool = False) -> str:
+        """A current pool access token for the relay hello.
+
+        The relay authenticates with the SIN exchange token (section
+        10): the first enabled pool's client exchanges as usual, and
+        the token must carry the meta:read scope the pools now grant.
+        Anything else (no pool, legacy pool, missing scope) is a
+        connect failure the relay client backs off on. With
+        ``force``, the exchange is never served from the client's
+        cache — the re-auth path's requirement (§10)."""
+        pools = self.pools()
+        if not pools:
+            raise RelayError("no pool joined: the relay hello needs a pool key exchange")
+        client = self.pool_client(pools[0])
+        client.exchange(force=force)
+        token = client.auth_state.get("access_token")
+        if not token:
+            raise RelayError("pool exchange produced no access token (legacy pool?)")
+        scopes = client.auth_state.get("scopes") or []
+        if "meta:read" not in scopes:
+            # Missing or empty scope lists mean the token cannot be
+            # shown to carry meta:read (a legacy pool records none):
+            # fail here with the clear diagnosis instead of letting
+            # the relay refuse a hello it was never entitled to make.
+            raise RelayError("pool access token does not carry the meta:read scope")
+        return str(token)
+
+    def _relay_token_fresh(self) -> str:
+        """The relay client's fresh-token provider: a forced exchange
+        (§10 — every in-band re-authentication is preceded by a fresh
+        exchange, which is also the revocation list's delivery
+        moment). Handing re-auth the CACHED token instead was gate
+        M4: the relay acks the same expiry, the client's re-auth
+        loop recomputes a past-due delay, and it re-auths once per
+        round trip for ~90 seconds."""
+        return self._relay_token(force=True)
+
+    def _meta_issuer_key(self) -> Any | None:
+        """The token issuer's Ed25519 public key, from the optional
+        meta_issuer_public_key setting (base64url raw key or PEM), for
+        verifying relay-carried revocation lists and exchange-carried
+        attestations. Unset or unparsable means the client cannot
+        verify lists and drops them — the relay still enforces its
+        own verified copy at hello. The silence here is deliberate
+        (a lookup must not raise); the LOUD version of this state is
+        _issuer_key_note in relay_status (gate S6)."""
+        raw = str(self.store.settings.get("meta_issuer_public_key") or "").strip()
+        if not raw:
+            return None
+        from .revocations import parse_issuer_public_key
+
+        return parse_issuer_public_key(raw)
+
+    def _revocation_store(self) -> RevocationStore:
+        """The node's ONE revocation store (§9/§10), shared by the
+        relay client (welcome/push lists), the pool clients
+        (exchange-carried lists), and the meta store (admission,
+        re-serve filtering, cache purge) — a list learned on any
+        channel is the list every enforcement point reads. Its
+        per-issuer high-water marks AND the signed lists that
+        earned them persist in the state dir, the lists re-verified
+        against the issuer key on load: rollback protection (§10)
+        and enforcement itself must survive restarts and network
+        toggles, each of which builds a fresh relay client."""
+        if self._shared_revocation_store is None:
+            self._shared_revocation_store = RevocationStore(
+                persist_path=self.store.dir / "meta_revocations.json",
+                issuer_key_provider=self._meta_issuer_key)
+        return self._shared_revocation_store
+
+    def _purge_revoked_from_cache(self, applied: Any) -> None:
+        """A NEW verified revocation list landed (relay push or pool
+        exchange): the named keys' cached batches die now (§10),
+        not at some later sweep. Only when a meta store exists —
+        a list must not conjure the store file into being on a node
+        that never built one. Failure-isolated: the purge is
+        defense in depth (admission and the read filter also check),
+        and it must never break the channel that delivered the list."""
+        if not self._meta_store_created():
+            return
+        try:
+            self.meta_store().purge_revoked(set(applied.keys))
+        except Exception:  # noqa: BLE001, S110 - see docstring
+            pass
+
+    def _note_exchange_revocations(self, payload: Any) -> None:
+        """PoolClient revocation sink (§10): a token exchange
+        response's revocation list, verified against the issuer key
+        and applied to the shared store at its sequence. The
+        exchange is the issuer's own endpoint — the one delivery
+        channel a withholding relay does not sit on — so this is
+        what bounds a withheld revocation's delay to one token
+        lifetime. (The portal emitting the field is the known
+        portal follow-up; pools that don't send it change nothing.)
+        """
+        applied = self._revocation_store().apply(
+            payload, self._meta_issuer_key())
+        if applied is not None:
+            self._purge_revoked_from_cache(applied)
+
+    def _new_relay_client(self) -> RelayClient:
+        return RelayClient(
+            self.identity,
+            url_provider=self._meta_relay_url,
+            mode_provider=self._meta_node_mode,
+            token_provider=self._relay_token,
+            issuer_key_provider=self._meta_issuer_key,
+            revocation_store=self._revocation_store(),
+            revocations_applied=self._purge_revoked_from_cache,
+            fresh_token_provider=self._relay_token_fresh,
+        )
+
+    def sync_relay_client(self) -> dict[str, Any]:
+        """Start or stop the relay client to match the settings.
+
+        The metadata network is its own switch: settings meta_network
+        (default off) plus a relay URL. With the switch off, or no URL,
+        the client stops and nothing connects anywhere. With it on, the
+        client runs; a URL or mode change kicks the live session so it
+        re-hellos with the new values. Idempotent; the scheduler calls
+        it every tick so dashboard changes land without a restart."""
+        want = bool(self.store.settings.get("meta_network", False)) and bool(self._meta_relay_url())
+        stop_client: RelayClient | None = None
+        with self._relay_lock:
+            client = self._relay_client
+            if want:
+                if client is None:
+                    client = self._relay_client = self._new_relay_client()
+                    client.start()
+                elif not client.is_alive():
+                    client.start()
+                elif client.session_params is not None and client.session_params != (
+                    self._meta_relay_url(),
+                    self._meta_node_mode(),
+                ):
+                    client.kick()
+            elif client is not None:
+                stop_client = client
+        # The stop runs OUTSIDE the lock: stop() joins the connection
+        # thread, and holding _relay_lock across that join would stall
+        # every relay_status() for its duration. The reference is only
+        # dropped once stop() confirms the thread is dead; a client
+        # that is still winding down keeps its reference, so the next
+        # tick retries the stop instead of spawning a replacement that
+        # would duel the survivor at the relay.
+        if stop_client is not None and stop_client.stop():
+            with self._relay_lock:
+                if self._relay_client is stop_client:
+                    self._relay_client = None
+        # Answering is its own opt-in, separate from the network
+        # switch and from every SIN switch: the query handler is
+        # registered only while BOTH meta_network and meta_answering
+        # are on, and removed the moment either turns off. The
+        # responder re-reads the node mode per query, so a mode
+        # change needs no rewiring here.
+        with self._relay_lock:
+            client = self._relay_client
+        if client is not None:
+            want_handler = want and self.meta_answering()
+            client.set_query_handler(
+                self._meta_query_handler if want_handler else None)
+        return self.relay_status()
+
+    def stop_relay_client(self) -> None:
+        with self._relay_lock:
+            client = self._relay_client
+        if client is not None and client.stop():
+            with self._relay_lock:
+                if self._relay_client is client:
+                    self._relay_client = None
+
+    def _issuer_key_note(self) -> str | None:
+        """Gate S6, the loud version of _meta_issuer_key's silence:
+        with no usable issuer key, EVERY attestation an exchange
+        delivers is dropped (this node's batches count zero support)
+        and EVERY revocation list is dropped (no local enforcement;
+        only the relay's own hello check remains) — a node in that
+        state must not look identical to a healthy one in status.
+        None when a key is configured and parses."""
+        raw = str(self.store.settings.get("meta_issuer_public_key") or "").strip()
+        if raw and self._meta_issuer_key() is not None:
+            return None
+        if not raw:
+            return (
+                "meta_issuer_public_key is not set: binding "
+                "attestations and revocation lists cannot be "
+                "verified, so this node drops them all — its "
+                "batches count zero support and revocation is "
+                "enforced only by the relay at hello, never locally"
+            )
+        return (
+            "meta_issuer_public_key does not parse as an Ed25519 "
+            "public key: binding attestations and revocation lists "
+            "are dropped as unverifiable — this node's batches "
+            "count zero support and revocation is not enforced "
+            "locally"
+        )
+
+    def relay_status(self) -> dict[str, Any]:
+        """Relay connection status for the dashboard and diagnostics."""
+        enabled = bool(self.store.settings.get("meta_network", False))
+        client = self._relay_client
+        if client is None:
+            return {
+                "enabled": enabled,
+                "answering": self.meta_answering(),
+                "connected": False,
+                "peers": None,
+                "mode": self._meta_node_mode(),
+                "relay_url": self._meta_relay_url(),
+                "last_error": None,
+                "revocations": None,
+                "attestation_note": self._attestation_pool_note(),
+                "issuer_note": self._issuer_key_note(),
+            }
+        status = client.status()
+        status["enabled"] = enabled
+        status["answering"] = self.meta_answering()
+        status["attestation_note"] = self._attestation_pool_note()
+        status["issuer_note"] = self._issuer_key_note()
+        return status
+
+    # -- metadata responder (claims store, DESIGN-METADATA.md section 5) --
+    def meta_answering(self) -> bool:
+        """The answering opt-in: settings meta_answering, default off,
+        separate from meta_network and from every SIN switch."""
+        return bool(self.store.settings.get("meta_answering", False))
+
+    def meta_store(self) -> MetaStore:
+        if self._meta_store is None:
+            with self._meta_construct_lock:
+                if self._meta_store is None:
+                    self._meta_store = MetaStore(
+                        self.store.dir,
+                        revocations=self._revocation_store())
+        return self._meta_store
+
+    def _attestation_source(self) -> tuple[str | None, dict[str, Any] | None]:
+        """(pool id, attestation) for the pool the relay session
+        belongs to — the FIRST joined pool, the one _relay_token
+        exchanges with (step 6's per-pool selection: the
+        responder/builder embed the SESSION pool's attestation,
+        because an attestation is one pool's signed statement and
+        askers verify it against that pool's issuer; another
+        pool's attestation embedded on this session would count
+        zero support there, which is worse than embedding none).
+        A pool client that raises degrades to 'no attestation'
+        (SF-2 doctrine), never to a broken caller."""
+        pools = self.pools()
+        if not pools:
+            return None, None
+        pool = pools[0]
+        try:
+            attestation = self.pool_client(pool).current_attestation()
+        except Exception:  # noqa: BLE001 - degrade, never break
+            attestation = None
+        return str(pool.get("id") or "pool"), attestation
+
+    def _current_attestation(self) -> dict[str, Any] | None:
+        """The node's current binding attestation (§9) for the
+        relay session's pool: the verified one that pool's exchange
+        last handed over, stored on its client's auth state. None
+        when that pool's exchanges have delivered none — another
+        pool's attestation is never substituted (per-pool
+        selection, step 6)."""
+        return self._attestation_source()[1]
+
+    def _attestation_pool_note(self) -> str | None:
+        """Visibility for the one multi-pool state that still costs
+        support: the session pool has delivered NO attestation
+        while another joined pool carries one. The node embeds
+        none (per-pool selection), so its answers count zero
+        support until the SESSION pool's exchange delivers its
+        own — a state worth naming in relay_status rather than
+        letting it pass as a healthy node. None when there is
+        nothing to warn about."""
+        pools = self.pools()
+        if len(pools) < 2:
+            return None
+        session_id, attestation = self._attestation_source()
+        if attestation is not None or session_id is None:
+            return None
+        for pool in pools[1:]:
+            try:
+                other = self.pool_client(pool).current_attestation()
+            except Exception:  # noqa: BLE001 - degrade, never break
+                other = None
+            if other is not None:
+                return (
+                    f"pool {pool.get('id') or 'pool'} carries a "
+                    f"binding attestation, but the relay session "
+                    f"runs on pool {session_id}, which has delivered "
+                    f"none: attestations are per-pool, so this "
+                    f"node's answers count zero support until the "
+                    f"session pool's exchange delivers its own"
+                )
+        return None
+
+    def _meta_responder_obj(self) -> Responder:
+        if self._meta_responder is None:
+            with self._meta_construct_lock:
+                if self._meta_responder is None:
+                    self._meta_responder = Responder(
+                        self.meta_store(), self.identity,
+                        mode_provider=self._meta_node_mode,
+                        attestation_provider=self._current_attestation)
+        return self._meta_responder
+
+    def _meta_store_created(self) -> bool:
+        """The claims store exists (constructed in this process, or
+        its file is already on disk). Status/due paths use this to
+        stay store-free on nodes that never built one: opening the
+        store would CREATE meta_claims.sqlite3 on a node with the
+        whole metadata feature off."""
+        return self._meta_store is not None or \
+            (self.store.dir / META_DB_FILENAME).exists()
+
+    def _meta_query_handler(self, query: dict[str, Any]) -> list[dict[str, Any]]:
+        return self._meta_responder_obj().handle(query)
+
+    def _meta_builder(self, live_gate: bool = False) -> LibraryBuilder:
+        # The live gate (stop at the next page if answering is
+        # switched off mid-walk) applies to scheduler-started builds.
+        # A manual rebuild is the user's explicit request and runs
+        # regardless of the switch.
+        return LibraryBuilder(
+            self.soulsync(), self.identity, self.meta_store(),
+            enabled_on=self.meta_answering if live_gate else None,
+            attestation_provider=self._current_attestation)
+
+    def meta_status(self) -> dict[str, Any]:
+        if not self._meta_store_created():
+            # No store yet: report the empty shape WITHOUT opening
+            # one. A status read must not create the file on a node
+            # that has the feature off (sync_meta_store's not-due
+            # path lands here on every scheduler tick).
+            return {
+                "answering": self.meta_answering(),
+                "mode": self._meta_node_mode(),
+                "store": {"own_claims": 0, "own_subjects": 0,
+                          "cached_batches": 0, "cached_claims": 0,
+                          "legacy_aliases": 0},
+                "build": {"last_status": None, "last_detail": None,
+                          "last_run_at": None, "last_completed_at": None,
+                          "last_full_completed_at": None,
+                          "last_totals": {}, "walk_entity": "",
+                          "full": True},
+                "querier": {"cached_batches": 0, "cached_claims": 0,
+                            "legacy_aliases": 0,
+                            "revocations":
+                                self._revocation_store().summary(),
+                            "verification": {"unverified_claims": 0,
+                                             "stale_verdicts": 0}},
+            }
+        builder = LibraryBuilder(None, self.identity, self.meta_store())
+        return {
+            "answering": self.meta_answering(),
+            "mode": self._meta_node_mode(),
+            "store": self.meta_store().counts(),
+            "build": builder.status(),
+            "querier": self._meta_querier_obj().status(),
+        }
+
+    def preview_answers(self, query: Any) -> dict[str, Any]:
+        """Exactly what the responder would answer for this query —
+        the same code path the relay handler runs, for the node's
+        own UI/API ("what your node would answer")."""
+        batches = self._meta_responder_obj().handle(
+            query if isinstance(query, dict) else {})
+        return {
+            "ok": True,
+            "mode": self._meta_node_mode(),
+            "answering": self.meta_answering(),
+            "batches": batches,
+        }
+
+    # -- metadata querier (asking, DESIGN-METADATA.md section 6) ---------
+
+    def _meta_fetchers(self) -> dict[str, Any]:
+        """§7's fetcher set: MusicBrainz (the node's configured
+        base URL, pacing and user agent — verification traffic is
+        the node's own, under the same etiquette as every other
+        MusicBrainz call it makes), Deezer's public lookup, and
+        Spotify as the explicit not-configured stub (the
+        credential route is §13 step 6's open sub-decision)."""
+        return {
+            "musicbrainz": MusicBrainzFetcher(
+                self.config.musicbrainz_user_agent,
+                base_url=self.config.musicbrainz_base_url,
+                min_interval_s=self.config.musicbrainz_min_interval_s,
+                pacer=self._musicbrainz_pacer),
+            "deezer": DeezerFetcher(),
+            "spotify": SpotifyFetcher(),
+        }
+
+    def _relay_client_or_none(self) -> RelayClient | None:
+        with self._relay_lock:
+            return self._relay_client
+
+    def _own_attestation_issuer(self) -> str | None:
+        """The issuer id of this node's own current attestation —
+        the TRUSTED issuer for §9 admission: the configured issuer
+        key speaks for this issuer and no other, and a batch
+        attestation earns standing only when its signature
+        verifies under that pair (MF-1). None — this node holds
+        no attestation of its own yet — means nothing can verify,
+        so every batch admits at zero support."""
+        attestation = self._current_attestation()
+        if attestation is None:
+            return None
+        issuer = attestation.get("issuer")
+        return issuer if isinstance(issuer, str) and issuer else None
+
+    def _meta_querier_obj(self) -> Querier:
+        if self._meta_querier is None:
+            with self._meta_construct_lock:
+                if self._meta_querier is None:
+                    store = self.meta_store()
+                    self._meta_querier = Querier(
+                        store, self.identity,
+                        relay_provider=self._relay_client_or_none,
+                        verifier=Verifier(store, self._meta_fetchers()),
+                        responder=self._meta_responder_obj(),
+                        issuer_key_provider=self._meta_issuer_key,
+                        own_issuer_provider=self._own_attestation_issuer)
+        return self._meta_querier
+
+    def meta_query(self, payload: Any) -> dict[str, Any]:
+        """One ask through the querier (POST /local/meta/query):
+        {kind, mode: exact|text, subjects|terms, network?}. Bad
+        asks are an error dict, never an exception. Asking does
+        NOT require the answering opt-in — asking and answering
+        are separate consents (§5); the relay client only exists
+        while meta_network is on, and without it the querier
+        answers from local data + cache alone."""
+        if not isinstance(payload, dict):
+            return {"ok": False, "error": "query body must be an object"}
+        kind = payload.get("kind")
+        if kind not in ("artist", "album", "track"):
+            return {"ok": False,
+                    "error": "kind must be artist, album or track"}
+        mode = payload.get("mode") or "exact"
+        network = payload.get("network") is not False
+        querier = self._meta_querier_obj()
+        if mode == "exact":
+            subjects = payload.get("subjects")
+            if not isinstance(subjects, list) or not subjects:
+                return {"ok": False,
+                        "error": "exact queries need a non-empty "
+                                 "subjects list"}
+            out = querier.query_exact(
+                kind, [str(s) for s in subjects], network=network)
+        elif mode == "text":
+            terms = payload.get("terms")
+            if not isinstance(terms, list) or not terms:
+                return {"ok": False,
+                        "error": "text queries need a non-empty "
+                                 "terms list"}
+            out = querier.query_text(
+                kind, [str(t) for t in terms], network=network)
+        else:
+            return {"ok": False, "error": "mode must be exact or text"}
+        # R1-SF-3/R2-SF-9: SoulSync-facing surfaces get the
+        # COARSE PROJECTION (meta/merge.py's project_for_depot —
+        # the step-8 depot contract): bucketed support, no origin
+        # keys, no batch ids, no exact counts. The full record
+        # stays internal (step 9's view reads the querier). The
+        # admission tallies (admitted/dropped) are exact counts of
+        # answering batches — they stay on the node-internal
+        # status surface ONLY (gate MF-3) and are never spread
+        # into this response.
+        return {"ok": True,
+                "asked_network": out["asked_network"],
+                "unresolved": out["unresolved"],
+                "records": [meta_merge.project_for_depot(record)
+                            for record in out["records"]]}
+
+    def meta_record(self, entry: str) -> dict[str, Any] | None:
+        """One subject's merged view from local data + cache (GET
+        /local/meta/record/<subject>): no relay traffic, ever.
+        None when this node knows nothing about the entry.
+        Served as the coarse depot projection, like meta_query."""
+        record = self._meta_querier_obj().record(entry)
+        if record is None:
+            return None
+        return meta_merge.project_for_depot(record)
+
+    def meta_store_exists(self) -> bool:
+        """Whether the claims store exists yet (the enrichment
+        page's chrome reads this so that merely viewing it never
+        creates the store file — see meta_enrichment)."""
+        return self._meta_store_created()
+
+    def _meta_enrichment_local(self, querier: Querier, kind: str,
+                               mode: str, query: str):
+        """Scope "local" (§20): a PURE READ of what this node
+        already holds. Exact rides Querier.record() — the
+        designed pure read (own claims + answer cache assembly;
+        schedules NO verification, runs no sanity triggers,
+        never touches the relay). Text has no record() twin, so
+        it is built from the same parts: the responder's local
+        name-index resolution (a store read), then record()'s
+        assembly per resolved subject. Nothing is admitted,
+        fetched, or scheduled on either path — the scope label
+        "only what this node knows" is a promise, and the ask
+        paths cannot keep it (query_exact schedules verification
+        even with network=False, query_text fires §8 sanity
+        triggers), which is why this scope does not use them."""
+        if mode == "exact":
+            record = querier.record(query)
+            if record is None:
+                return [], [query]
+            return [record], []
+        resolved = querier.responder._resolve_text(
+            {"kind": kind, "terms": [query]})
+        records = []
+        for subject in resolved:
+            record = querier.record(subject)
+            if record is not None:
+                records.append(record)
+        return records, ([] if resolved else [query])
+
+    def meta_enrichment(self, payload: Any) -> dict[str, Any]:
+        """One lookup for the enrichment view (§13 step 9),
+        returning the FULL merged records, unprojected. The
+        presenter (meta/enrichment.py) reads the whole record —
+        its gap classification is computed from the origin
+        lists — but exposes to the page exactly the depot
+        projection's field set per value: §9 binds this surface
+        too, so exact counts, origin keys, batch ids and report
+        counts are stripped in the presenter and never reach
+        the template. It renders only in this node's
+        login-gated UI, and viewing never promotes anything or
+        serves the shown data onward.
+
+        Two scopes, honestly different. "ask" (payload network
+        not False) runs the querier's existing ask paths (exact
+        / text — the same cache-first fan-out SoulSync's asks
+        use): it may admit new answers into the cache and
+        schedule verification, exactly like any ask. "local"
+        (network False) is a pure read of what the node already
+        holds — see _meta_enrichment_local.
+
+        A node whose claims store was never created gets the
+        empty marker WITHOUT one being opened — merely viewing
+        the page must not create meta_claims.sqlite3 on a node
+        with the feature off (the meta_status doctrine)."""
+        if not self._meta_store_created():
+            return {"ok": True, "store_exists": False,
+                    "asked_network": False, "unresolved": [],
+                    "records": [], "querier": None}
+        if not isinstance(payload, dict):
+            return {"ok": False, "error": "lookup must be an object"}
+        kind = payload.get("kind")
+        if kind not in ("artist", "album", "track"):
+            return {"ok": False,
+                    "error": "kind must be artist, album or track"}
+        mode = payload.get("mode") or "text"
+        query = str(payload.get("query") or "").strip()
+        if not query:
+            return {"ok": False, "error": "a lookup needs a query"}
+        if mode not in ("exact", "text"):
+            return {"ok": False, "error": "mode must be exact or text"}
+        network = payload.get("network") is not False
+        querier = self._meta_querier_obj()
+        if not network:
+            records, unresolved = self._meta_enrichment_local(
+                querier, kind, mode, query)
+            return {"ok": True, "store_exists": True,
+                    "asked_network": False,
+                    "unresolved": unresolved,
+                    "records": records,
+                    "querier": querier.status(),
+                    "own_key": self.identity.public_key_b64url}
+        if mode == "exact":
+            out = querier.query_exact(kind, [query], network=True)
+        else:
+            out = querier.query_text(kind, [query], network=True)
+        return {"ok": True, "store_exists": True,
+                "asked_network": out["asked_network"],
+                "unresolved": out["unresolved"],
+                "records": out["records"],
+                "querier": querier.status(),
+                "own_key": self.identity.public_key_b64url}
+
+    def rebuild_meta_store(self, now: datetime | None = None,
+                           force_full: bool = False,
+                           live_gate: bool = False) -> dict[str, Any]:
+        """One claims-store build over the SoulSync export. Outcomes
+        are recorded in the store and returned; a stopped build
+        (export missing, answering switched off mid-run) is a
+        status, not an exception."""
+        if not self._meta_lock.acquire(blocking=False):
+            return {"status": "already_running"}
+        try:
+            now = now or self.clock()
+            try:
+                builder = self._meta_builder(live_gate=live_gate)
+            except SoulSyncError as err:
+                return {"status": "soulsync_unavailable",
+                        "detail": str(err)}
+            try:
+                # A rebuild also satisfies a due full walk: the
+                # cadence lives in the builder's state, and a manual
+                # rebuild is as good a moment as a scheduled one.
+                totals = builder.run(
+                    now.isoformat(),
+                    force_full=force_full or builder.full_walk_due(now))
+                builder.record_outcome("completed")
+                return {"status": "completed", **totals}
+            except BuildStopped as stop:
+                builder.record_outcome(stop.reason, stop.detail or None)
+                return {"status": stop.reason, "detail": stop.detail}
+        finally:
+            self._meta_lock.release()
+
+    def meta_rebuild_due(self, now: datetime) -> bool:
+        """Due when answering is on and the last completed build is
+        older than the rebuild interval (or never ran) — or a full
+        walk is due on its own cadence, however fresh the last
+        incremental completion is (incrementals never see
+        deletions, so they cannot substitute for the sweep)."""
+        if not self.meta_answering():
+            return False
+        if not self._meta_store_created():
+            return True  # never built; no store read needed
+        builder = LibraryBuilder(None, self.identity, self.meta_store())
+        if builder.full_walk_due(now):
+            return True
+        last = _parse_time(builder.status().get("last_completed_at"))
+        if last is None:
+            return True
+        return now - last >= timedelta(hours=_META_REBUILD_INTERVAL_H)
+
+    def sync_meta_store(self) -> dict[str, Any]:
+        """Scheduler leg: start a claims-store build on a background
+        thread when one is due. The build must never block the
+        scheduler (a full walk of a large library takes minutes)."""
+        if not self.meta_rebuild_due(self.clock()):
+            return self.meta_status()
+        thread = self._meta_build_thread
+        if thread is not None and thread.is_alive():
+            return self.meta_status()
+        thread = threading.Thread(
+            target=self._run_meta_build, daemon=True,
+            name="metasync-meta-build")
+        self._meta_build_thread = thread
+        thread.start()
+        return self.meta_status()
+
+    def _run_meta_build(self) -> None:
+        try:
+            self.rebuild_meta_store(live_gate=True)
+        except Exception as err:  # noqa: BLE001 — a background build must never die silently.
+            self.store.record_error("meta_build", err)
+            self.store.save_state()
+
+    # -- the network's size and an unsent report -----------------------------
+    def _remember_network(self, pool: dict[str, Any], client: Any, now: datetime) -> None:
+        """Keep the network size an approved pool reports on /v1/whoami
+        (installs that reported the closed week, and the publish
+        threshold), so the dashboard and SoulSync can say "12 installs
+        reported, charts start at 15". Best effort: an older pool without
+        the field, or any failure, leaves the last value in place."""
+        try:
+            network = (client.get_whoami() or {}).get("network")
+        except Exception:  # noqa: BLE001 — the size is a nicety; the refresh already did its job.
+            return
+        if not isinstance(network, dict):
+            return
+
+        def count(key: str) -> int | None:
+            value = network.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                return None
+            return value
+
+        installs, threshold = count("installs"), count("publishThreshold")
+        if installs is None or not threshold:
+            return
+        self.store.state.setdefault("network", {})[str(pool.get("id") or "pool")] = {
+            "week": str(network.get("week") or "")[:16],
+            "installs": installs,
+            "previous_week": str(network.get("previousWeek") or "")[:16],
+            "previous_installs": count("previousInstalls"),
+            "publish_threshold": threshold,
+            "fetched_at": now.isoformat(),
+        }
+
+    def network_progress(self) -> dict[str, Any] | None:
+        """The network size from the first enabled pool that reported one."""
+        known = self.store.state.get("network") or {}
+        for pool in self.pools():
+            entry = known.get(str(pool.get("id") or "pool"))
+            if isinstance(entry, dict) and entry.get("publish_threshold"):
+                return {"pool": str(pool.get("name") or pool.get("id")), **entry}
+        return None
+
+    def unsent_report(self) -> dict[str, Any] | None:
+        """While dry run is on: the report this node computed and did not
+        send ({week, signal_count, pools}), or None. A node in dry run is
+        not counted by the network; this is what the dashboard and
+        SoulSync use to say so, with a one-click way to start sending."""
+        if not self.dry_run:
+            return None
+        previews = self.store.state.get("previews") or {}
+        best: tuple[str, int] | None = None
+        pools = 0
+        for pool in self.pools():
+            preview = previews.get(pool["id"]) or {}
+            if not preview.get("week") or preview.get("sent_at"):
+                continue
+            pools += 1
+            # The week and the signal count come from the same preview:
+            # the latest week's preview wins, with the larger count on a
+            # tie, so the card never pairs one pool's week with another's
+            # count.
+            candidate = (str(preview["week"]), len(preview.get("signals") or []))
+            if best is None or candidate > best:
+                best = candidate
+        if not pools or best is None:
+            return None
+        return {"week": best[0], "signal_count": best[1], "pools": pools}
+
     # -- status ---------------------------------------------------------------
     def status(self) -> dict[str, Any]:
         state = self.store.state
@@ -967,7 +1774,7 @@ class NodeService:
         return {
             "ok": True,
             "service": "metasync-node",
-            "version": "0.2.0",
+            "version": "0.3.0",
             "node_id": self.identity.node_id,
             "node_fingerprint": self.identity.fingerprint,
             "node_public_key": self.identity.public_key_b64url,
@@ -985,6 +1792,8 @@ class NodeService:
             "last_refresh_at": state.get("last_refresh_at"),
             "charts_offered": len(self.local_charts()["playlists"]),
             "last_errors": (state.get("last_errors") or [])[:5],
+            "unsent_report": self.unsent_report(),
+            "network": self.network_progress(),
         }
 
 

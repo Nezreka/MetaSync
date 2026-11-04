@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 from typing import Any
 
 import requests
@@ -45,6 +46,30 @@ def cover_url(release_group_mbid: str) -> str:
     return f"https://coverartarchive.org/release-group/{release_group_mbid}/front-250"
 
 
+class Pacer:
+    """Serial minimum-interval pacing, shared by every MusicBrainz
+    client one node runs (R2-SF-6): the ~1 req/s etiquette binds
+    the NODE, not each code path — the resolver (library scans,
+    definition building) and the §7 verifier's fetcher pacing
+    privately would let one node call at 2 req/s in aggregate.
+    The service builds ONE Pacer and injects it into both; the
+    sleep is injectable for tests."""
+
+    def __init__(self, min_interval_s: float,
+                 sleep: Callable[[float], None] = time.sleep):
+        self.min_interval_s = min_interval_s
+        self._sleep = sleep
+        self._lock = threading.Lock()
+        self._last = 0.0
+
+    def wait(self) -> None:
+        with self._lock:
+            wait = self.min_interval_s - (time.monotonic() - self._last)
+            if wait > 0:
+                self._sleep(wait)
+            self._last = time.monotonic()
+
+
 class MusicBrainzResolver:
     def __init__(
         self,
@@ -55,6 +80,7 @@ class MusicBrainzResolver:
         session: requests.Session | None = None,
         sleep=time.sleep,
         timeout_s: int = 20,
+        pacer: Pacer | None = None,
     ):
         self.base = base_url.rstrip("/")
         self.user_agent = user_agent
@@ -65,6 +91,10 @@ class MusicBrainzResolver:
         self.timeout_s = timeout_s
         self._lock = threading.Lock()
         self._last_call_at = 0.0
+        # The node's shared MusicBrainz pacer when injected
+        # (R2-SF-6); None keeps the legacy private pacing below
+        # for standalone construction (tests, tools).
+        self._pacer = pacer
 
     def _get_json(self, path: str, *, keep: bool = True) -> dict[str, Any]:
         """GET a MusicBrainz path, paced. ``keep=False`` skips the response
@@ -74,10 +104,13 @@ class MusicBrainzResolver:
         with self._lock:
             if path in self.cache:
                 return self.cache[path]
-            wait = self.min_interval_s - (time.monotonic() - self._last_call_at)
-            if wait > 0:
-                self._sleep(wait)
-            self._last_call_at = time.monotonic()
+            if self._pacer is not None:
+                self._pacer.wait()
+            else:
+                wait = self.min_interval_s - (time.monotonic() - self._last_call_at)
+                if wait > 0:
+                    self._sleep(wait)
+                self._last_call_at = time.monotonic()
             try:
                 res = self.session.get(
                     f"{self.base}{path}",

@@ -1,0 +1,7 @@
+tests/
+**/__pycache__/
+*.pyc
+fly.toml
+README.md
+.dockerignore
+Dockerfile
