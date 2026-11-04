@@ -117,6 +117,25 @@ describe("report populations, compose week and admin status (no live database)",
     }
   });
 
+  test("network progress counts installs for the closed and previous week only", async () => {
+    const mod = await import("../src/sin/index.ts");
+    const fake = new FakeSinDb();
+    const now = new Date();
+    const [closed, current] = openReportWeeks(now) as [string, string];
+    const previous = isoWeekOf(new Date(now.getTime() - 14 * 86_400_000));
+    for (let i = 0; i < 12; i += 1) fake.reportTokens.add(`${closed}|token-${i}`);
+    fake.reportTokens.add(`${previous}|token-p1`).add(`${previous}|token-p2`);
+    fake.reportTokens.add(`${current}|token-x`); // still open: not counted
+    const got = await mod.networkProgress(fake as unknown as SinDb, now);
+    assert.deepEqual(got, {
+      week: closed,
+      installs: 12,
+      previousWeek: previous,
+      previousInstalls: 2,
+      publishThreshold: 15,
+    });
+  });
+
   test("status counts reports and lists the closed week's charts; admin key only", async () => {
     process.env.SIN_ADMIN_KEY = ADMIN;
     const mod = await import("../src/sin/index.ts");

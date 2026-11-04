@@ -346,10 +346,23 @@ describe("sin §3A: key exchange + access tokens (fake db)", () => {
 
     const whoami = await tokenGet(app, token, node, "/v1/whoami");
     assert.equal(whoami.status, 200);
-    assert.deepEqual(await whoami.json(), {
-      ok: true,
-      keyPrefix: RAW.slice(0, 12),
-    });
+    const me = (await whoami.json()) as {
+      ok: boolean;
+      keyPrefix: string;
+      network?: { installs: number; previousInstalls: number; publishThreshold: number; week: string };
+    };
+    assert.equal(me.ok, true);
+    assert.equal(me.keyPrefix, RAW.slice(0, 12));
+    // an approved node learns the network's size: counts of installs only
+    assert.equal(me.network?.publishThreshold, 15);
+    assert.equal(typeof me.network?.installs, "number");
+    assert.deepEqual(Object.keys(me.network ?? {}).sort(), [
+      "installs",
+      "previousInstalls",
+      "previousWeek",
+      "publishThreshold",
+      "week",
+    ]);
   });
 
   test("gated reads: token without a node signature, or no credential, gets 401", async () => {

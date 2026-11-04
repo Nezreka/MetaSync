@@ -53,4 +53,14 @@
 {% else %}
 <div class="empty-state"><strong>No payload to preview</strong>No report has completed yet. Run the weekly report and its payload will appear here.</div>
 {% endfor %}
+{% if dry_run and previews %}
+<section class="card">
+  <div class="card-head">
+    <p class="eyebrow">Dry run is on</p>
+    <h2>Looks right?</h2>
+  </div>
+  <p>This is everything that would leave this machine. Start sending and this week's report goes out now; after that, one report a week, on its own.</p>
+  <form method="post" action="{{ url_for('action_start_sending') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="primary" type="submit">Start sending</button></form>
+</section>
+{% endif %}
 {% endblock %}

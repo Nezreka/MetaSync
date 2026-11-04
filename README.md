@@ -76,9 +76,12 @@ the very next request.
 
 **5. Send a report.** The node starts in **Dry run**: it computes the
 exact weekly report and shows it on the Payload preview page, but sends
-nothing. When you're happy, turn Dry run off and run it — the dashboard
-shows live progress. After that, the built-in scheduler sends one report
-per week on its own.
+nothing, so the network doesn't count your install yet. Once a report is
+ready, the dashboard (and SoulSync's MetaSync settings) say so; when
+you're happy with it, press **Start sending** and this week's report goes
+out right away. After that, the built-in scheduler sends one report per
+week on its own. The dashboard also shows how many installs reported last
+week and how far the network is from charting on its own (15 per album).
 
 One honest heads-up for very large libraries: signals are keyed by
 MusicBrainz release *groups*, and SoulSync stores release (edition) IDs,
@@ -191,7 +194,7 @@ Pool URL is shown on your portal dashboard after sign-in.
 | `GET /v1/auth/public-key` | public | The pool's token-signing public key, so a node can verify its access token |
 | `POST /v1/auth/exchange` | pool key + node signature | Trades key + signature for a 24h token; unbound keys get `202 binding_pending` and no token |
 | `POST /v1/report` | token + signature (or the operator's env key) | One weekly report: `{ week, token, signals: [{ type, mbid }], churn_optin? }` (`churn_optin: true` only from a node sharing drop signals; counted per week, never stored per node) for the closed or current week, once per token — max 5,000 signals (1,000 per type, 100 `listen_album`) / 1 MB, strict validation, unknown fields rejected |
-| `GET /v1/whoami` | token or env key | Connection test for a node |
+| `GET /v1/whoami` | token or env key | Connection test for a node; an approved node also gets the network's size (installs that reported the closed week, and the publish threshold) |
 | `GET /v1/index/trending` · `most-wanted` · `breakouts` | token or env key | The public chart indexes for a week |
 | `GET /v1/playlists` | token or env key | The latest published charts as full track lists |
 | `POST /v1/aggregate` | admin only | Run one aggregation pass |
