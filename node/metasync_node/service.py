@@ -1736,7 +1736,7 @@ class NodeService:
         """The network size from the first enabled pool that reported one."""
         known = self.store.state.get("network") or {}
         for pool in self.pools():
-            entry = known.get(str(pool.get("id") or ""))
+            entry = known.get(str(pool.get("id") or "pool"))
             if isinstance(entry, dict) and entry.get("publish_threshold"):
                 return {"pool": str(pool.get("name") or pool.get("id")), **entry}
         return None
@@ -1749,19 +1749,23 @@ class NodeService:
         if not self.dry_run:
             return None
         previews = self.store.state.get("previews") or {}
-        weeks: list[str] = []
-        signals = 0
+        best: tuple[str, int] | None = None
         pools = 0
         for pool in self.pools():
             preview = previews.get(pool["id"]) or {}
             if not preview.get("week") or preview.get("sent_at"):
                 continue
             pools += 1
-            weeks.append(str(preview["week"]))
-            signals = max(signals, len(preview.get("signals") or []))
-        if not pools:
+            # The week and the signal count come from the same preview:
+            # the latest week's preview wins, with the larger count on a
+            # tie, so the card never pairs one pool's week with another's
+            # count.
+            candidate = (str(preview["week"]), len(preview.get("signals") or []))
+            if best is None or candidate > best:
+                best = candidate
+        if not pools or best is None:
             return None
-        return {"week": max(weeks), "signal_count": signals, "pools": pools}
+        return {"week": best[0], "signal_count": best[1], "pools": pools}
 
     # -- status ---------------------------------------------------------------
     def status(self) -> dict[str, Any]:
