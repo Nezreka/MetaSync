@@ -16,7 +16,7 @@
  *                               key only) OR Bearer access token + node
  *                               signature; one report per token per
  *                               open week, counted on arrival
- *   GET  /v1/whoami             same doors as report — connection test
+ *   GET  /v1/whoami             same doors as report — connection test (+ network size for an approved node)
  *   POST /v1/aggregate          X-SIN-Key: admin key ONLY (SIN_ADMIN_KEY),
  *                               or an admin-scope access token
  *   GET  /v1/index/trending     authenticated (legacy key or token +
@@ -1257,7 +1257,23 @@ app.get("/v1/whoami", async (c) => {
     return c.json({ error: "rate_limited" }, 429);
   }
   if (auth.kind === "portal") {
-    return c.json({ ok: true, keyPrefix: auth.portal.keyPrefix });
+    // An approved node also learns how big the network is: how many
+    // installs reported the week that closed (and the one before), and
+    // the threshold a chart needs. A count of installs, never items or
+    // who; the same kind of number report_populations already keeps. It
+    // lets a node show "12 installs reported, charts start at 15"
+    // instead of empty charts with no explanation. A database hiccup
+    // never fails the connection test: the field is just left out.
+    const db = dbResolver();
+    let network: Awaited<ReturnType<typeof networkProgress>> | undefined;
+    if (db) {
+      try {
+        network = await networkProgress(db);
+      } catch {
+        network = undefined;
+      }
+    }
+    return c.json({ ok: true, keyPrefix: auth.portal.keyPrefix, ...(network ? { network } : {}) });
   }
   return c.json({ ok: true });
 });
@@ -1550,6 +1566,28 @@ export async function adminStatus(db: SinDb, now: Date = new Date()) {
       keys: charts.map((r) => r.key).sort(),
       lastPublishedAt: lastPublished ? lastPublished.toISOString() : null,
     },
+  };
+}
+
+/**
+ * The network's size, for an approved node (GET /v1/whoami): how many
+ * installs reported the week that closed and the week before, and the
+ * publish threshold. Counts of accepted reports only (one report_tokens
+ * row per accepted report), never which installs. Exported for tests.
+ */
+export async function networkProgress(db: SinDb, now: Date = new Date()) {
+  const [closed] = openReportWeeks(now) as [string, string];
+  const previous = isoWeekOf(new Date(now.getTime() - 14 * 86_400_000));
+  const tokens = (
+    await db.select({ week: reportTokens.week }).from(reportTokens).where(inArray(reportTokens.week, [previous, closed]))
+  ).filter((r) => r.week === previous || r.week === closed);
+  const installsIn = (week: string) => tokens.filter((r) => r.week === week).length;
+  return {
+    week: closed,
+    installs: installsIn(closed),
+    previousWeek: previous,
+    previousInstalls: installsIn(previous),
+    publishThreshold: K_PUBLISH_THRESHOLD,
   };
 }
 

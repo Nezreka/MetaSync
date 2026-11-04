@@ -366,6 +366,22 @@ def create_app(service: NodeService) -> Flask:
         flash(f"Dry run is now {'ON' if store.settings['dry_run'] else 'OFF'}.", "ok")
         return redirect(url_for("dashboard"))
 
+    @app.post("/actions/start-sending")
+    @login_required
+    def action_start_sending():
+        # The one-click way out of dry run, offered once a report is ready:
+        # turn sending on and send the closed week's report right away (the
+        # pool takes the closed week), so this install counts this week
+        # instead of after next Monday's scheduled run.
+        store.settings["dry_run"] = False
+        store.save_settings()
+        if not service.pools():
+            flash("Sending is on. Join a pool on the Pools page and the weekly report goes out.", "ok")
+            return redirect(url_for("dashboard"))
+        service.start_report_job()
+        flash("Sending is on. This week's report is going out now; its progress is below.", "ok")
+        return redirect(url_for("dashboard"))
+
     @app.post("/actions/share-listening")
     @login_required
     def action_share_listening():

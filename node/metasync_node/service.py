@@ -523,6 +523,11 @@ class NodeService:
             "last_report": status["last_report"],
             "last_refresh_at": status["last_refresh_at"],
             "charts_offered": status["charts_offered"],
+            # SoulSync's MetaSync settings say whether this install is
+            # counted yet, and how big the network is
+            "dry_run": status["dry_run"],
+            "unsent_report": status["unsent_report"],
+            "network": status["network"],
             "pairing_status": pairing.get("status") if pairing else None,
             "last_pairing": self.store.state.get("last_pairing"),
         }
@@ -980,6 +985,7 @@ class NodeService:
                     {"key": str(p.get("key")), "name": p.get("name"), "track_count": len(p.get("tracks") or [])}
                     for p in playlists
                 ]
+                self._remember_network(pool, client, now)
             except PoolBindingPending as err:
                 entry["status"] = "binding_pending"
                 entry["error"] = str(err)
@@ -1694,6 +1700,69 @@ class NodeService:
             self.store.record_error("meta_build", err)
             self.store.save_state()
 
+    # -- the network's size and an unsent report -----------------------------
+    def _remember_network(self, pool: dict[str, Any], client: Any, now: datetime) -> None:
+        """Keep the network size an approved pool reports on /v1/whoami
+        (installs that reported the closed week, and the publish
+        threshold), so the dashboard and SoulSync can say "12 installs
+        reported, charts start at 15". Best effort: an older pool without
+        the field, or any failure, leaves the last value in place."""
+        try:
+            network = (client.get_whoami() or {}).get("network")
+        except Exception:  # noqa: BLE001 — the size is a nicety; the refresh already did its job.
+            return
+        if not isinstance(network, dict):
+            return
+
+        def count(key: str) -> int | None:
+            value = network.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                return None
+            return value
+
+        installs, threshold = count("installs"), count("publishThreshold")
+        if installs is None or not threshold:
+            return
+        self.store.state.setdefault("network", {})[str(pool.get("id") or "pool")] = {
+            "week": str(network.get("week") or "")[:16],
+            "installs": installs,
+            "previous_week": str(network.get("previousWeek") or "")[:16],
+            "previous_installs": count("previousInstalls"),
+            "publish_threshold": threshold,
+            "fetched_at": now.isoformat(),
+        }
+
+    def network_progress(self) -> dict[str, Any] | None:
+        """The network size from the first enabled pool that reported one."""
+        known = self.store.state.get("network") or {}
+        for pool in self.pools():
+            entry = known.get(str(pool.get("id") or ""))
+            if isinstance(entry, dict) and entry.get("publish_threshold"):
+                return {"pool": str(pool.get("name") or pool.get("id")), **entry}
+        return None
+
+    def unsent_report(self) -> dict[str, Any] | None:
+        """While dry run is on: the report this node computed and did not
+        send ({week, signal_count, pools}), or None. A node in dry run is
+        not counted by the network; this is what the dashboard and
+        SoulSync use to say so, with a one-click way to start sending."""
+        if not self.dry_run:
+            return None
+        previews = self.store.state.get("previews") or {}
+        weeks: list[str] = []
+        signals = 0
+        pools = 0
+        for pool in self.pools():
+            preview = previews.get(pool["id"]) or {}
+            if not preview.get("week") or preview.get("sent_at"):
+                continue
+            pools += 1
+            weeks.append(str(preview["week"]))
+            signals = max(signals, len(preview.get("signals") or []))
+        if not pools:
+            return None
+        return {"week": max(weeks), "signal_count": signals, "pools": pools}
+
     # -- status ---------------------------------------------------------------
     def status(self) -> dict[str, Any]:
         state = self.store.state
@@ -1719,6 +1788,8 @@ class NodeService:
             "last_refresh_at": state.get("last_refresh_at"),
             "charts_offered": len(self.local_charts()["playlists"]),
             "last_errors": (state.get("last_errors") or [])[:5],
+            "unsent_report": self.unsent_report(),
+            "network": self.network_progress(),
         }
 
 

@@ -259,7 +259,8 @@ machine other than the bound node.
 **Endpoints the backend exposes** (`src/sin/index.ts`): `GET /health`,
 `GET /v1/auth/public-key`, `POST /v1/auth/exchange`,
 `GET /v1/whoami` (returns key prefix + binding status for the
-presented credential), `POST /v1/report`, `POST /v1/aggregate`
+presented credential; for an approved node also the network's size,
+see §13), `POST /v1/report`, `POST /v1/aggregate`
 (admin scope), `POST /v1/compose` (admin scope), `GET /v1/index/
 trending|most-wanted|breakouts` (public; aggregates only),
 `GET /v1/playlists` (token or key), `POST /v1/playlists` (admin
@@ -569,6 +570,17 @@ there:
   already in it, and lands on it in Sync. **Nothing is synced to a media
   server, wishlisted or downloaded until that person presses Sync &
   download** (or schedules Auto-Sync on it).
+
+**The network's size.** An approved node's `GET /v1/whoami` also
+returns `network`: how many installs reported the week that closed and
+the week before (counts of accepted reports, one per install per week,
+the same number the operator's status check reads) and the publish
+threshold (k = 15). It is a count of installs, never items, never which
+installs. The node keeps it from its daily refresh and shows it on its
+dashboard ("12 installs reported 2026-W43, charts start at 15"), and
+passes it to SoulSync's MetaSync settings with the rest of
+`/local/status`. Only nodes with an approved key see it; nothing below
+k is ever about an item.
 
 Until Oct 23, 2026 the node pushed each chart through SoulSync's
 `POST /api/v1/playlists/<id>/sync`. That call also put every missing
