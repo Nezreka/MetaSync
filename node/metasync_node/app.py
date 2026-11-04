@@ -101,7 +101,7 @@ def create_app(service: NodeService) -> Flask:
 
     @app.get("/health")
     def health():
-        return {"ok": True, "service": "metasync-node", "version": "0.2.0"}
+        return {"ok": True, "service": "metasync-node", "version": "0.3.0"}
 
     @app.route("/setup", methods=["GET", "POST"])
     def setup():

@@ -512,7 +512,7 @@ class NodeService:
         return {
             "ok": True,
             "service": "metasync-node",
-            "version": "0.2.0",
+            "version": "0.3.0",
             "node_id": self.identity.node_id,
             "node_fingerprint": self.identity.fingerprint,
             "node_public_key": self.identity.public_key_b64url,
@@ -1774,7 +1774,7 @@ class NodeService:
         return {
             "ok": True,
             "service": "metasync-node",
-            "version": "0.2.0",
+            "version": "0.3.0",
             "node_id": self.identity.node_id,
             "node_fingerprint": self.identity.fingerprint,
             "node_public_key": self.identity.public_key_b64url,
