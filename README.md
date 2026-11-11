@@ -122,16 +122,19 @@ library size, usernames, emails, IP-based identity, or your SoulSync URL.
 
 - **Binary contributions.** Per item, per week, your node reports 1 or
   nothing. A count means "this many distinct installs", full stop.
-- **Rotating dedupe token.** Each report carries `hash(node secret +
-  week)`, used only to dedupe a double-submit within that week. Next
-  week's token is unlinkable to this week's — there is no cross-week
-  tracking.
+- **One report per approved node per week.** The pool marks that your
+  node reported this week with a keyed hash of (your key's internal id
+  + the week), made on the server. The marker changes every week, holds
+  no signals, and is never joined to the counts. It is made by the
+  server, not taken from the report, so one node cannot pose as many
+  installs. The report still carries `hash(node secret + week)`; the
+  pool no longer stores it for a portal key.
 - **k = 15 publish threshold.** An item appears in a chart only if at
   least 15 distinct nodes reported it. Below that, the data point does
   not exist publicly.
 - **Reports are counted on arrival, never stored.** The server adds +1
   per item to a running tally and keeps only `(week, signal, MBID,
-  node_count)`; the weekly token is kept apart, only to accept one
+  node_count)`; the weekly marker is kept apart, only to accept one
   report per install per week.
 - **Keys are hashes.** The portal stores SHA-256 hashes of keys, never
   the keys themselves. Your node signs its requests with its own Ed25519

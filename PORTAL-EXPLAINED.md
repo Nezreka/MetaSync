@@ -159,12 +159,17 @@ This is the privacy design, and it survives the keys being stored:
 - **Box 1 (accounts + keys)** knows *who you are* and *that your key
   checked in*. It knows nothing about your music.
 - **Box 2 (reports)** knows *what the whole network reported* — counts
-  of MusicBrainz IDs — under a nickname (a "token") that changes every
-  week and is made from a secret that lives only on your own machine.
-  It knows nothing about accounts.
+  of MusicBrainz IDs. Beside the counts it keeps one marker per
+  report, which changes every week, so your node counts once a week
+  and no more. The marker holds none of your signals and is never
+  joined to the counts. It knows nothing about accounts.
 
 Your key is checked at the door, then set aside. The report goes into
-Box 2 under the rotating nickname, with no account and no key attached.
+Box 2 as plain +1s on the counts, with no account and no key attached.
+The weekly marker is a scrambled value the Pool makes from your key's
+internal id and the week. It says "this node already reported this
+week", which the door knows anyway, and it cannot be read back into a
+key without the Pool's own secret.
 There is no list anywhere that connects "this account" to "these
 signals." Even the person running the Pool (Boulder) can only see:
 this account exists, its key is active, it last checked in on Tuesday,

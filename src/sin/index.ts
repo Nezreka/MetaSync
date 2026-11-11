@@ -76,6 +76,7 @@ import {
   poolTokenPublicKeyRaw,
   portalKeyHash,
   openReportWeeks,
+  reportClaimForKey,
   reportToCountIncrements,
   REPORT_TOKEN_RETENTION_WEEKS,
   isoWeekOf,
@@ -1323,6 +1324,18 @@ app.post("/v1/report", async (c) => {
     return c.json({ error: "week_not_open", openWeeks: openReportWeeks() }, 400);
   }
 
+  // One report per approved node per week. For a portal key the claim
+  // is made here, from the authenticated key: the body's token is the
+  // client's own word, and a node that varied it would count as many
+  // installs. Only the operator's env keys (the official node, local
+  // development pools) are deduped by the body token.
+  let claim = report.token;
+  if (auth.kind === "portal") {
+    const pepper = process.env.API_KEY_PEPPER;
+    if (!pepper) return c.json({ error: "ingest_not_configured" }, 503);
+    claim = reportClaimForKey(auth.portal.id, report.week, pepper);
+  }
+
   const found = requireDb();
   if ("response" in found) return found.response;
 
@@ -1332,7 +1345,7 @@ app.post("/v1/report", async (c) => {
   // Nothing per-node is stored: the token row and the counts are never
   // linked. The rows are built ONLY from the validated body, so no
   // key/account reference exists anywhere in them (P1/P2/P7).
-  const accepted = await countReport(found.db, report);
+  const accepted = await countReport(found.db, report, claim);
   if (accepted === null) {
     return c.json({ accepted: 0, duplicate: true, week: report.week }, 200);
   }
@@ -1340,21 +1353,24 @@ app.post("/v1/report", async (c) => {
 });
 
 /**
- * Count one validated report: claim (week, token) in report_tokens and,
+ * Count one validated report: claim (week, claim) in report_tokens and,
  * if the claim is new, increment aggregate_counts once per distinct
  * signal. Returns the number of signals counted, or null when this
- * token already reported this week (binary per node per week: the
- * second report counts nothing). Exported for tests.
+ * claim already reported this week (binary per node per week: the
+ * second report counts nothing). `claim` is the server-made per-key
+ * value for a portal key (reportClaimForKey); only the operator's env
+ * keys fall back to the body's own token. Exported for tests.
  */
 export async function countReport(
   db: SinDb,
   report: ReportInput,
+  claim: string = report.token,
 ): Promise<number | null> {
   const increments = reportToCountIncrements(report);
   return db.transaction(async (tx) => {
     const claimed = await tx
       .insert(reportTokens)
-      .values({ week: report.week, tokenHash: report.token })
+      .values({ week: report.week, tokenHash: claim })
       .onConflictDoNothing()
       .returning({ week: reportTokens.week });
     if (claimed.length === 0) return null;
