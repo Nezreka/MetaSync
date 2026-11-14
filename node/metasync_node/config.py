@@ -9,7 +9,7 @@ from dataclasses import dataclass
 @dataclass
 class Config:
     state_dir: str = "/data"
-    port: int = 8790  # SoulSync uses 8000; MetaSync's UI lives here instead.
+    port: int = 8790  # SoulSync uses 8008; MetaSync's UI lives here instead.
     musicbrainz_base_url: str = "https://musicbrainz.org/ws/2"
     musicbrainz_user_agent: str = "MetaSync-Node/0.1 (https://github.com/Nezreka/MetaSync)"
     musicbrainz_min_interval_s: float = 1.1  # MusicBrainz asks for <= 1 req/sec

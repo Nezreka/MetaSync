@@ -80,9 +80,13 @@ PING_INTERVAL_SECONDS = 20.0
 PING_TIMEOUT_SECONDS = 20.0
 
 # Outbound answer packing: batches are packed into messages whose
-# plaintext stays under this, so the wire frame (even sealed, which
-# adds only a fixed 48 bytes) stays well under the frame cap.
-WIRE_CHUNK_BYTES = 4 * 1024 * 1024
+# plaintext stays under this. The relay admits at most 2 MiB of answer
+# frames per node per query and drops a frame that would cross it
+# whole, so a frame must fit that share on its own: 1 MiB of plaintext
+# is about 1.4 MiB on the wire once sealed and base64 encoded. At the
+# old 4 MiB an answer between 2 and 4 MiB went out as one frame and
+# the relay dropped all of it.
+WIRE_CHUNK_BYTES = 1024 * 1024
 
 # Re-authenticate this long before the token expires; the relay keeps
 # a further grace (RELAY_REAUTH_GRACE_SECONDS, 30s by default) for a

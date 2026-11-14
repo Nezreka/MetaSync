@@ -270,6 +270,26 @@ def album_variant(item: dict[str, Any] | None) -> str:
     return "local"
 
 
+def _album_subject(item: dict[str, Any], artist: str,
+                   album_variants: dict[str, str]) -> Any:
+    """The SoulID of the album a track row sits on.
+
+    SoulSync's export does not carry it. A track row's `album_soul_id`
+    is a per-track id of kind "album_track" (artist + album + title),
+    never an album's own id, so looking it up among the album rows
+    found nothing and no tracklist claim was ever built. The album's id
+    is derived here the way SoulSync mints it: kind "album" over the
+    row's artist and album title. The exported field is still honoured
+    when it does name a known album row.
+    """
+    album_title = str(item.get("album_title") or "")
+    if artist.strip() and album_title.strip():
+        derived = meta_soulid.generate_soul_id("album", artist, album_title)
+        if derived in album_variants:
+            return derived
+    return item.get("album_soul_id")
+
+
 def track_claims(item: dict[str, Any],
                  album_variants: dict[str, str],
                  album_sources: dict[str, str]) -> list[dict[str, Any]]:
@@ -296,7 +316,7 @@ def track_claims(item: dict[str, Any],
         out.append(_claim(item["soul_id"], "track", "duration_ms",
                           round(duration), "file_tags"))
     out += _year_claim(item, "track", source)
-    album_soul_id = item.get("album_soul_id")
+    album_soul_id = _album_subject(item, artist, album_variants)
     disc = item.get("disc_number")
     number = item.get("track_number")
     variant = album_variants.get(album_soul_id, "local") \

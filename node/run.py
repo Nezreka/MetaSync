@@ -33,6 +33,18 @@ def build_service() -> NodeService:
     return NodeService(config, env=dict(os.environ))
 
 
+def _note_error(service: NodeService, leg: str, err: BaseException) -> None:
+    """Record a scheduler leg's failure without letting the record itself
+    raise. Saving state can fail for the same reason the leg did (a full
+    or read-only disk); an exception here would leave the loop and end
+    the weekly reports until the next restart."""
+    try:
+        service.store.record_error(leg, err)
+        service.store.save_state()
+    except Exception as save_err:  # noqa: BLE001 - nothing may kill the scheduler
+        print(f"MetaSync scheduler: {leg} failed ({err}); could not save the error ({save_err})", file=sys.stderr)
+
+
 def scheduler_loop(service: NodeService, stop: threading.Event) -> None:
     """Weekly report + periodic playlist refresh, each leg isolated."""
     while not stop.is_set():
@@ -42,16 +54,14 @@ def scheduler_loop(service: NodeService, stop: threading.Event) -> None:
             # or off, new relay URL, new mode) lands without a restart.
             service.sync_relay_client()
         except Exception as err:  # noqa: BLE001 - the relay leg must never kill the scheduler
-            service.store.record_error("relay", err)
-            service.store.save_state()
+            _note_error(service, "relay", err)
         try:
             # The claims-store build follows the answering switch:
             # due-checked every tick, run on its own thread so a long
             # library walk never stalls the scheduler.
             service.sync_meta_store()
         except Exception as err:  # noqa: BLE001 - the meta leg must never kill the scheduler
-            service.store.record_error("meta_store", err)
-            service.store.save_state()
+            _note_error(service, "meta_store", err)
         try:
             now = datetime.now(timezone.utc)
             # Once per closed week, after this node's slot, with a back-off
@@ -70,8 +80,7 @@ def scheduler_loop(service: NodeService, stop: threading.Event) -> None:
             if refresh_due and service.pools():
                 service.run_refresh(now)
         except Exception as err:  # the scheduler itself must never die
-            service.store.record_error("scheduler", err)
-            service.store.save_state()
+            _note_error(service, "scheduler", err)
         stop.wait(service.config.scheduler_tick_s)
 
 

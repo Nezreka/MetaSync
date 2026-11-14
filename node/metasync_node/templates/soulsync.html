@@ -4,7 +4,7 @@
 {% macro soulsync_form(form_class) %}
 <form method="post" class="{{ form_class }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <label>SoulSync URL
-    <input type="url" name="url" value="{{ current.url or '' }}" placeholder="http://soulsync:8000" required>
+    <input type="url" name="url" value="{{ current.url or '' }}" placeholder="http://soulsync:8008" required>
   </label>
   <label>SoulSync API key {% if has_key %}<span class="muted">(saved — leave blank to keep it)</span>{% endif %}
     <input type="password" name="api_key" placeholder="sk_...">
@@ -42,7 +42,7 @@
     <form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="danger" type="submit" name="action" value="disconnect">Disconnect from SoulSync</button></form>
   </div>
   <p class="muted">Disconnecting here only clears this machine's copy of the address and key. To unlink
-  fully, also use Disconnect in SoulSync → Settings → Advanced → MetaSync — that side revokes the key.</p>
+  fully, also use Disconnect in SoulSync → Settings → Connections → MetaSync — that side revokes the key.</p>
 </section>
 
 <details class="card">
@@ -55,7 +55,7 @@
     <p class="eyebrow">Easiest way in</p>
     <h2>Pair from SoulSync</h2>
   </div>
-  <p class="muted">Open SoulSync → Settings → Advanced → MetaSync and click Connect. A code appears,
+  <p class="muted">Open SoulSync → Settings → Connections → MetaSync and click Connect. A code appears,
   you approve it here, and SoulSync hands MetaSync a key automatically — this page then shows
   “Connected” and there is nothing to paste. The form below is the manual way, for setups where
   pairing cannot reach this node.</p>
