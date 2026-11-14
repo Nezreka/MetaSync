@@ -9,7 +9,8 @@
  *   SoulID belongs exclusively to the metadata MetaSync service.
  * - Exactly eight signal types exist. Anything else is rejected.
  * - Contributions are binary: one node can contribute at most 1 per
- *   (week, signal, MBID), and a node's token is accepted once per week.
+ *   (week, signal, MBID), and one report per approved node is accepted
+ *   per week (the claim is the server's: reportClaimForKey).
  * - Reports are counted on arrival and never stored per node.
  * - Nothing is published below the k-anonymity threshold.
  */
@@ -539,12 +540,30 @@ export function keepRateReason(keepNodes: number, importNodes: number): string |
 /* ONLY; it never enters the report insert path (design §4, P1–P3).   */
 /* ------------------------------------------------------------------ */
 
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 
 /** SHA-256 hex of `pepper + rawKey` — the only form of a portal key SIN
  *  (or the database) ever holds. Copied from roll-call's pepperedHash. */
 export function portalKeyHash(rawKey: string, pepper: string): string {
   return createHash("sha256").update(pepper + rawKey).digest("hex");
+}
+
+/**
+ * The weekly report claim for a portal key: what report_tokens stores to
+ * accept ONE report per approved node per week. It is made by the server
+ * from the authenticated key, never taken from the report body: the
+ * body's own token is whatever the client says it is, so a single node
+ * sending fifteen different tokens would otherwise count as fifteen
+ * installs and walk through the k threshold alone.
+ *
+ * HMAC-SHA256(pepper, key id + week), hex. A different value every week,
+ * and not reversible to the key without the server's pepper. It still
+ * sits apart from the counts: the row holds no signals (DATA.md §8, §15).
+ */
+export function reportClaimForKey(keyId: string, week: string, pepper: string): string {
+  return createHmac("sha256", pepper)
+    .update(`sin-report-claim-v1\n${keyId}\n${week}`)
+    .digest("hex");
 }
 
 /** The validity rule, exactly roll-call's (§2.2): a key is valid iff it

@@ -145,7 +145,10 @@ so nothing collides. Pages:
 - First run generates a random 32-byte node key in the node's own state
   dir (`node_key`, mode 0600). It never leaves the machine.
 - Weekly token = `sha256("<node_key>:<week>")` hex. Unlinkable across
-  weeks; the pool dedupes within a week on it.
+  weeks. The node still sends it, but since Nov 10, 2026 the pool
+  dedupes a portal key's reports on a claim it makes itself, one per
+  approved node per week (DATA.md §5); the token dedupes only reports
+  sent with the operator's env keys.
 - **Access-rule amendment, Oct 22, 2026:** the persistent `node_key`
   is also the root for the SIN request-signing identity specified in
   `PORTAL-DESIGN.md` §3A.2. The MVP described here does not yet derive
