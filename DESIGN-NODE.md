@@ -122,7 +122,7 @@ them, and nothing syncs or downloads until a person presses the button.
 ## 4. The UI (own port, own password)
 
 Flask, server-rendered templates, no build step, minimal JS (none
-required). Default port **8790** (`METASYNC_PORT`) — SoulSync uses 8000,
+required). Default port **8790** (`METASYNC_PORT`) — SoulSync uses 8008,
 so nothing collides. Pages:
 
 - `/` dashboard — node fingerprint, week, dry-run state, connections,
