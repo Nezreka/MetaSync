@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import os
 import secrets
 import time
 from functools import wraps
@@ -18,6 +19,7 @@ from typing import Any
 from flask import Flask, abort, flash, redirect, render_template, request, session, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
 
+from . import __version__
 from .meta import enrichment as enrichment_view
 from .service import NodeService, PairingError, PairingRateLimited, check_pool_url
 
@@ -101,7 +103,13 @@ def create_app(service: NodeService) -> Flask:
 
     @app.get("/health")
     def health():
-        return {"ok": True, "service": "metasync-node", "version": "0.3.0"}
+        health = {"ok": True, "service": "metasync-node", "version": __version__}
+        # The image build stamps the commit it was built from (Dockerfile
+        # COMMIT_SHA), so a running node can say exactly what it is.
+        commit = os.environ.get("METASYNC_COMMIT_SHA", "").strip()
+        if commit:
+            health["commit"] = commit
+        return health
 
     @app.route("/setup", methods=["GET", "POST"])
     def setup():

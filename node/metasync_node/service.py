@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 from urllib.parse import urlparse
 
+from . import __version__
 from .config import Config
 from .identity import NodeIdentity, load_or_create_identity, token_for_week
 from .meta import merge as meta_merge
@@ -533,7 +534,7 @@ class NodeService:
         return {
             "ok": True,
             "service": "metasync-node",
-            "version": "0.3.0",
+            "version": __version__,
             "node_id": self.identity.node_id,
             "node_fingerprint": self.identity.fingerprint,
             "node_public_key": self.identity.public_key_b64url,
@@ -1795,7 +1796,7 @@ class NodeService:
         return {
             "ok": True,
             "service": "metasync-node",
-            "version": "0.3.0",
+            "version": __version__,
             "node_id": self.identity.node_id,
             "node_fingerprint": self.identity.fingerprint,
             "node_public_key": self.identity.public_key_b64url,

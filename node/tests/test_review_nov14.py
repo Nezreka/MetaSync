@@ -252,6 +252,35 @@ class TestVerifierNonJsonAnswer(unittest.TestCase):
                     fetcher._get("/x")
 
 
+class TestVersionHasOneSource(unittest.TestCase):
+    """/health, /local/status and the MusicBrainz user agent all read
+    metasync_node.__version__, so a release bumps one line."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.service = NodeService(make_config(self.tmp.name), store=Store(self.tmp.name))
+        from metasync_node.app import create_app
+
+        self.client = browser_client(create_app(self.service))
+
+    def test_health_status_and_user_agent_agree(self):
+        import metasync_node
+        from metasync_node.config import DEFAULT_USER_AGENT
+
+        version = metasync_node.__version__
+        self.assertEqual(self.client.get("/health").get_json(), {"ok": True, "service": "metasync-node", "version": version})
+        self.assertEqual(self.service.local_status()["version"], version)
+        self.assertIn(f"MetaSync-Node/{version} ", DEFAULT_USER_AGENT)
+
+    def test_health_names_the_commit_an_image_was_built_from(self):
+        import os
+        from unittest.mock import patch
+
+        with patch.dict(os.environ, {"METASYNC_COMMIT_SHA": "abc1234"}):
+            self.assertEqual(self.client.get("/health").get_json()["commit"], "abc1234")
+
+
 class TestAnswerFrameFitsTheRelayShare(unittest.TestCase):
     def test_a_sealed_frame_fits_the_relays_per_node_share(self):
         from metasync_relay.config import RelayConfig
