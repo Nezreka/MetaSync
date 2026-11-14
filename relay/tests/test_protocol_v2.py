@@ -313,3 +313,11 @@ def test_oversize_frame_is_protocol_error():
     raw = '{"type": "done", "query_id": "' + "a" * 32 + '", "pad": "' + "x" * (9 * 1024 * 1024) + '"}'
     with pytest.raises(ProtocolError):
         pm(raw)
+
+
+@pytest.mark.parametrize("value", [[], {}, 1, None, True])
+def test_query_reply_encoding_of_the_wrong_type_is_a_protocol_error(value):
+    # An unhashable value raised TypeError out of the membership test,
+    # past every ProtocolError handler, and closed the connection 1011.
+    with pytest.raises(ProtocolError):
+        pm(_query(reply_encoding=value))

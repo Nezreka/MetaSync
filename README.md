@@ -59,7 +59,7 @@ METASYNC_STATE_DIR=./data python3 run.py
 
 Open http://localhost:8790 and set an admin password on first run.
 
-**3. Connect MetaSync and SoulSync.** In SoulSync: **Settings → Advanced
+**3. Connect MetaSync and SoulSync.** In SoulSync: **Settings → Connections
 → MetaSync → Connect**. SoulSync finds the node and shows a pairing code;
 approve it on the MetaSync dashboard and the two swap keys automatically.
 Typing the keys by hand works too, in both directions. Connecting joins
@@ -206,7 +206,7 @@ Pool URL is shown on your portal dashboard after sign-in.
 
 ## Development
 
-GitHub Actions runs all three suites on every push and pull request
+GitHub Actions runs all four suites (backend, node, relay, portal) on every push and pull request
 (`.github/workflows/tests.yml`). Docker images publish from
 `.github/workflows/docker-publish.yml`, mirroring SoulSync: every push
 to main builds `:latest`, and a manual dispatch with a version tag cuts

@@ -106,18 +106,39 @@ class NodeService:
                 if seeded:
                     settings["pools"] = [seeded]
                     changed = True
-            if "METASYNC_DRY_RUN" in env or "DRY_RUN" in env:
-                raw = env.get("METASYNC_DRY_RUN", env.get("DRY_RUN", ""))
-                settings["dry_run"] = raw.lower() not in ("0", "false", "no", "off")
-                changed = True
-            if "METASYNC_SHARE_CHURN" in env:
-                settings["share_churn"] = _env_flag(env["METASYNC_SHARE_CHURN"])
-                changed = True
-            if "METASYNC_SHARE_LISTENING" in env:
-                settings["share_listening"] = _env_flag(env["METASYNC_SHARE_LISTENING"])
-                changed = True
-            if "METASYNC_META_ANSWERING" in env:
-                settings["meta_answering"] = _env_flag(env["METASYNC_META_ANSWERING"])
+            # The switches below are also set on the dashboard, so an env
+            # value is applied once: when it first appears, and again only
+            # when the operator changes it. Re-applying it on every boot
+            # undid dashboard choices at each restart (Start sending fell
+            # back to dry run; a listening opt-out came back on).
+            applied = settings.get("env_applied")
+            if not isinstance(applied, dict):
+                applied = {}
+            switches = (
+                ("METASYNC_DRY_RUN", "dry_run"),
+                ("METASYNC_SHARE_CHURN", "share_churn"),
+                ("METASYNC_SHARE_LISTENING", "share_listening"),
+                ("METASYNC_META_ANSWERING", "meta_answering"),
+            )
+            for name, key in switches:
+                raw = env.get(name)
+                if raw is None and name == "METASYNC_DRY_RUN":
+                    raw = env.get("DRY_RUN")
+                if raw is None:
+                    if name in applied:
+                        del applied[name]
+                        settings["env_applied"] = applied
+                        changed = True
+                    continue
+                raw = str(raw)
+                if applied.get(name) == raw:
+                    continue
+                if key == "dry_run":
+                    settings[key] = raw.lower() not in ("0", "false", "no", "off")
+                else:
+                    settings[key] = _env_flag(raw)
+                applied[name] = raw
+                settings["env_applied"] = applied
                 changed = True
         if changed:
             self.store.save_settings()

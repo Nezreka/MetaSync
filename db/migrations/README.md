@@ -26,6 +26,10 @@ psql "$DATABASE_URL_UNPOOLED" -f db/migrations/0001_sin_init.sql
 | `0010_report_populations.sql` | Per-week counts of reports and of reports from installs sharing drop signals, so Loved & Kept can scale drops to the whole population |
 | `0008_count_on_arrival_and_listen.sql` | `report_tokens`, `aggregate_counts` (count on arrival), `listen_album`. **Apply before deploying the matching backend**: the new report path writes these tables. |
 | `0012_meta_revocations.sql` | Metadata revocation feed state: `meta_revocation_state` (per-issuer seq), `meta_seen_bindings` (every node id ever bound — an unbound/deleted binding's id survives only here), `meta_revoked_nodes` (materialized form of the computed revoked set). **Apply before deploying the matching backend**: the feed sync writes these tables on every read. |
+| `0013_binding_unique_on_live_keys.sql` | Narrows `portal_keys_bound_node_public_key_uq` to unrevoked keys, so Regenerate can carry an approved node to the new key and a node on a revoked key can be approved on another. **Apply before deploying the matching portal.** |
+
+There is no `0011`: it belonged to a metadata claims-ingest design that
+never shipped.
 
 **Restore warning (0012):** `meta_revocation_state` holds the revocation
 feed's sequence, and holders apply a list only when its seq exceeds the
@@ -36,6 +40,3 @@ it from the holder side. After ANY restore, check this row before
 trusting the feed: if it was lost or regressed, re-seed `seq` above the
 last served value as part of the restore, before the backend serves
 again.
-
-No migration has been run yet — Neon is not authenticated in the agent
-environment, and running one is Boulder's step after sign-in.

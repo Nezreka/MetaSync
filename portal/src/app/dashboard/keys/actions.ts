@@ -77,7 +77,17 @@ export async function rollKeyAction(keyId: string): Promise<ActionResult> {
   const { bindingCarriedOnRoll } = await import('@/lib/binding')
   const carriedBinding = bindingCarriedOnRoll(existing)
 
+  // Revoke FIRST, then create. One node may be bound on one unrevoked
+  // key (portal_keys_bound_node_public_key_uq, migration 0013), and the
+  // replacement carries the old key's binding: created while the old
+  // key was still live, it broke that rule and the roll always failed
+  // for a key with an approved node.
   const { newKeyId } = await prisma.$transaction(async (tx) => {
+    const revoked = await tx.portalKey.updateMany({
+      where: { id: existing.id, userId, revokedAt: null },
+      data: { revokedAt: new Date() },
+    })
+    if (revoked.count !== 1) throw new Error('Key was revoked while regenerating')
     const created = await tx.portalKey.create({
       data: {
         userId,
@@ -87,10 +97,6 @@ export async function rollKeyAction(keyId: string): Promise<ActionResult> {
         ...carriedBinding,
       },
       select: { id: true },
-    })
-    await tx.portalKey.update({
-      where: { id: existing.id },
-      data: { revokedAt: new Date() },
     })
     return { newKeyId: created.id }
   })
@@ -106,10 +112,13 @@ export async function rollKeyAction(keyId: string): Promise<ActionResult> {
 // only approve / reject / unbind bindings on their OWN keys. The pure
 // transition payloads live in @/lib/binding (unit-tested).
 
-export async function approveBindingAction(keyId: string): Promise<ActionResult> {
+export async function approveBindingAction(
+  keyId: string,
+  expectedFingerprint: string
+): Promise<ActionResult> {
   const userId = await requireUserId()
   const key = await prisma.portalKey.findFirst({
-    where: { id: keyId, userId },
+    where: { id: keyId, userId, revokedAt: null },
     select: {
       boundNodeId: true,
       boundNodePublicKey: true,
@@ -122,12 +131,30 @@ export async function approveBindingAction(keyId: string): Promise<ActionResult>
   if (!key) return { error: 'Key not found.' }
   if (!key.pendingNodePublicKey) return { error: 'No pending binding request on this key.' }
 
-  const { approveBindingUpdate } = await import('@/lib/binding')
+  // Approve the node the person confirmed, not whatever is pending by
+  // the time the click lands: the fingerprint they saw comes along, and
+  // the write applies only while that same request is still pending.
+  const { approveBindingUpdate, nodeFingerprint } = await import('@/lib/binding')
+  const changed = { error: 'This request changed since the page loaded. Reload and check the fingerprint again.' }
+  if (
+    typeof expectedFingerprint !== 'string' ||
+    !expectedFingerprint ||
+    nodeFingerprint(key.pendingNodeId) !== expectedFingerprint
+  ) {
+    return changed
+  }
   try {
-    await prisma.portalKey.update({
-      where: { id: keyId },
+    const updated = await prisma.portalKey.updateMany({
+      where: {
+        id: keyId,
+        userId,
+        revokedAt: null,
+        pendingNodeId: key.pendingNodeId,
+        pendingNodePublicKey: key.pendingNodePublicKey,
+      },
       data: approveBindingUpdate(key),
     })
+    if (updated.count !== 1) return changed
   } catch (err) {
     // portal_keys_bound_node_public_key_uq: one MetaSync can be bound to
     // one key. Without this the approve button threw an unhandled error.

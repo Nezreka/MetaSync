@@ -34,6 +34,7 @@ jobs:
 
       - name: The pool is up
         run: |
+          set -o pipefail
           curl -fsS --max-time 30 "$SIN_URL/health" | tee health.json
           jq -e '.ok == true' health.json > /dev/null
 
@@ -55,8 +56,12 @@ jobs:
 
       - name: Vital signs
         run: |
+          # pipefail: without it tee hid a failed status fetch, the checks
+          # below read an empty file, and the step passed.
+          set -o pipefail
           curl -fsS --max-time 30 "$SIN_URL/v1/admin/status" -H "x-sin-key: $SIN_ADMIN_KEY" | tee status.json
           echo
+          jq -e '.charts.count != null and .reports.closed != null' status.json > /dev/null
           charts=$(jq '.charts.count' status.json)
           reports=$(jq '.reports.closed' status.json)
           before=$(jq '.reports.previous' status.json)

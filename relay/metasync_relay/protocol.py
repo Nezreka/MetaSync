@@ -285,7 +285,10 @@ def _parse_query(obj: dict) -> Query:
             raise ProtocolError("bad_reply_key")
     reply_encoding: str | None = None
     if "reply_encoding" in obj:
-        if obj["reply_encoding"] not in REPLY_ENCODINGS:
+        if (
+            not isinstance(obj["reply_encoding"], str)
+            or obj["reply_encoding"] not in REPLY_ENCODINGS
+        ):
             raise ProtocolError("bad_reply_encoding")
         reply_encoding = obj["reply_encoding"]
     return Query(
