@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import os
 import secrets
 import time
 from functools import wraps
@@ -18,6 +19,7 @@ from typing import Any
 from flask import Flask, abort, flash, redirect, render_template, request, session, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
 
+from . import __version__
 from .meta import enrichment as enrichment_view
 from .service import NodeService, PairingError, PairingRateLimited, check_pool_url
 
@@ -42,7 +44,7 @@ def create_app(service: NodeService) -> Flask:
 
     # CSRF: every browser form POST carries the session's token. The
     # session cookie alone is not enough — SameSite=Lax still sends it on
-    # requests from any page on the same site, and SoulSync (port 8000) is
+    # requests from any page on the same site, and SoulSync (port 8008) is
     # the same site as this UI (port 8790): a page there, or any other app
     # on this host, could otherwise post to /pools or /actions/dry-run as
     # the logged-in admin. The machine-to-machine routes SoulSync calls are
@@ -101,7 +103,13 @@ def create_app(service: NodeService) -> Flask:
 
     @app.get("/health")
     def health():
-        return {"ok": True, "service": "metasync-node", "version": "0.3.0"}
+        health = {"ok": True, "service": "metasync-node", "version": __version__}
+        # The image build stamps the commit it was built from (Dockerfile
+        # COMMIT_SHA), so a running node can say exactly what it is.
+        commit = os.environ.get("METASYNC_COMMIT_SHA", "").strip()
+        if commit:
+            health["commit"] = commit
+        return health
 
     @app.route("/setup", methods=["GET", "POST"])
     def setup():
@@ -424,6 +432,12 @@ def create_app(service: NodeService) -> Flask:
             else:
                 url = request.form.get("url", "").strip().rstrip("/")
                 api_key = request.form.get("api_key", "").strip()
+                saved_url = str(current.get("url") or "").strip().rstrip("/")
+                if not api_key and current.get("api_key") and url != saved_url:
+                    # The stored key belongs to the stored address. Sent
+                    # to a new address it would hand that server the key.
+                    flash("The address changed, so enter the SoulSync API key again.", "error")
+                    return redirect(url_for("soulsync_settings"))
                 store.settings["soulsync"] = {
                     "url": url,
                     "api_key": api_key or current.get("api_key", ""),
@@ -468,6 +482,10 @@ def create_app(service: NodeService) -> Flask:
                 )
                 if existing is None:
                     flash("That pool no longer exists.", "error")
+                elif url and not api_key and existing.get("api_key") \
+                        and url != str(existing.get("url") or "").strip().rstrip("/"):
+                    # The stored key was issued for the stored pool URL.
+                    flash("The pool URL changed, so enter the pool key again.", "error")
                 else:
                     try:
                         result = service.receive_pool_key(

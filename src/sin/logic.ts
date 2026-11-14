@@ -9,7 +9,8 @@
  *   SoulID belongs exclusively to the metadata MetaSync service.
  * - Exactly eight signal types exist. Anything else is rejected.
  * - Contributions are binary: one node can contribute at most 1 per
- *   (week, signal, MBID), and a node's token is accepted once per week.
+ *   (week, signal, MBID), and one report per approved node is accepted
+ *   per week (the claim is the server's: reportClaimForKey).
  * - Reports are counted on arrival and never stored per node.
  * - Nothing is published below the k-anonymity threshold.
  */
@@ -539,12 +540,30 @@ export function keepRateReason(keepNodes: number, importNodes: number): string |
 /* ONLY; it never enters the report insert path (design §4, P1–P3).   */
 /* ------------------------------------------------------------------ */
 
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 
 /** SHA-256 hex of `pepper + rawKey` — the only form of a portal key SIN
  *  (or the database) ever holds. Copied from roll-call's pepperedHash. */
 export function portalKeyHash(rawKey: string, pepper: string): string {
   return createHash("sha256").update(pepper + rawKey).digest("hex");
+}
+
+/**
+ * The weekly report claim for a portal key: what report_tokens stores to
+ * accept ONE report per approved node per week. It is made by the server
+ * from the authenticated key, never taken from the report body: the
+ * body's own token is whatever the client says it is, so a single node
+ * sending fifteen different tokens would otherwise count as fifteen
+ * installs and walk through the k threshold alone.
+ *
+ * HMAC-SHA256(pepper, key id + week), hex. A different value every week,
+ * and not reversible to the key without the server's pepper. It still
+ * sits apart from the counts: the row holds no signals (DATA.md §8, §15).
+ */
+export function reportClaimForKey(keyId: string, week: string, pepper: string): string {
+  return createHmac("sha256", pepper)
+    .update(`sin-report-claim-v1\n${keyId}\n${week}`)
+    .digest("hex");
 }
 
 /** The validity rule, exactly roll-call's (§2.2): a key is valid iff it
@@ -584,6 +603,9 @@ export const EXCHANGES_PER_HOUR = 10;
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
 
+/** Above this many buckets, a new bucket first drops the expired ones. */
+export const RATE_LIMIT_MAX_BUCKETS = 10_000;
+
 /** Fixed-window per-bucket request counter. Pure apart from its own map,
  *  so it is unit-testable with injected timestamps. */
 export class RequestRateLimiter {
@@ -605,11 +627,29 @@ export class RequestRateLimiter {
     const key = `${scope}|${bucket}|${windowMs}`;
     const current = this.windows.get(key);
     if (!current || current.windowStart !== windowStart) {
+      if (!current && this.windows.size >= RATE_LIMIT_MAX_BUCKETS) {
+        this.prune(now.getTime());
+      }
       this.windows.set(key, { windowStart, count: 1 });
       return true;
     }
     current.count += 1;
     return current.count <= limit;
+  }
+
+  /** Drop every bucket whose window has ended. Buckets are keyed by
+   *  caller-supplied values (a key, a node id), so without this the map
+   *  grew by one entry per distinct value for the life of the process. */
+  private prune(nowMs: number): void {
+    for (const [key, entry] of this.windows) {
+      const windowMs = Number(key.slice(key.lastIndexOf("|") + 1));
+      if (entry.windowStart + windowMs <= nowMs) this.windows.delete(key);
+    }
+  }
+
+  /** Buckets currently held (for tests). */
+  get size(): number {
+    return this.windows.size;
   }
 
   /** One POST /v1/report attempt: must fit BOTH the hourly and the

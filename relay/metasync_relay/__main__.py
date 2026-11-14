@@ -23,11 +23,44 @@ from .config import (
 from .server import Relay, serve_forever
 
 
-def main() -> int:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+_RECORD_FIELDS = frozenset(
+    logging.LogRecord("", 0, "", 0, "", (), None).__dict__
+) | {"message", "asctime", "taskName"}
+
+
+class ExtraFormatter(logging.Formatter):
+    """The plain line plus every ``extra=`` field as ``key=value``.
+
+    The relay logs numbers and error classes through ``extra`` (the
+    counters line, violations, refusals). The stock format string prints
+    none of them, which left the line the runbook reads as the bare
+    word "counters". Only what the code passes in ``extra`` is added:
+    counts and class names, never a subject, node id or address.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        line = super().format(record)
+        extras = {
+            key: value
+            for key, value in record.__dict__.items()
+            if key not in _RECORD_FIELDS
+        }
+        if not extras:
+            return line
+        fields = " ".join(f"{key}={extras[key]}" for key in sorted(extras))
+        return f"{line} {fields}"
+
+
+def configure_logging() -> None:
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        ExtraFormatter("%(asctime)s %(levelname)s %(name)s %(message)s")
     )
+    logging.basicConfig(level=logging.INFO, handlers=[handler])
+
+
+def main() -> int:
+    configure_logging()
     try:
         config = RelayConfig.from_env()
         pool_public_key = require_pool_public_key()

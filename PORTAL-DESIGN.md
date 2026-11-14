@@ -396,9 +396,12 @@ What rate limiting cannot do, said plainly: it does not stop Sybil
 token inflation by itself. The dedupe token is derived from the
 **node's own key** (`sha256(node_key + week)`, `DESIGN-NODE.md` §5),
 not from the portal key — one portal key could front many node keys.
-The real defences are the **k = 15 threshold** (an item needs 15
-distinct tokens before anything publishes), one account per verified
-email (§6), and admin revoke as the kill switch. The portal key is a
+(Since Nov 10, 2026 the pool makes the weekly claim itself, one per
+approved node per week, so a single node can no longer vary its token
+to count many times: §4 P1.) The real defences are the **k = 15
+threshold** (an item needs 15 approved nodes before anything
+publishes), one account per verified email (§6), and admin revoke as
+the kill switch. The portal key is a
 door key, not a proof of personhood; the design doesn't pretend
 otherwise.
 
@@ -877,7 +880,7 @@ of them:
 
 - **Two boxes stay two boxes.** Bindings, public keys, key status and
   token issuance belong to Box 1 (accounts + keys). Reports remain in
-  Box 2 under the rotating weekly token.
+  Box 2 under the weekly claim (P1, as amended Nov 10, 2026).
 - **The door check is transient.** Key id, node id, token claims,
   binding result and signature result are used to pass/fail the
   request and, for a valid portal key, to touch `last_used_at`. They
@@ -918,6 +921,16 @@ enforcement, so it's checkable in code review, not just intended.
   `aggregates`) referencing a key, account, IP, or user agent.** The
   token stays `sha256(node_key + week)` — unlinkable across weeks,
   derived from material the portal never sees.
+  **Amended Nov 10, 2026.** The pool no longer dedupes a portal
+  key's reports on that token. A client picks its own token, so one
+  approved node could send fifteen and count as fifteen installs. The
+  `report_tokens` row is now a claim the pool makes itself:
+  `HMAC-SHA256(pepper, key id + week)` (`reportClaimForKey`). It
+  changes every week, holds no signals, is never joined to the counts,
+  and cannot be turned back into a key without the pepper. With the
+  pepper and the database, an operator can confirm that a given key
+  reported in a given week, which the door already learns (§3.3's
+  `last_used_at`). No signal row gains any key reference.
 - **P2 — Identity stops at the gate.** In `src/sin`, the portal-key
   lookup result (key id, user id) is consumed only by (a) pass/fail
   and (b) the §3.3 timestamp touch. It is never passed to, logged by,
@@ -1087,8 +1100,10 @@ user's node.
   provider's own protections (OAuth) or the email provider's
   (magic link).
 - **k = 15 is the load-bearing wall.** Even a successful Sybil (many
-  accounts, many node keys) must field 15 distinct tokens agreeing on
-  one MBID in one week before anything publishes, and what publishes
+  accounts, many node keys) must field 15 approved nodes agreeing on
+  one MBID in one week before anything publishes (one claim per key
+  per week, made by the pool: §4 P1; an account holds at most 5 keys,
+  so 15 takes at least 3 accounts), and what publishes
   is a *count on a chart/playlist* — taste data, not access, money, or
   anyone's library. The value at risk is low and the threshold is the
   mitigation; if operator experience ever shows gaming, raising k and

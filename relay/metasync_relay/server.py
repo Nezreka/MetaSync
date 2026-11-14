@@ -351,7 +351,11 @@ class Relay:
         else:
             self.revocations = None
         self._sweeper_task: asyncio.Task | None = None
-        self._last_revocations_refresh = 0.0
+        # None until the first fetch: the clock is monotonic (seconds
+        # since boot on Linux), so a 0.0 start made a freshly booted
+        # machine wait a whole interval before its first fetch, with
+        # no revocation list held in the meantime.
+        self._last_revocations_refresh: float | None = None
         self._last_counters_log = 0.0
 
     def _state_for(self, node_id: str) -> _NodeState:
@@ -1210,7 +1214,8 @@ class Relay:
         if self.revocations is None or not self.revocations.url:
             return
         now = self._mono()
-        if now - self._last_revocations_refresh < self.config.revocations_interval_seconds:
+        last = self._last_revocations_refresh
+        if last is not None and now - last < self.config.revocations_interval_seconds:
             return
         self._last_revocations_refresh = now
         await self.refresh_revocations()

@@ -336,8 +336,14 @@ def verify_batch(public_key_b64: str, envelope: dict) -> dict:
         header = batch["header"]
         if not isinstance(header, dict):
             raise ClaimError("batch header must be an object")
-        pub = Ed25519PublicKey.from_public_bytes(
-            b64url_decode(public_key_b64))
+        key_bytes = b64url_decode(public_key_b64)
+        # One key, one spelling. The decoder ignores padding and any
+        # character outside the alphabet, so "<key>=", "!!!!<key>" and
+        # "<key>" all name the same key; origins are counted by this
+        # string, and each spelling would count as a separate node.
+        if b64url_encode(key_bytes) != public_key_b64:
+            raise ClaimError("batch node key is not canonically encoded")
+        pub = Ed25519PublicKey.from_public_bytes(key_bytes)
         digest = bytes.fromhex(batch_digest(batch))
     except ClaimError:
         raise

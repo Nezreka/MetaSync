@@ -5,6 +5,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY run.py ./
 COPY metasync_node ./metasync_node
 ENV METASYNC_STATE_DIR=/data METASYNC_PORT=8790
+# The commit this image was built from (set by the publish workflows), shown
+# on /health. Declared after the dependency layer so a new commit does not
+# reinstall the requirements.
+ARG COMMIT_SHA=""
+ENV METASYNC_COMMIT_SHA=${COMMIT_SHA}
 VOLUME ["/data"]
 EXPOSE 8790
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \

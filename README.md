@@ -59,7 +59,7 @@ METASYNC_STATE_DIR=./data python3 run.py
 
 Open http://localhost:8790 and set an admin password on first run.
 
-**3. Connect MetaSync and SoulSync.** In SoulSync: **Settings → Advanced
+**3. Connect MetaSync and SoulSync.** In SoulSync: **Settings → Connections
 → MetaSync → Connect**. SoulSync finds the node and shows a pairing code;
 approve it on the MetaSync dashboard and the two swap keys automatically.
 Typing the keys by hand works too, in both directions. Connecting joins
@@ -122,16 +122,19 @@ library size, usernames, emails, IP-based identity, or your SoulSync URL.
 
 - **Binary contributions.** Per item, per week, your node reports 1 or
   nothing. A count means "this many distinct installs", full stop.
-- **Rotating dedupe token.** Each report carries `hash(node secret +
-  week)`, used only to dedupe a double-submit within that week. Next
-  week's token is unlinkable to this week's — there is no cross-week
-  tracking.
+- **One report per approved node per week.** The pool marks that your
+  node reported this week with a keyed hash of (your key's internal id
+  + the week), made on the server. The marker changes every week, holds
+  no signals, and is never joined to the counts. It is made by the
+  server, not taken from the report, so one node cannot pose as many
+  installs. The report still carries `hash(node secret + week)`; the
+  pool no longer stores it for a portal key.
 - **k = 15 publish threshold.** An item appears in a chart only if at
   least 15 distinct nodes reported it. Below that, the data point does
   not exist publicly.
 - **Reports are counted on arrival, never stored.** The server adds +1
   per item to a running tally and keeps only `(week, signal, MBID,
-  node_count)`; the weekly token is kept apart, only to accept one
+  node_count)`; the weekly marker is kept apart, only to accept one
   report per install per week.
 - **Keys are hashes.** The portal stores SHA-256 hashes of keys, never
   the keys themselves. Your node signs its requests with its own Ed25519
@@ -203,12 +206,18 @@ Pool URL is shown on your portal dashboard after sign-in.
 
 ## Development
 
-GitHub Actions runs all three suites on every push and pull request
+GitHub Actions runs all four suites (backend, node, relay, portal) on every push and pull request
 (`.github/workflows/tests.yml`). Docker images publish from
 `.github/workflows/docker-publish.yml`, mirroring SoulSync: every push
 to main builds `:latest`, and a manual dispatch with a version tag cuts
 a numbered release — both to Docker Hub (`boulderbadgedad/metasync`)
 and GHCR (`ghcr.io/nezreka/metasync`), for amd64 and arm64.
+`.github/workflows/dev-nightly.yml` builds the `dev` branch the same way
+SoulSync does: every push to dev (and a nightly run when dev moved) tests
+the node and publishes `ghcr.io/nezreka/metasync:dev`, plus a dated
+`dev-<date>-<sha>` tag. Every image carries the commit it was built from,
+shown on the node's `/health`. The node's version lives in one place,
+`node/metasync_node/__init__.py`.
 
 ```bash
 npm run build   # tsc --noEmit (strict) over the backend + tests

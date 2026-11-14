@@ -256,7 +256,13 @@ class MusicBrainzFetcher:
         if not res.ok:
             raise FetcherError(
                 f"musicbrainz HTTP {res.status_code} for {path}")
-        body = res.json()
+        try:
+            body = res.json()
+        except ValueError as err:
+            # A 200 that is not JSON (a proxy or captive-portal page)
+            # is a failed lookup, not a crash of the whole run.
+            raise FetcherError(
+                f"musicbrainz sent a non-JSON answer for {path}") from err
         return body if isinstance(body, dict) else None
 
     def _recording(self, body: dict[str, Any]) -> dict[str, Any]:
@@ -407,7 +413,11 @@ class DeezerFetcher:
             return None
         if not res.ok:
             raise FetcherError(f"deezer HTTP {res.status_code} for {path}")
-        body = res.json()
+        try:
+            body = res.json()
+        except ValueError as err:
+            raise FetcherError(
+                f"deezer sent a non-JSON answer for {path}") from err
         if not isinstance(body, dict):
             return None
         error = body.get("error")

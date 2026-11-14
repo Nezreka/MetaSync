@@ -63,7 +63,9 @@ export const reportTokens = pgTable(
   "report_tokens",
   {
     week: varchar("week", { length: 8 }).notNull(),
-    /** Rotating dedupe token hash(node_key + week) — never linked to signals. */
+    /** The weekly report claim: for a portal key, the pool's own
+     *  HMAC(pepper, key id + week) (logic.ts reportClaimForKey); for the
+     *  operator's env keys, the body's token. Never linked to signals. */
     tokenHash: varchar("token_hash", { length: 128 }).notNull(),
   },
   (t) => [primaryKey({ columns: [t.week, t.tokenHash] })],
@@ -177,7 +179,9 @@ export const portalKeys = pgTable(
     index("portal_keys_user_id_idx").on(t.userId),
     uniqueIndex("portal_keys_bound_node_public_key_uq")
       .on(t.boundNodePublicKey)
-      .where(sql`${t.boundNodePublicKey} is not null`),
+      .where(
+        sql`${t.boundNodePublicKey} is not null and ${t.revokedAt} is null`,
+      ),
   ],
 );
 

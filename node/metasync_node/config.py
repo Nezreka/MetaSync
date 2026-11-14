@@ -5,13 +5,18 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+from . import __version__
+
+
+DEFAULT_USER_AGENT = f"MetaSync-Node/{__version__} (https://github.com/Nezreka/MetaSync)"
+
 
 @dataclass
 class Config:
     state_dir: str = "/data"
-    port: int = 8790  # SoulSync uses 8000; MetaSync's UI lives here instead.
+    port: int = 8790  # SoulSync uses 8008; MetaSync's UI lives here instead.
     musicbrainz_base_url: str = "https://musicbrainz.org/ws/2"
-    musicbrainz_user_agent: str = "MetaSync-Node/0.1 (https://github.com/Nezreka/MetaSync)"
+    musicbrainz_user_agent: str = DEFAULT_USER_AGENT
     musicbrainz_min_interval_s: float = 1.1  # MusicBrainz asks for <= 1 req/sec
     playlist_max_items: int = 20
     playlist_tracks_per_item: int = 3
@@ -48,7 +53,7 @@ def load_config(env: dict[str, str] | None = None) -> Config:
         port=_int(env, "METASYNC_PORT", 8790),
         musicbrainz_base_url=env.get("MUSICBRAINZ_BASE_URL", "https://musicbrainz.org/ws/2").rstrip("/"),
         musicbrainz_user_agent=env.get(
-            "MUSICBRAINZ_USER_AGENT", "MetaSync-Node/0.1 (https://github.com/Nezreka/MetaSync)"
+            "MUSICBRAINZ_USER_AGENT", DEFAULT_USER_AGENT
         ),
         playlist_max_items=_int(env, "PLAYLIST_MAX_ITEMS", 20),
         playlist_tracks_per_item=_int(env, "PLAYLIST_TRACKS_PER_ITEM", 3),

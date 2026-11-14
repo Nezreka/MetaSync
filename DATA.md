@@ -208,10 +208,16 @@ the node generates a random 32-byte root key, stored hex in
 things derive from it:
 
 - **Weekly dedupe token**: `token(week) = sha256("<root_key_hex>:<week>")`,
-  hex. This is the `token` in §3. It rotates every week, so reports
-  from different weeks cannot be linked by token; within one week it
-  is what makes a node's second send of the same signal a no-op
-  (the backend unique index is on `(token_hash, week, signal, mbid)`).
+  hex. This is the `token` in §3. It rotates every week. **Since
+  Nov 10, 2026 the pool does not dedupe a portal key's reports on it**:
+  the body's token is the client's own word, and one approved node
+  sending fifteen different tokens counted as fifteen installs, enough
+  to pass k = 15 alone. The pool now makes the weekly claim itself:
+  `HMAC-SHA256(API_KEY_PEPPER, "sin-report-claim-v1" + key id + week)`
+  (`src/sin/logic.ts::reportClaimForKey`), one per approved node per
+  week. The body token is still required on the wire and still dedupes
+  reports sent with the operator's env keys (the official node, local
+  development pools).
 - **Signing key**: an Ed25519 seed derived by HKDF-SHA256 over the
   root key with info label `metasync-sin-request-signing-v1`.
 - **node_id**: `sha256(raw Ed25519 public key)`, hex. The first 12
@@ -352,7 +358,7 @@ Schema: `src/sin/schema.ts`, migrations `db/migrations/0001`–`0010`.
 
 | Table | Columns (complete) | Purpose / retention |
 |---|---|---|
-| `report_tokens` | `week`, `token_hash` (PK) | One row per accepted report: the weekly dedupe token, so a second report for the same week counts nothing. **Holds no signals and is never joined to the counts.** Pruned after 3 weeks (the report window is 2). |
+| `report_tokens` | `week`, `token_hash` (PK) | One row per accepted report: the pool-made weekly claim for the reporting key (§5; the body's own token only for the operator's env keys), so a second report for the same week counts nothing. **Holds no signals and is never joined to the counts.** Pruned after 3 weeks (the report window is 2). |
 | `aggregate_counts` | `week`, `signal`, `mbid`, `node_count` (PK = week+signal+mbid) | Private running distinct-node counts, **including below-k ones**. A report adds +1 per distinct signal the moment it arrives, in the same transaction as its token claim. No route reads this table. **Deleted 3 weeks after its week**: once a week can no longer receive reports, the aggregation pass publishes everything at or above k, then drops the week's remaining (below-k) counts. |
 | `report_populations` | `week` (PK), `reports`, `churn_optin` | Per week: how many reports were accepted, and how many carried `churn_optin`. +1s in the same transaction as the token claim (migration 0010). **Counts only, nothing per node.** Used to scale drops in Loved & Kept (§9) and by `GET /v1/admin/status`. |
 | `raw_reports` | `id`, `week`, `token_hash`, `signal`, `mbid`, `received_at` | **No longer written** (migration 0008). The next aggregation pass drains any rows left by the old ingest path into `aggregate_counts` and deletes them. Drop the table once it is empty. |
@@ -621,8 +627,13 @@ bugs anyone is hiding:
    request, though, a node's whole weekly report arrives together,
    and an operator who logged request bodies at that moment would
    see it. That is why reports are capped and describe one week of
-   events, never a library (§2, bulk rule). Across weeks, tokens are
-   unlinkable.
+   events, never a library (§2, bulk rule). The weekly claim row (§5)
+   is a keyed hash of the key id and the week: someone holding both
+   the database and the server's pepper can recompute it for a given
+   key and so confirm "this key reported in week W", across weeks.
+   That is the fact the door already learns, and nothing more: the
+   row holds no signals and the counts hold no claim. Without the
+   pepper the rows are unlinkable to a key and to each other.
 3. **The portal join exists in the data, not in code.** `portal_keys`
    carries `user_id` in the same database as the reports. No SIN
    code path selects it, and the portal is the only component that

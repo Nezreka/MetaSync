@@ -23,6 +23,7 @@ import {
   K_PUBLISH_THRESHOLD,
   loadPoolTokenPrivateKey,
   portalKeyHash,
+  reportClaimForKey,
 } from "../src/sin/logic.ts";
 import type { SinDb } from "../src/sin/db.ts";
 import { FakeSinDb, type PortalRow } from "./fake-db.ts";
@@ -515,6 +516,20 @@ describe("sin §3A: key exchange + access tokens (fake db)", () => {
     assert.deepEqual(await eleventh.json(), { error: "rate_limited" });
   });
 
+  test("exchange rate limit: attempts that fail auth do not spend a node's bucket", async () => {
+    // The node id is a public header value. Twelve exchanges that name
+    // the victim's node id but carry no valid key must not leave the
+    // victim's own exchange rate limited.
+    const victim = makeNode();
+    const { app } = await setup([boundRow(victim)]);
+    for (let i = 0; i < 12; i += 1) {
+      const junk = await exchange(app, `sin_live_not-a-real-key-${i}`, victim);
+      assert.equal(junk.status, 401, `junk exchange ${i + 1}`);
+    }
+    const real = await exchange(app, RAW, victim);
+    assert.equal(real.status, 200);
+  });
+
   test("admin exchange -> admin-scope token can aggregate + publish; user token cannot", async () => {
     const node = makeNode();
     const { app, fake } = await setup([boundRow(node)]);
@@ -605,6 +620,62 @@ describe("sin §3A: key exchange + access tokens (fake db)", () => {
     assert.deepEqual(await again.json(), { accepted: 0, duplicate: true, week: WEEK });
     assert.equal(fake.countRows.length, 1);
     assert.equal(fake.transactions, 2);
+  });
+
+  test("a node that varies its report token still counts once: the claim is the server's, per key", async () => {
+    const node = makeNode();
+    const { app, fake } = await setup([boundRow(node)]);
+    const token = await exchangeForToken(app, RAW, node);
+    // reportBody() carries a fresh body token on every call.
+    const first = await tokenReport(app, token, node, reportBody());
+    assert.equal(first.status, 201);
+    for (let i = 0; i < 4; i += 1) {
+      const again = await tokenReport(app, token, node, reportBody());
+      assert.equal(again.status, 200);
+      assert.equal(((await again.json()) as { duplicate: boolean }).duplicate, true);
+    }
+    assert.equal(fake.countRows.length, 1);
+    assert.equal(fake.countRows[0]!.nodeCount, 1);
+    // The stored claim is the per-key value, and no body token is kept.
+    assert.deepEqual([...fake.reportTokens], [`${WEEK}|${reportClaimForKey("key-1", WEEK, PEPPER)}`]);
+    assert.equal(fake.populationRows[0]!.reports, 1);
+  });
+
+  test("two approved nodes on two keys count as two, even with the same body token", async () => {
+    const nodeA = makeNode();
+    const nodeB = makeNode();
+    const rawB = `sin_live_${"B".repeat(43)}`;
+    const { app, fake } = await setup([
+      boundRow(nodeA),
+      { ...boundRow(nodeB), id: "key-2", keyHash: portalKeyHash(rawB, PEPPER), keyPrefix: rawB.slice(0, 12) },
+    ]);
+    const body = reportBody();
+    const a = await tokenReport(app, await exchangeForToken(app, RAW, nodeA), nodeA, body);
+    const b = await tokenReport(app, await exchangeForToken(app, rawB, nodeB), nodeB, body);
+    assert.equal(a.status, 201);
+    assert.equal(b.status, 201);
+    assert.equal(fake.countRows[0]!.nodeCount, 2);
+    assert.equal(fake.reportTokens.size, 2);
+  });
+
+  test("the weekly claim changes every week and differs per key", () => {
+    const a = reportClaimForKey("key-1", "2026-W45", PEPPER);
+    assert.match(a, /^[0-9a-f]{64}$/);
+    assert.notEqual(a, reportClaimForKey("key-1", "2026-W46", PEPPER));
+    assert.notEqual(a, reportClaimForKey("key-2", "2026-W45", PEPPER));
+    assert.notEqual(a, reportClaimForKey("key-1", "2026-W45", "another-pepper"));
+    assert.equal(a, reportClaimForKey("key-1", "2026-W45", PEPPER));
+  });
+
+  test("the operator's env key is still deduped by the body token", async () => {
+    const { app, fake } = await setup([]);
+    const send = (body: string) =>
+      app.request("/v1/report", { method: "POST", headers: { "x-sin-key": SHARED_KEY }, body });
+    const one = reportBody();
+    assert.equal((await send(one)).status, 201);
+    assert.equal((await send(one)).status, 200);
+    assert.equal((await send(reportBody())).status, 201);
+    assert.equal(fake.countRows[0]!.nodeCount, 2);
   });
 
   test("a closed or future week is refused before anything is counted", async () => {

@@ -18,7 +18,7 @@ commands: `python3 run.py preview|report|refresh`.
 ## Run it (Docker)
 
 See `docker-compose.example.yml` — MetaSync sits next to SoulSync, its UI
-on **8790** (SoulSync stays on 8000), state in its own volume.
+on **8790** (SoulSync stays on 8008), state in its own volume.
 
 ## Connect SoulSync — two paths
 

@@ -199,7 +199,9 @@ export default function KeyRow({ keyData }: { keyData: KeyRowData }) {
                     )
                   )
                     return
-                  void runBindingAction('approve', () => approveBindingAction(keyData.id))
+                  void runBindingAction('approve', () =>
+                    approveBindingAction(keyData.id, keyData.binding.pendingFingerprint ?? '')
+                  )
                 }}
                 className="btn-primary px-3.5 py-1.5 text-sm font-semibold"
               >
