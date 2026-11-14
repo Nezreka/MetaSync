@@ -179,7 +179,9 @@ export const portalKeys = pgTable(
     index("portal_keys_user_id_idx").on(t.userId),
     uniqueIndex("portal_keys_bound_node_public_key_uq")
       .on(t.boundNodePublicKey)
-      .where(sql`${t.boundNodePublicKey} is not null`),
+      .where(
+        sql`${t.boundNodePublicKey} is not null and ${t.revokedAt} is null`,
+      ),
   ],
 );
 

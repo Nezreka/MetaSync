@@ -516,6 +516,20 @@ describe("sin §3A: key exchange + access tokens (fake db)", () => {
     assert.deepEqual(await eleventh.json(), { error: "rate_limited" });
   });
 
+  test("exchange rate limit: attempts that fail auth do not spend a node's bucket", async () => {
+    // The node id is a public header value. Twelve exchanges that name
+    // the victim's node id but carry no valid key must not leave the
+    // victim's own exchange rate limited.
+    const victim = makeNode();
+    const { app } = await setup([boundRow(victim)]);
+    for (let i = 0; i < 12; i += 1) {
+      const junk = await exchange(app, `sin_live_not-a-real-key-${i}`, victim);
+      assert.equal(junk.status, 401, `junk exchange ${i + 1}`);
+    }
+    const real = await exchange(app, RAW, victim);
+    assert.equal(real.status, 200);
+  });
+
   test("admin exchange -> admin-scope token can aggregate + publish; user token cannot", async () => {
     const node = makeNode();
     const { app, fake } = await setup([boundRow(node)]);

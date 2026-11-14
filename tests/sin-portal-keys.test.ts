@@ -13,6 +13,7 @@ import {
   isoWeekOf,
   isPortalKeyValid,
   portalKeyHash,
+  RATE_LIMIT_MAX_BUCKETS,
   RequestRateLimiter,
 } from "../src/sin/logic.ts";
 import type { SinDb } from "../src/sin/db.ts";
@@ -107,6 +108,22 @@ describe("portal key helpers (pure)", () => {
       isPortalKeyValid({ revokedAt: null, expiresAt: new Date("2026-10-23T00:00:00Z") }, now),
       true,
     );
+  });
+
+  test("rate limiter drops expired buckets once it is full", () => {
+    const limiter = new RequestRateLimiter();
+    const start = new Date("2026-11-02T00:00:00Z");
+    for (let i = 0; i < RATE_LIMIT_MAX_BUCKETS; i += 1) {
+      limiter.allowExchange(`node:${i}`, start);
+    }
+    assert.equal(limiter.size, RATE_LIMIT_MAX_BUCKETS);
+    // Same hour: nothing has expired, so nothing is dropped.
+    limiter.allowExchange("node:same-hour", start);
+    assert.equal(limiter.size, RATE_LIMIT_MAX_BUCKETS + 1);
+    // Two hours on, every earlier bucket's window has ended.
+    const later = new Date(start.getTime() + 2 * 60 * 60 * 1000);
+    limiter.allowExchange("node:later", later);
+    assert.equal(limiter.size, 1);
   });
 
   test("rate limiter: per-bucket fixed windows trip at the cap", () => {

@@ -603,6 +603,9 @@ export const EXCHANGES_PER_HOUR = 10;
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
 
+/** Above this many buckets, a new bucket first drops the expired ones. */
+export const RATE_LIMIT_MAX_BUCKETS = 10_000;
+
 /** Fixed-window per-bucket request counter. Pure apart from its own map,
  *  so it is unit-testable with injected timestamps. */
 export class RequestRateLimiter {
@@ -624,11 +627,29 @@ export class RequestRateLimiter {
     const key = `${scope}|${bucket}|${windowMs}`;
     const current = this.windows.get(key);
     if (!current || current.windowStart !== windowStart) {
+      if (!current && this.windows.size >= RATE_LIMIT_MAX_BUCKETS) {
+        this.prune(now.getTime());
+      }
       this.windows.set(key, { windowStart, count: 1 });
       return true;
     }
     current.count += 1;
     return current.count <= limit;
+  }
+
+  /** Drop every bucket whose window has ended. Buckets are keyed by
+   *  caller-supplied values (a key, a node id), so without this the map
+   *  grew by one entry per distinct value for the life of the process. */
+  private prune(nowMs: number): void {
+    for (const [key, entry] of this.windows) {
+      const windowMs = Number(key.slice(key.lastIndexOf("|") + 1));
+      if (entry.windowStart + windowMs <= nowMs) this.windows.delete(key);
+    }
+  }
+
+  /** Buckets currently held (for tests). */
+  get size(): number {
+    return this.windows.size;
   }
 
   /** One POST /v1/report attempt: must fit BOTH the hourly and the

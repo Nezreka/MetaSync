@@ -654,8 +654,11 @@ export async function claimRequestNonce(
     .values({
       nodeId,
       nonceHash: sha256Hex(nonce),
+      // Twice the window: a timestamp up to one window ahead of this
+      // clock stays valid for two windows from now, and the nonce must
+      // outlive the signature it guards.
       expiresAt: new Date(
-        now.getTime() + NODE_TIMESTAMP_WINDOW_SECONDS * 1000,
+        now.getTime() + 2 * NODE_TIMESTAMP_WINDOW_SECONDS * 1000,
       ),
     })
     .onConflictDoNothing()
@@ -942,7 +945,10 @@ app.post("/v1/auth/exchange", async (c) => {
   const now = new Date();
 
   // Exchange tripwires (§3A.8): per key fingerprint AND per node id.
-  // Both buckets count every attempt, good or bad.
+  // The key bucket counts every attempt, good or bad. The node bucket
+  // counts only requests whose signature verified (below): the node id
+  // is a public value in a header, and counting unsigned attempts let
+  // anyone who knew it spend a node's ten exchanges and lock it out.
   const pepper = process.env.API_KEY_PEPPER;
   const keyBucket = provided
     ? pepper &&
@@ -951,11 +957,7 @@ app.post("/v1/auth/exchange", async (c) => {
       ? `key:${portalKeyHash(provided, pepper)}`
       : `key:${sha256Hex(provided)}`
     : "key:missing";
-  const nodeBucket = `node:${headers?.nodeId ?? "unknown"}`;
-  if (
-    !rateLimiter.allowExchange(keyBucket, now) ||
-    !rateLimiter.allowExchange(nodeBucket, now)
-  ) {
+  if (!rateLimiter.allowExchange(keyBucket, now)) {
     return c.json({ error: "rate_limited" }, 429);
   }
 
@@ -1017,6 +1019,9 @@ app.post("/v1/auth/exchange", async (c) => {
       ) {
         return unauthorized();
       }
+      if (!rateLimiter.allowExchange(`node:${headers.nodeId}`, now)) {
+        return c.json({ error: "rate_limited" }, 429);
+      }
       if (!(await claimRequestNonce(db, headers.nodeId, headers.nonce, now))) {
         return unauthorized();
       }
@@ -1056,6 +1061,9 @@ app.post("/v1/auth/exchange", async (c) => {
     }
     if (!verifyNodeRequest(request, headers, expectedPublicRaw, bodyText, now)) {
       return unauthorized();
+    }
+    if (!rateLimiter.allowExchange(`node:${headers.nodeId}`, now)) {
+      return c.json({ error: "rate_limited" }, 429);
     }
     if (!(await claimRequestNonce(db, headers.nodeId, headers.nonce, now))) {
       return unauthorized();
