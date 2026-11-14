@@ -5,13 +5,13 @@ on:
   push:
     branches:
       - main
-  # Manual trigger for tagged releases (e.g. 0.2.0)
+  # Manual trigger for tagged releases (e.g. 0.3.1)
   workflow_dispatch:
     inputs:
       version_tag:
-        description: 'Version tag (e.g. 0.2.0)'
+        description: 'Version tag (e.g. 0.3.1)'
         required: true
-        default: '0.2.0'
+        default: '0.3.1'
 
 jobs:
   build-and-push:
@@ -58,8 +58,24 @@ jobs:
           pull: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          build-args: |
+            COMMIT_SHA=${{ github.sha }}
           tags: |
             boulderbadgedad/metasync:latest
             ghcr.io/${{ env.OWNER }}/metasync:latest
             ${{ inputs.version_tag && format('boulderbadgedad/metasync:{0}', inputs.version_tag) || '' }}
             ${{ inputs.version_tag && format('ghcr.io/{0}/metasync:{1}', env.OWNER, inputs.version_tag) || '' }}
+
+      # Same step as SoulSync's publish workflow. It only runs for a numbered
+      # release, and does nothing until the DISCORD_ANNOUNCEMENTS_WEBHOOK
+      # repository secret is set.
+      - name: Announce release to Discord
+        if: success() && inputs.version_tag
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_ANNOUNCEMENTS_WEBHOOK }}
+          VERSION_TAG: ${{ inputs.version_tag }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK" ]; then echo "No webhook configured, skipping"; exit 0; fi
+          curl -s -H "Content-Type: application/json" \
+            -d "{\"embeds\": [{\"title\": \"MetaSync v$VERSION_TAG Released\", \"description\": \"A new version of MetaSync is available! Pull the latest Docker image to update.\n\n\`\`\`\ndocker pull boulderbadgedad/metasync:$VERSION_TAG\n\`\`\`\", \"color\": 5025616, \"footer\": {\"text\": \"MetaSync Auto-Release\"}, \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}]}" \
+            "$DISCORD_WEBHOOK"

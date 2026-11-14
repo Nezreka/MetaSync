@@ -212,6 +212,12 @@ GitHub Actions runs all four suites (backend, node, relay, portal) on every push
 to main builds `:latest`, and a manual dispatch with a version tag cuts
 a numbered release — both to Docker Hub (`boulderbadgedad/metasync`)
 and GHCR (`ghcr.io/nezreka/metasync`), for amd64 and arm64.
+`.github/workflows/dev-nightly.yml` builds the `dev` branch the same way
+SoulSync does: every push to dev (and a nightly run when dev moved) tests
+the node and publishes `ghcr.io/nezreka/metasync:dev`, plus a dated
+`dev-<date>-<sha>` tag. Every image carries the commit it was built from,
+shown on the node's `/health`. The node's version lives in one place,
+`node/metasync_node/__init__.py`.
 
 ```bash
 npm run build   # tsc --noEmit (strict) over the backend + tests
